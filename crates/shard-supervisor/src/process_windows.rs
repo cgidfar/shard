@@ -59,13 +59,24 @@ impl ProcessControl for WindowsProcessControl {
             .append(true)
             .open(&crash_log)?;
 
+        // Try with CREATE_BREAKAWAY_FROM_JOB first (survives parent Job Object),
+        // fall back without it if the parent job doesn't allow breakaway.
         let child = Command::new(exe)
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::from(stderr_file))
+            .stderr(Stdio::from(stderr_file.try_clone()?))
             .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB)
-            .spawn()?;
+            .spawn()
+            .or_else(|_| {
+                Command::new(exe)
+                    .args(args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::from(stderr_file))
+                    .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)
+                    .spawn()
+            })?;
 
         Ok(child.id())
     }
