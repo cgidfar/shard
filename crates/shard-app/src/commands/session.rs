@@ -166,7 +166,7 @@ pub fn create_session(
 }
 
 #[tauri::command]
-pub fn stop_session(id: String, force: bool) -> Result<(), String> {
+pub async fn stop_session(id: String, force: bool) -> Result<(), String> {
     let session_store = SessionStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
     let (repo, session) = session_store.find_by_id(&id).map_err(|e| e.to_string())?;
 
@@ -180,27 +180,24 @@ pub fn stop_session(id: String, force: bool) -> Result<(), String> {
         Frame::StopGraceful
     };
 
-    let rt = tokio::runtime::Handle::try_current().map_err(|e| e.to_string())?;
     let transport_addr = session.transport_addr.clone();
 
-    let rpc_ok = rt.block_on(async {
-        match NamedPipeTransport::connect(&transport_addr).await {
-            Ok(mut client) => {
-                let _ = protocol::write_frame(&mut client, &frame).await;
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                    loop {
-                        match protocol::read_frame(&mut client).await {
-                            Ok(Some(Frame::Status { .. })) | Ok(None) => return,
-                            _ => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
-                        }
+    let rpc_ok = match NamedPipeTransport::connect(&transport_addr).await {
+        Ok(mut client) => {
+            let _ = protocol::write_frame(&mut client, &frame).await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    match protocol::read_frame(&mut client).await {
+                        Ok(Some(Frame::Status { .. })) | Ok(None) => return,
+                        _ => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
                     }
-                })
-                .await;
-                true
-            }
-            Err(_) => false,
+                }
+            })
+            .await;
+            true
         }
-    });
+        Err(_) => false,
+    };
 
     if !rpc_ok {
         use shard_supervisor::process::{PlatformProcessControl, ProcessControl};
