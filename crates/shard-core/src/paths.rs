@@ -50,9 +50,21 @@ impl ShardPaths {
         self.repo_dir(alias).join("repo.db")
     }
 
-    /// Path to a repo's bare git clone
+    /// Path to a repo's bare git clone (remote repos only)
     pub fn repo_source(&self, alias: &str) -> PathBuf {
         self.repo_dir(alias).join("source.git")
+    }
+
+    /// Resolve the git source directory for a repo.
+    ///
+    /// - Local repo:  the original checkout (`local_path`)
+    /// - Remote repo: the bare clone (`source.git`)
+    pub fn repo_source_for_repo(&self, alias: &str, local_path: Option<&str>) -> PathBuf {
+        if let Some(lp) = local_path {
+            PathBuf::from(lp)
+        } else {
+            self.repo_source(alias)
+        }
     }
 
     /// Root directory for a repo's workspaces (fallback location in AppData).

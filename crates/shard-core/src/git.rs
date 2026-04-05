@@ -34,18 +34,18 @@ pub fn clone_bare(url: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Fetch latest changes into a bare repo.
-pub fn fetch(bare_repo: &Path) -> Result<()> {
-    run_git(&["fetch", "--all", "--prune"], Some(bare_repo))?;
+/// Fetch latest changes in a repo (bare or regular checkout).
+pub fn fetch(repo_dir: &Path) -> Result<()> {
+    run_git(&["fetch", "--all", "--prune"], Some(repo_dir))?;
     Ok(())
 }
 
-/// Create a git worktree from a bare repo.
+/// Create a git worktree from a repo (bare or regular checkout).
 ///
 /// If `new_branch` is Some, creates a new branch based on `start_point` (the branch arg).
 /// Otherwise checks out the existing branch directly.
 pub fn worktree_add(
-    bare_repo: &Path,
+    repo_dir: &Path,
     worktree_path: &Path,
     branch: &str,
     new_branch: Option<&str>,
@@ -53,36 +53,79 @@ pub fn worktree_add(
     let wt = worktree_path.to_str().ok_or_else(|| ShardError::Other("invalid path".into()))?;
     match new_branch {
         Some(nb) => {
-            // git worktree add -b <new_branch> <path> <start_point>
-            run_git(&["worktree", "add", "-b", nb, wt, branch], Some(bare_repo))?;
+            run_git(&["worktree", "add", "-b", nb, wt, branch], Some(repo_dir))?;
         }
         None => {
-            run_git(&["worktree", "add", wt, branch], Some(bare_repo))?;
+            run_git(&["worktree", "add", wt, branch], Some(repo_dir))?;
         }
     }
     Ok(())
 }
 
 /// Remove a git worktree.
-pub fn worktree_remove(bare_repo: &Path, worktree_path: &Path) -> Result<()> {
+pub fn worktree_remove(repo_dir: &Path, worktree_path: &Path) -> Result<()> {
     let wt = worktree_path.to_str().ok_or_else(|| ShardError::Other("invalid path".into()))?;
-    run_git(&["worktree", "remove", "--force", wt], Some(bare_repo))?;
+    run_git(&["worktree", "remove", "--force", wt], Some(repo_dir))?;
     Ok(())
 }
 
-/// List branches in a bare repo. Returns branch names without the refs/heads/ prefix.
-pub fn list_branches(bare_repo: &Path) -> Result<Vec<String>> {
+/// Prune stale worktree admin entries.
+pub fn worktree_prune(repo_dir: &Path) -> Result<()> {
+    run_git(&["worktree", "prune"], Some(repo_dir))?;
+    Ok(())
+}
+
+/// List branches in a repo. Returns branch names without the refs/heads/ prefix.
+pub fn list_branches(repo_dir: &Path) -> Result<Vec<String>> {
     let output = run_git(
         &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
-        Some(bare_repo),
+        Some(repo_dir),
     )?;
     Ok(output.lines().map(|s| s.to_string()).filter(|s| !s.is_empty()).collect())
 }
 
-/// Get the default branch of a bare repo (HEAD target).
-pub fn default_branch(bare_repo: &Path) -> Result<String> {
-    let output = run_git(&["symbolic-ref", "--short", "HEAD"], Some(bare_repo))?;
+/// Get the current branch (HEAD target) of a repo.
+pub fn default_branch(repo_dir: &Path) -> Result<String> {
+    let output = run_git(&["symbolic-ref", "--short", "HEAD"], Some(repo_dir))?;
     Ok(output)
+}
+
+/// Add a pattern to `.git/info/exclude` (per-repo gitignore, not committed).
+/// Idempotent — won't add if already present.
+pub fn add_to_exclude(repo_dir: &Path, pattern: &str) -> Result<()> {
+    let exclude_path = repo_dir.join(".git").join("info").join("exclude");
+    if let Some(parent) = exclude_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let contents = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+    if contents.lines().any(|line| line.trim() == pattern) {
+        return Ok(()); // Already present
+    }
+
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&exclude_path)?;
+    writeln!(f, "{}", pattern)?;
+    Ok(())
+}
+
+/// Remove a pattern from `.git/info/exclude`.
+pub fn remove_from_exclude(repo_dir: &Path, pattern: &str) -> Result<()> {
+    let exclude_path = repo_dir.join(".git").join("info").join("exclude");
+    if !exclude_path.exists() {
+        return Ok(());
+    }
+
+    let contents = std::fs::read_to_string(&exclude_path)?;
+    let filtered: Vec<&str> = contents
+        .lines()
+        .filter(|line| line.trim() != pattern)
+        .collect();
+    std::fs::write(&exclude_path, filtered.join("\n") + "\n")?;
+    Ok(())
 }
 
 /// Parse a git URL or path into optional (host, owner, name) components.

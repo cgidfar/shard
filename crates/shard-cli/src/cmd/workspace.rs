@@ -9,7 +9,7 @@ pub fn run(command: WorkspaceCommands) -> shard_core::Result<()> {
 
     match command {
         WorkspaceCommands::Create { repo, name, branch } => {
-            let ws = store.create(&repo, name.as_deref(), branch.as_deref())?;
+            let ws = store.create(&repo, name.as_deref(), branch.as_deref(), false)?;
             println!("Created workspace '{}:{}' on branch '{}'", repo, ws.name, ws.branch);
             println!("  Path: {}", ws.path);
         }

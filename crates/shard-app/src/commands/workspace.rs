@@ -15,7 +15,7 @@ pub fn create_workspace(
 ) -> Result<Workspace, String> {
     let store = WorkspaceStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
     store
-        .create(&repo, name.as_deref(), branch.as_deref())
+        .create(&repo, name.as_deref(), branch.as_deref(), false)
         .map_err(|e| e.to_string())
 }
 

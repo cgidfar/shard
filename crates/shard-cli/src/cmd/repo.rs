@@ -16,10 +16,11 @@ pub fn run(command: RepoCommands) -> shard_core::Result<()> {
 
             // Auto-create a workspace for the default branch
             let ws_store = WorkspaceStore::new(ShardPaths::new()?);
-            let source_dir = paths.repo_source(&repo.alias);
+            let is_local = repo.local_path.is_some();
+            let source_dir = paths.repo_source_for_repo(&repo.alias, repo.local_path.as_deref());
             match shard_core::git::default_branch(&source_dir) {
                 Ok(branch) => {
-                    match ws_store.create(&repo.alias, Some(&branch), Some(&branch)) {
+                    match ws_store.create(&repo.alias, Some(&branch), Some(&branch), is_local) {
                         Ok(ws) => println!("Created default workspace '{}'", ws.name),
                         Err(e) => eprintln!("Warning: could not auto-create workspace: {e}"),
                     }

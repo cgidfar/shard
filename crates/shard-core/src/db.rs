@@ -48,6 +48,7 @@ pub fn init_repo_db(conn: &Connection) -> Result<()> {
             name TEXT PRIMARY KEY,
             branch TEXT NOT NULL,
             path TEXT NOT NULL UNIQUE,
+            is_base INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL
         );
 
@@ -66,5 +67,7 @@ pub fn init_repo_db(conn: &Connection) -> Result<()> {
             FOREIGN KEY (workspace_name) REFERENCES workspaces(name)
         );"
     )?;
+    // Migration: add is_base column if missing (existing databases)
+    let _ = conn.execute_batch("ALTER TABLE workspaces ADD COLUMN is_base INTEGER NOT NULL DEFAULT 0;");
     Ok(())
 }

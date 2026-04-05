@@ -67,19 +67,23 @@ impl RepositoryStore {
         let local_path = {
             let p = std::path::Path::new(url);
             if p.is_dir() {
-                // Canonicalize to get the absolute path
-                p.canonicalize()
-                    .ok()
-                    .map(|c| c.to_string_lossy().to_string())
+                p.canonicalize().ok().map(|c| {
+                    let s = c.to_string_lossy().to_string();
+                    // Strip Windows extended-length prefix (\\?\) — git can't handle it
+                    s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+                })
             } else {
                 None
             }
         };
 
-        // Clone bare repo
-        let source_dir = self.paths.repo_source(&alias);
-        tracing::info!("cloning {} into {}", url, source_dir.display());
-        git::clone_bare(url, &source_dir)?;
+        // For remote repos, create a bare clone.
+        // For local repos, skip — we use the existing checkout directly.
+        if local_path.is_none() {
+            let source_dir = self.paths.repo_source(&alias);
+            tracing::info!("cloning {} into {}", url, source_dir.display());
+            git::clone_bare(url, &source_dir)?;
+        }
 
         // Initialize repo.db for this repo
         let repo_db_path = self.paths.repo_db(&alias);
@@ -159,25 +163,58 @@ impl RepositoryStore {
 
     /// Fetch latest changes for a repository.
     pub fn sync(&self, alias: &str) -> Result<()> {
-        let _repo = self.get(alias)?;
-        let source_dir = self.paths.repo_source(alias);
+        let repo = self.get(alias)?;
+        let source_dir = self.paths.repo_source_for_repo(alias, repo.local_path.as_deref());
         tracing::info!("syncing {}", alias);
         git::fetch(&source_dir)?;
         Ok(())
     }
 
     /// Remove a repository and all its data.
+    ///
+    /// For local repos: removes worktrees, prunes git state, cleans up `.shard/`
+    /// and DB records, but NEVER deletes the original checkout.
+    /// For remote repos: deletes the entire repo directory (bare clone + worktrees).
     pub fn remove(&self, alias: &str) -> Result<()> {
-        let _repo = self.get(alias)?;
+        let repo = self.get(alias)?;
+
+        if repo.local_path.is_some() {
+            let local_path = std::path::Path::new(repo.local_path.as_ref().unwrap());
+
+            // Remove non-base worktrees via git worktree remove
+            let ws_store = crate::workspaces::WorkspaceStore::new(ShardPaths::new()?);
+            if let Ok(workspaces) = ws_store.list(alias) {
+                for ws in workspaces {
+                    if !ws.is_base {
+                        let ws_dir = std::path::PathBuf::from(&ws.path);
+                        if ws_dir.exists() {
+                            let _ = git::worktree_remove(local_path, &ws_dir);
+                        }
+                    }
+                }
+            }
+
+            // Prune stale worktree admin entries
+            let _ = git::worktree_prune(local_path);
+
+            // Remove .shard/ directory if it exists
+            let shard_dir = local_path.join(".shard");
+            if shard_dir.exists() {
+                let _ = std::fs::remove_dir_all(&shard_dir);
+            }
+
+            // Clean up .git/info/exclude entry
+            let _ = git::remove_from_exclude(local_path, ".shard/");
+        }
 
         // Remove from index
         let conn = self.open_index()?;
         conn.execute("DELETE FROM repos WHERE alias = ?1", params![alias])?;
 
-        // Remove directory
+        // Remove repo data directory (DB, bare clone for remote, sessions)
         let repo_dir = self.paths.repo_dir(alias);
         if repo_dir.exists() {
-            std::fs::remove_dir_all(&repo_dir)?;
+            let _ = std::fs::remove_dir_all(&repo_dir);
         }
 
         Ok(())

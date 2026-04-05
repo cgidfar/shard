@@ -10,3 +10,4 @@ crates/shard-app/frontend/bun.lock
 
 # Shard workspace directories
 .shard/
+.claude/

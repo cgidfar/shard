@@ -14,6 +14,7 @@ pub struct Workspace {
     pub name: String,
     pub branch: String,
     pub path: String,
+    pub is_base: bool,
     pub created_at: u64,
 }
 
@@ -26,24 +27,27 @@ impl WorkspaceStore {
         Self { paths }
     }
 
-    /// Create a new workspace (git worktree) for a repo.
+    /// Create a new workspace for a repo.
+    ///
+    /// If `is_base` is true, the workspace points to the original checkout
+    /// (no git worktree created). Otherwise a git worktree is created.
     ///
     /// If a custom name is given AND it differs from the branch, a new git branch
-    /// is created with that name (based on the source branch). This avoids the git
-    /// limitation of one worktree per branch.
-    ///
-    /// If no branch is given, the repo's default branch is used.
+    /// is created with that name (based on the source branch).
     pub fn create(
         &self,
         repo_alias: &str,
         name: Option<&str>,
         branch: Option<&str>,
+        is_base: bool,
     ) -> Result<Workspace> {
-        // Verify the repo exists and get its local_path
         let repo_store = RepositoryStore::new(ShardPaths::new()?);
         let repo = repo_store.get(repo_alias)?;
 
-        let source_dir = self.paths.repo_source(repo_alias);
+        let source_dir = self.paths.repo_source_for_repo(
+            repo_alias,
+            repo.local_path.as_deref(),
+        );
 
         // Determine base branch
         let base_branch = match branch {
@@ -58,7 +62,6 @@ impl WorkspaceStore {
         };
 
         // If the workspace name differs from the branch, create a new branch.
-        // This handles the case where the base branch already has a worktree.
         let (branch_for_db, new_branch) = if ws_name != base_branch {
             (ws_name.clone(), Some(ws_name.clone()))
         } else {
@@ -78,21 +81,34 @@ impl WorkspaceStore {
             return Err(ShardError::WorkspaceAlreadyExists(ws_name));
         }
 
-        // Resolve workspace directory:
-        // Local repos: .shard/{name}/ next to the original repo
-        // Remote repos: AppData fallback
-        let ws_dir = self.paths.workspace_dir_for_repo(
-            repo_alias,
-            &ws_name,
-            repo.local_path.as_deref(),
-        );
-        tracing::info!("creating worktree at {}", ws_dir.display());
-        git::worktree_add(
-            &source_dir,
-            &ws_dir,
-            &base_branch,
-            new_branch.as_deref(),
-        )?;
+        let ws_dir = if is_base {
+            // Base workspace = original checkout, no worktree needed
+            let lp = repo.local_path.as_deref().ok_or_else(|| {
+                ShardError::Other("is_base=true but repo has no local_path".into())
+            })?;
+            std::path::PathBuf::from(lp)
+        } else {
+            // Create a git worktree
+            let dir = self.paths.workspace_dir_for_repo(
+                repo_alias,
+                &ws_name,
+                repo.local_path.as_deref(),
+            );
+            tracing::info!("creating worktree at {}", dir.display());
+            git::worktree_add(
+                &source_dir,
+                &dir,
+                &base_branch,
+                new_branch.as_deref(),
+            )?;
+
+            // For local repos, hide .shard/ from git status on first worktree
+            if repo.local_path.is_some() {
+                let _ = git::add_to_exclude(&source_dir, ".shard/");
+            }
+
+            dir
+        };
 
         // Record in DB
         let now = SystemTime::now()
@@ -102,14 +118,15 @@ impl WorkspaceStore {
         let path_str = ws_dir.to_string_lossy().to_string();
 
         conn.execute(
-            "INSERT INTO workspaces (name, branch, path, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![ws_name, branch_for_db, path_str, now],
+            "INSERT INTO workspaces (name, branch, path, is_base, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![ws_name, branch_for_db, path_str, is_base as i32, now],
         )?;
 
         Ok(Workspace {
             name: ws_name,
             branch: branch_for_db,
             path: path_str,
+            is_base,
             created_at: now,
         })
     }
@@ -124,14 +141,16 @@ impl WorkspaceStore {
         let conn = db::open_connection(&repo_db_path)?;
 
         let mut stmt = conn.prepare(
-            "SELECT name, branch, path, created_at FROM workspaces ORDER BY name",
+            "SELECT name, branch, path, is_base, created_at FROM workspaces ORDER BY name",
         )?;
         let workspaces = stmt.query_map([], |row| {
+            let is_base_int: i32 = row.get(3)?;
             Ok(Workspace {
                 name: row.get(0)?,
                 branch: row.get(1)?,
                 path: row.get(2)?,
-                created_at: row.get(3)?,
+                is_base: is_base_int != 0,
+                created_at: row.get(4)?,
             })
         })?;
 
@@ -148,14 +167,16 @@ impl WorkspaceStore {
         let conn = db::open_connection(&repo_db_path)?;
 
         conn.query_row(
-            "SELECT name, branch, path, created_at FROM workspaces WHERE name = ?1",
+            "SELECT name, branch, path, is_base, created_at FROM workspaces WHERE name = ?1",
             params![ws_name],
             |row| {
+                let is_base_int: i32 = row.get(3)?;
                 Ok(Workspace {
                     name: row.get(0)?,
                     branch: row.get(1)?,
                     path: row.get(2)?,
-                    created_at: row.get(3)?,
+                    is_base: is_base_int != 0,
+                    created_at: row.get(4)?,
                 })
             },
         )
@@ -163,14 +184,24 @@ impl WorkspaceStore {
     }
 
     /// Remove a workspace (git worktree + DB record).
+    ///
+    /// If the workspace is a base checkout (`is_base=true`), only the DB record
+    /// is removed — the original directory is never touched.
     pub fn remove(&self, repo_alias: &str, ws_name: &str) -> Result<()> {
         let ws = self.get(repo_alias, ws_name)?;
-        let source_dir = self.paths.repo_source(repo_alias);
-        let ws_dir = std::path::PathBuf::from(&ws.path);
 
-        // Remove the git worktree
-        if ws_dir.exists() {
-            git::worktree_remove(&source_dir, &ws_dir)?;
+        if !ws.is_base {
+            let repo_store = RepositoryStore::new(ShardPaths::new()?);
+            let repo = repo_store.get(repo_alias)?;
+            let source_dir = self.paths.repo_source_for_repo(
+                repo_alias,
+                repo.local_path.as_deref(),
+            );
+            let ws_dir = std::path::PathBuf::from(&ws.path);
+
+            if ws_dir.exists() {
+                git::worktree_remove(&source_dir, &ws_dir)?;
+            }
         }
 
         // Remove from DB
