@@ -1,30 +1,15 @@
+@import "./tokens.css";
+
 * {
   margin: 0;
   padding: 0;
   box-sizing: border-box;
 }
 
-:root {
-  --bg-primary: #1e1e2e;
-  --bg-secondary: #181825;
-  --bg-surface: #11111b;
-  --text-primary: #cdd6f4;
-  --text-secondary: #a6adc8;
-  --text-muted: #6c7086;
-  --accent: #89b4fa;
-  --accent-hover: #74c7ec;
-  --border: #313244;
-  --danger: #f38ba8;
-  --success: #a6e3a1;
-  --warning: #f9e2af;
-  --tab-active: #1e1e2e;
-  --tab-inactive: #181825;
-}
-
 html, body {
   height: 100%;
-  font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
-  font-size: 13px;
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
   color: var(--text-primary);
   background: var(--bg-primary);
   overflow: hidden;
@@ -48,9 +33,9 @@ html, body {
 }
 
 .sidebar-header {
-  padding: 12px 16px;
+  padding: var(--space-3) var(--space-4);
   font-weight: 600;
-  font-size: 14px;
+  font-size: var(--text-md);
   color: var(--text-primary);
   border-bottom: 1px solid var(--border);
   display: flex;
@@ -59,12 +44,12 @@ html, body {
 }
 
 .sidebar-section {
-  padding: 8px 0;
+  padding: var(--space-2) 0;
 }
 
 .sidebar-section-title {
-  padding: 4px 16px;
-  font-size: 11px;
+  padding: var(--space-1) var(--space-4);
+  font-size: var(--text-xs);
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.05em;
@@ -72,15 +57,16 @@ html, body {
 }
 
 .tree-item {
-  padding: 6px 16px 6px 24px;
+  padding: 6px var(--space-4) 6px var(--space-6);
   cursor: pointer;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   color: var(--text-secondary);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  transition: background var(--transition-fast), color var(--transition-fast);
 }
 
 .tree-item:hover {
@@ -94,9 +80,9 @@ html, body {
 }
 
 .tree-item .status-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
+  width: var(--space-2);
+  height: var(--space-2);
+  border-radius: var(--radius-full);
   flex-shrink: 0;
 }
 
@@ -107,13 +93,14 @@ html, body {
 .status-dot.exited { background: var(--text-muted); }
 
 .tree-group {
-  padding: 6px 16px;
+  padding: 6px var(--space-4);
   cursor: pointer;
   display: flex;
   align-items: center;
   gap: 6px;
   font-weight: 500;
   color: var(--text-primary);
+  transition: background var(--transition-fast);
 }
 
 .tree-group:hover {
@@ -135,9 +122,11 @@ html, body {
   cursor: pointer;
   color: var(--text-muted);
   padding: 2px 6px;
-  border-radius: 4px;
-  font-size: 16px;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-md);
+  font-family: var(--font-sans);
   line-height: 1;
+  transition: color var(--transition-fast), background var(--transition-fast);
 }
 
 .btn:hover {
@@ -165,16 +154,18 @@ html, body {
 .tab {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 0 16px;
+  gap: var(--space-2);
+  padding: 0 var(--space-4);
   height: 36px;
   cursor: pointer;
   border-right: 1px solid var(--border);
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: var(--text-sm);
+  font-family: var(--font-sans);
   white-space: nowrap;
   flex-shrink: 0;
   background: var(--tab-inactive);
+  transition: color var(--transition-fast), background var(--transition-fast);
 }
 
 .tab:hover {
@@ -188,13 +179,14 @@ html, body {
 }
 
 .tab-close {
-  font-size: 14px;
+  font-size: var(--text-md);
   cursor: pointer;
   opacity: 0.5;
   border: none;
   background: none;
   color: inherit;
   padding: 0 2px;
+  transition: opacity var(--transition-fast);
 }
 
 .tab-close:hover {
@@ -210,7 +202,7 @@ html, body {
 
 #terminal-container .xterm {
   height: 100%;
-  padding: 4px;
+  padding: var(--space-1);
 }
 
 /* Empty state */
@@ -221,19 +213,19 @@ html, body {
   justify-content: center;
   height: 100%;
   color: var(--text-muted);
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 .empty-state-title {
-  font-size: 18px;
+  font-size: var(--text-lg);
   font-weight: 500;
   color: var(--text-secondary);
 }
 
 /* Scrollbar styling */
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: var(--space-2);
+  height: var(--space-2);
 }
 
 ::-webkit-scrollbar-track {
@@ -242,7 +234,7 @@ html, body {
 
 ::-webkit-scrollbar-thumb {
   background: var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
 }
 
 ::-webkit-scrollbar-thumb:hover {
