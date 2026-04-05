@@ -10,10 +10,9 @@ import {
 } from "../lib/api";
 
 export interface SidebarCallbacks {
-  onSessionClick: (repo: string, sessionId: string) => void;
+  onSessionClick: (repo: string, sessionId: string, sessionLabel: string) => void;
   onCreateSession: (repo: string, workspace: string) => void;
   onCreateWorkspace: (repo: string) => void;
-  onAddRepo: () => void;
 }
 
 interface RepoTree {
@@ -28,10 +27,17 @@ export class Sidebar {
   private el: HTMLElement;
   private callbacks: SidebarCallbacks;
   private tree: RepoTree[] = [];
+  private activeSessionId: string | null = null;
+  private confirmingStopId: string | null = null;
 
   constructor(el: HTMLElement, callbacks: SidebarCallbacks) {
     this.el = el;
     this.callbacks = callbacks;
+  }
+
+  setActiveSession(sessionId: string | null) {
+    this.activeSessionId = sessionId;
+    this.render();
   }
 
   async refresh() {
@@ -55,161 +61,218 @@ export class Sidebar {
     this.render();
   }
 
+  private deriveSessionLabel(si: SessionInfo): string {
+    try {
+      const cmd: string[] = JSON.parse(si.session.command_json);
+      const exe = cmd[0]?.split(/[/\\]/).pop() || "session";
+      return exe;
+    } catch {
+      return "session";
+    }
+  }
+
   private render() {
     this.el.innerHTML = "";
 
-    // Header
-    const header = document.createElement("div");
-    header.className = "sidebar-header";
-    const headerLabel = document.createElement("span");
-    headerLabel.textContent = "Shard";
-    header.appendChild(headerLabel);
-
-    const addRepoBtn = document.createElement("button");
-    addRepoBtn.className = "btn";
-    addRepoBtn.textContent = "+";
-    addRepoBtn.title = "Add repository";
-    addRepoBtn.addEventListener("click", () => this.callbacks.onAddRepo());
-    header.appendChild(addRepoBtn);
-
-    this.el.appendChild(header);
-
     if (this.tree.length === 0) {
       const empty = document.createElement("div");
-      empty.style.padding = "16px";
-      empty.style.color = "var(--text-muted)";
-      empty.style.fontSize = "12px";
-      empty.textContent =
-        "No repositories. Use shardctl to add repos and create sessions.";
+      empty.className = "sidebar-empty";
+      empty.innerHTML = `
+        <span class="sidebar-empty-title">No shards yet</span>
+        <span class="sidebar-empty-hint">Add a local folder or clone a remote repo to get started</span>
+      `;
       this.el.appendChild(empty);
       return;
     }
 
-    for (const { repo, workspaces } of this.tree) {
-      const section = document.createElement("div");
-      section.className = "sidebar-section";
+    for (let ri = 0; ri < this.tree.length; ri++) {
+      const { repo, workspaces } = this.tree[ri];
 
-      // Repo group header
+      if (ri > 0) {
+        const divider = document.createElement("div");
+        divider.className = "sidebar-divider";
+        this.el.appendChild(divider);
+      }
+
+      // Repo group
       const repoGroup = document.createElement("div");
-      repoGroup.className = "tree-group";
-      repoGroup.innerHTML = `<span>\u25B6</span> <span>${repo.alias}</span>`;
-      let open = true;
+      repoGroup.className = "tree-group tree-group-repo";
+      let repoOpen = true;
 
-      // Add workspace button on the repo row
+      const repoArrow = document.createElement("span");
+      repoArrow.className = "tree-arrow";
+      repoArrow.textContent = "▼";
+
+      const repoLabel = document.createElement("span");
+      repoLabel.className = "tree-label";
+      repoLabel.textContent = repo.alias;
+
       const addWsBtn = document.createElement("button");
-      addWsBtn.className = "btn";
+      addWsBtn.className = "tree-action";
       addWsBtn.textContent = "+";
       addWsBtn.title = "New workspace";
-      addWsBtn.style.marginLeft = "auto";
       addWsBtn.addEventListener("click", (e) => {
         e.stopPropagation();
         this.callbacks.onCreateWorkspace(repo.alias);
       });
+
+      repoGroup.appendChild(repoArrow);
+      repoGroup.appendChild(repoLabel);
       repoGroup.appendChild(addWsBtn);
 
-      const children = document.createElement("div");
-      children.className = "tree-children open";
+      const repoChildren = document.createElement("div");
+      repoChildren.className = "tree-children open";
 
       repoGroup.addEventListener("click", (e) => {
-        if ((e.target as HTMLElement).closest(".btn")) return;
-        open = !open;
-        children.className = open ? "tree-children open" : "tree-children";
-        repoGroup.querySelector("span")!.textContent = open
-          ? "\u25BC"
-          : "\u25B6";
+        if ((e.target as HTMLElement).closest(".tree-action")) return;
+        repoOpen = !repoOpen;
+        repoChildren.className = repoOpen ? "tree-children open" : "tree-children";
+        repoArrow.textContent = repoOpen ? "▼" : "▶";
       });
-      repoGroup.querySelector("span")!.textContent = "\u25BC";
+
+      this.el.appendChild(repoGroup);
 
       for (const { workspace, sessions } of workspaces) {
-        // Workspace sub-group
-        const wsItem = document.createElement("div");
-        wsItem.className = "tree-group";
-        wsItem.style.paddingLeft = "28px";
-        wsItem.style.fontSize = "12px";
+        // Workspace row
+        const wsGroup = document.createElement("div");
+        wsGroup.className = "tree-group tree-group-ws";
+        let wsOpen = true;
+
+        const wsArrow = document.createElement("span");
+        wsArrow.className = "tree-arrow";
+        wsArrow.textContent = sessions.length > 0 ? "▼" : "▶";
+
+        // Default workspace indicator
+        const isBase = workspace.name === "main" || workspace.name === "master";
+        if (isBase) {
+          const pin = document.createElement("span");
+          pin.className = "ws-pin";
+          pin.innerHTML = `<svg width="10" height="10" viewBox="0 0 10 10"><circle cx="5" cy="5" r="2" fill="none" stroke="currentColor" stroke-width="1.2"/><circle cx="5" cy="5" r="0.8" fill="currentColor"/></svg>`;
+          wsGroup.appendChild(wsArrow);
+          wsGroup.appendChild(pin);
+        } else {
+          wsGroup.appendChild(wsArrow);
+        }
 
         const wsLabel = document.createElement("span");
+        wsLabel.className = "tree-label";
         wsLabel.textContent = workspace.name;
-        wsItem.appendChild(wsLabel);
 
-        // Add session button
-        const addBtn = document.createElement("button");
-        addBtn.className = "btn";
-        addBtn.textContent = "+";
-        addBtn.title = "New session";
-        addBtn.style.marginLeft = "auto";
-        addBtn.addEventListener("click", (e) => {
+        const addSessionBtn = document.createElement("button");
+        addSessionBtn.className = "tree-action";
+        addSessionBtn.textContent = "+";
+        addSessionBtn.title = "New session";
+        addSessionBtn.addEventListener("click", (e) => {
           e.stopPropagation();
           this.callbacks.onCreateSession(repo.alias, workspace.name);
         });
-        wsItem.appendChild(addBtn);
 
-        children.appendChild(wsItem);
+        wsGroup.appendChild(wsLabel);
+        wsGroup.appendChild(addSessionBtn);
+
+        const wsChildren = document.createElement("div");
+        wsChildren.className = sessions.length > 0 ? "tree-children open" : "tree-children";
+
+        wsGroup.addEventListener("click", (e) => {
+          if ((e.target as HTMLElement).closest(".tree-action")) return;
+          wsOpen = !wsOpen;
+          wsChildren.className = wsOpen ? "tree-children open" : "tree-children";
+          wsArrow.textContent = wsOpen ? "▼" : "▶";
+        });
+
+        repoChildren.appendChild(wsGroup);
 
         // Sessions
         for (const si of sessions) {
           const isRunning = si.session.status === "running";
-          const isDead =
-            si.session.status === "failed" ||
-            si.session.status === "exited" ||
-            si.session.status === "stopped";
+          const isDead = ["failed", "exited", "stopped"].includes(si.session.status);
+          const isActive = si.session.id === this.activeSessionId;
+          const isConfirming = si.session.id === this.confirmingStopId;
 
-          const sessionItem = document.createElement("div");
-          sessionItem.className = "tree-item";
-          sessionItem.style.paddingLeft = "44px";
+          const sessionRow = document.createElement("div");
+          sessionRow.className = `tree-item tree-item-session${isActive ? " active" : ""}${isDead ? " dead" : ""}`;
 
-          const dot = document.createElement("span");
-          dot.className = `status-dot ${si.session.status}`;
-          sessionItem.appendChild(dot);
+          if (isConfirming) {
+            // Inline stop confirmation
+            sessionRow.className = "tree-item tree-item-session confirming";
 
-          const cmd: string[] = JSON.parse(si.session.command_json);
-          const label = document.createElement("span");
-          label.textContent = `${si.session.id.slice(0, 8)} ${cmd.join(" ")}`;
-          label.style.overflow = "hidden";
-          label.style.textOverflow = "ellipsis";
-          label.style.flex = "1";
-          sessionItem.appendChild(label);
+            const label = document.createElement("span");
+            label.className = "tree-label";
+            label.textContent = "Stop session?";
 
-          if (isRunning) {
-            // Click to attach
-            sessionItem.style.cursor = "pointer";
-            sessionItem.addEventListener("click", () => {
-              this.callbacks.onSessionClick(si.repo, si.session.id);
-            });
-
-            // Stop button
             const stopBtn = document.createElement("button");
-            stopBtn.className = "btn";
-            stopBtn.textContent = "\u25A0";
-            stopBtn.title = "Stop session";
-            stopBtn.style.fontSize = "10px";
+            stopBtn.className = "confirm-stop";
+            stopBtn.textContent = "Stop";
             stopBtn.addEventListener("click", (e) => {
               e.stopPropagation();
+              this.confirmingStopId = null;
               stopSession(si.session.id).then(() => this.refresh());
             });
-            sessionItem.appendChild(stopBtn);
-          } else if (isDead) {
-            // Dim dead sessions
-            sessionItem.style.opacity = "0.6";
 
-            // Remove button
-            const removeBtn = document.createElement("button");
-            removeBtn.className = "btn";
-            removeBtn.textContent = "\u00D7";
-            removeBtn.title = "Remove session";
-            removeBtn.addEventListener("click", (e) => {
+            const cancelBtn = document.createElement("button");
+            cancelBtn.className = "confirm-cancel";
+            cancelBtn.textContent = "No";
+            cancelBtn.addEventListener("click", (e) => {
               e.stopPropagation();
-              removeSession(si.session.id).then(() => this.refresh());
+              this.confirmingStopId = null;
+              this.render();
             });
-            sessionItem.appendChild(removeBtn);
+
+            sessionRow.appendChild(label);
+            sessionRow.appendChild(stopBtn);
+            sessionRow.appendChild(cancelBtn);
+          } else {
+            const dot = document.createElement("span");
+            dot.className = `status-dot ${si.session.status}`;
+            sessionRow.appendChild(dot);
+
+            const label = document.createElement("span");
+            label.className = "tree-label";
+            label.textContent = this.deriveSessionLabel(si);
+            sessionRow.appendChild(label);
+
+            const closeBtn = document.createElement("button");
+            closeBtn.className = "tree-action tree-action-close";
+            closeBtn.textContent = "×";
+
+            if (isRunning) {
+              sessionRow.style.cursor = "pointer";
+              sessionRow.addEventListener("click", (e) => {
+                if ((e.target as HTMLElement).closest(".tree-action")) return;
+                this.callbacks.onSessionClick(si.repo, si.session.id, this.deriveSessionLabel(si));
+              });
+
+              closeBtn.title = "Stop session";
+              closeBtn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                this.confirmingStopId = si.session.id;
+                this.render();
+              });
+            } else {
+              // Dead session — click to view output, × removes
+              sessionRow.style.cursor = "pointer";
+              sessionRow.addEventListener("click", (e) => {
+                if ((e.target as HTMLElement).closest(".tree-action")) return;
+                this.callbacks.onSessionClick(si.repo, si.session.id, this.deriveSessionLabel(si));
+              });
+
+              closeBtn.title = "Remove session";
+              closeBtn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                removeSession(si.session.id).then(() => this.refresh());
+              });
+            }
+
+            sessionRow.appendChild(closeBtn);
           }
 
-          children.appendChild(sessionItem);
+          wsChildren.appendChild(sessionRow);
         }
+
+        repoChildren.appendChild(wsChildren);
       }
 
-      section.appendChild(repoGroup);
-      section.appendChild(children);
-      this.el.appendChild(section);
+      this.el.appendChild(repoChildren);
     }
   }
 }

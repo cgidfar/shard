@@ -1,13 +1,24 @@
 import { createTerminalSession, type TerminalSession } from "../lib/terminal";
 
+export interface TerminalPaneCallbacks {
+  onAddShard: () => void;
+}
+
 export class TerminalPane {
   private container: HTMLElement;
+  private callbacks: TerminalPaneCallbacks;
   private sessions: Map<string, { el: HTMLDivElement; session: TerminalSession }> =
     new Map();
   private activeId: string | null = null;
+  private hasShards: boolean = false;
 
-  constructor(container: HTMLElement) {
+  constructor(container: HTMLElement, callbacks: TerminalPaneCallbacks) {
     this.container = container;
+    this.callbacks = callbacks;
+  }
+
+  setHasShards(has: boolean) {
+    this.hasShards = has;
   }
 
   open(sessionId: string) {
@@ -16,7 +27,6 @@ export class TerminalPane {
       return;
     }
 
-    // Create a wrapper div for this terminal
     const el = document.createElement("div");
     el.style.position = "absolute";
     el.style.inset = "0";
@@ -29,7 +39,6 @@ export class TerminalPane {
   }
 
   show(sessionId: string) {
-    // Hide current
     if (this.activeId && this.sessions.has(this.activeId)) {
       this.sessions.get(this.activeId)!.el.style.display = "none";
     }
@@ -41,6 +50,7 @@ export class TerminalPane {
       entry.session.fitAddon.fit();
       entry.session.terminal.focus();
     }
+    this.hideEmpty();
   }
 
   close(sessionId: string) {
@@ -56,8 +66,8 @@ export class TerminalPane {
     }
   }
 
-  hasSession(sessionId: string): boolean {
-    return this.sessions.has(sessionId);
+  getActiveId(): string | null {
+    return this.activeId;
   }
 
   showEmpty() {
@@ -66,20 +76,34 @@ export class TerminalPane {
     }
     this.activeId = null;
 
-    // Show empty state if no terminals are open
-    if (this.sessions.size === 0) {
-      let empty = this.container.querySelector(".empty-state");
-      if (!empty) {
-        empty = document.createElement("div");
-        empty.className = "empty-state";
-        empty.innerHTML = `
-          <div class="empty-state-title">No session open</div>
-          <div>Click a session in the sidebar or create a new one</div>
-        `;
-        this.container.appendChild(empty);
-      }
-      (empty as HTMLElement).style.display = "flex";
+    let empty = this.container.querySelector(".empty-state") as HTMLElement;
+    if (!empty) {
+      empty = document.createElement("div");
+      empty.className = "empty-state";
+      this.container.appendChild(empty);
     }
+
+    if (!this.hasShards) {
+      // First launch / no shards
+      empty.innerHTML = `
+        <div class="empty-welcome">Welcome to Shard</div>
+        <div class="empty-subtitle">Your agentic workspaces, all in one place</div>
+        <button class="empty-cta" id="empty-add-shard">+ Add your first shard</button>
+        <div class="empty-cli-hint">or from the command line</div>
+        <div class="empty-cli"><code>shardctl repo add C:\\Projects\\my-repo</code></div>
+      `;
+      empty.querySelector("#empty-add-shard")?.addEventListener("click", () => {
+        this.callbacks.onAddShard();
+      });
+    } else {
+      // Has shards but no session selected
+      empty.innerHTML = `
+        <div class="empty-state-title">No session open</div>
+        <div class="empty-state-hint">Click a session in the sidebar or create a new one</div>
+      `;
+    }
+
+    empty.style.display = "flex";
   }
 
   hideEmpty() {

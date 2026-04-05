@@ -1,38 +1,47 @@
 import "@xterm/xterm/css/xterm.css";
+import { TitleBar } from "./components/TitleBar";
 import { Sidebar } from "./components/Sidebar";
-import { TabBar } from "./components/TabBar";
 import { TerminalPane } from "./components/TerminalPane";
-import { addRepo, createSession, createWorkspace } from "./lib/api";
+import { AddShardDialog } from "./components/AddShardDialog";
+import { addRepo, createSession, createWorkspace, listRepos } from "./lib/api";
 
+const titlebarEl = document.getElementById("titlebar")!;
 const sidebarEl = document.getElementById("sidebar")!;
-const tabBarEl = document.getElementById("tab-bar")!;
 const terminalContainer = document.getElementById("terminal-container")!;
 
-const terminalPane = new TerminalPane(terminalContainer);
+const dialog = new AddShardDialog();
 
-const tabBar = new TabBar(tabBarEl, {
-  onSelect(sessionId: string) {
-    terminalPane.hideEmpty();
-    terminalPane.show(sessionId);
-    tabBar.setActive(sessionId);
-  },
-  onClose(sessionId: string) {
-    terminalPane.close(sessionId);
-    tabBar.removeTab(sessionId);
-    if (!tabBar.getActiveId()) {
-      terminalPane.showEmpty();
-    }
+async function openAddShardDialog() {
+  const result = await dialog.open();
+  if (!result) return;
+  try {
+    await addRepo(result.url, result.alias);
+    await sidebar.refresh();
+    await updateEmptyState();
+  } catch (err) {
+    alert(`Failed to add shard: ${err}`);
+  }
+}
+
+const terminalPane = new TerminalPane(terminalContainer, {
+  onAddShard: openAddShardDialog,
+});
+
+const titleBar = new TitleBar(titlebarEl, {
+  onAddShard: openAddShardDialog,
+  onToggleSidebar() {
+    sidebarEl.classList.toggle("collapsed");
   },
 });
 
 const sidebar = new Sidebar(sidebarEl, {
-  onSessionClick(_repo: string, sessionId: string) {
-    openSession(_repo, sessionId);
+  onSessionClick(repo: string, sessionId: string, sessionLabel: string) {
+    openSession(repo, sessionId, sessionLabel);
   },
   async onCreateSession(repo: string, workspace: string) {
     try {
       const session = await createSession(repo, workspace);
-      openSession(repo, session.id);
+      openSession(repo, session.id, "session");
       sidebar.refresh();
     } catch (err) {
       console.error("Failed to create session:", err);
@@ -48,39 +57,32 @@ const sidebar = new Sidebar(sidebarEl, {
       alert(`Failed to create workspace: ${err}`);
     }
   },
-  async onAddRepo() {
-    const url = prompt(
-      "Git URL, SSH address, or local path:\n\n" +
-        "Examples:\n" +
-        "  https://github.com/user/repo\n" +
-        "  git@github.com:user/repo.git\n" +
-        "  C:\\Projects\\my-repo"
-    );
-    if (!url || !url.trim()) return;
-
-    const alias = prompt(
-      "Short alias (leave blank to auto-derive from URL):"
-    );
-
-    try {
-      await addRepo(url.trim(), alias?.trim() || undefined);
-      sidebar.refresh();
-    } catch (err) {
-      alert(`Failed to add repo: ${err}`);
-    }
-  },
 });
 
-function openSession(repo: string, sessionId: string) {
-  const shortId = sessionId.slice(0, 8);
-  tabBar.addTab(sessionId, `${repo}:${shortId}`);
-  terminalPane.hideEmpty();
+function openSession(repo: string, sessionId: string, sessionLabel: string) {
   terminalPane.open(sessionId);
+  sidebar.setActiveSession(sessionId);
+  titleBar.setBreadcrumb({
+    repo,
+    workspace: "main",
+    session: sessionLabel,
+    status: "running",
+  });
+}
+
+async function updateEmptyState() {
+  const repos = await listRepos();
+  terminalPane.setHasShards(repos.length > 0);
 }
 
 // Initial load
-terminalPane.showEmpty();
-sidebar.refresh();
+async function init() {
+  await updateEmptyState();
+  terminalPane.showEmpty();
+  await sidebar.refresh();
+}
 
-// Refresh sidebar periodically to pick up external changes
+init();
+
+// Refresh sidebar periodically
 setInterval(() => sidebar.refresh(), 5000);
