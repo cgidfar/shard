@@ -6,6 +6,7 @@ use crate::process::ProcessControl;
 const STILL_ACTIVE: u32 = 259;
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
 const DETACHED_PROCESS: u32 = 0x00000008;
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
 
 pub struct WindowsProcessControl;
 
@@ -63,7 +64,7 @@ impl ProcessControl for WindowsProcessControl {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_file))
-            .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)
+            .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB)
             .spawn()?;
 
         Ok(child.id())
