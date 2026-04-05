@@ -30,6 +30,8 @@ export class Sidebar {
   private activeSessionId: string | null = null;
   private confirmingStopId: string | null = null;
   private stoppingId: string | null = null;
+  private expandState: Map<string, boolean> = new Map(); // key → open
+  private refreshing = false;
 
   constructor(el: HTMLElement, callbacks: SidebarCallbacks) {
     this.el = el;
@@ -42,24 +44,31 @@ export class Sidebar {
   }
 
   async refresh() {
-    const repos = await listRepos();
-    this.tree = [];
+    if (this.refreshing) return;
+    this.refreshing = true;
+    try {
+      const repos = await listRepos();
+      const tree: RepoTree[] = [];
 
-    for (const repo of repos) {
-      const workspaces = await listWorkspaces(repo.alias);
-      const sessions = await listSessions(repo.alias);
+      for (const repo of repos) {
+        const workspaces = await listWorkspaces(repo.alias);
+        const sessions = await listSessions(repo.alias);
 
-      const wsTree = workspaces.map((ws) => ({
-        workspace: ws,
-        sessions: sessions.filter(
-          (s) => s.session.workspace_name === ws.name
-        ),
-      }));
+        const wsTree = workspaces.map((ws) => ({
+          workspace: ws,
+          sessions: sessions.filter(
+            (s) => s.session.workspace_name === ws.name
+          ),
+        }));
 
-      this.tree.push({ repo, workspaces: wsTree });
+        tree.push({ repo, workspaces: wsTree });
+      }
+
+      this.tree = tree;
+      this.render();
+    } finally {
+      this.refreshing = false;
     }
-
-    this.render();
   }
 
   private deriveSessionLabel(si: SessionInfo): string {
@@ -98,11 +107,12 @@ export class Sidebar {
       // Repo group
       const repoGroup = document.createElement("div");
       repoGroup.className = "tree-group tree-group-repo";
-      let repoOpen = true;
+      const repoKey = `repo:${repo.alias}`;
+      if (!this.expandState.has(repoKey)) this.expandState.set(repoKey, true);
 
       const repoArrow = document.createElement("span");
       repoArrow.className = "tree-arrow";
-      repoArrow.textContent = "▼";
+      repoArrow.textContent = this.expandState.get(repoKey) ? "▼" : "▶";
 
       const repoLabel = document.createElement("span");
       repoLabel.className = "tree-label";
@@ -122,13 +132,14 @@ export class Sidebar {
       repoGroup.appendChild(addWsBtn);
 
       const repoChildren = document.createElement("div");
-      repoChildren.className = "tree-children open";
+      repoChildren.className = this.expandState.get(repoKey) ? "tree-children open" : "tree-children";
 
       repoGroup.addEventListener("click", (e) => {
         if ((e.target as HTMLElement).closest(".tree-action")) return;
-        repoOpen = !repoOpen;
-        repoChildren.className = repoOpen ? "tree-children open" : "tree-children";
-        repoArrow.textContent = repoOpen ? "▼" : "▶";
+        const open = !this.expandState.get(repoKey);
+        this.expandState.set(repoKey, open);
+        repoChildren.className = open ? "tree-children open" : "tree-children";
+        repoArrow.textContent = open ? "▼" : "▶";
       });
 
       this.el.appendChild(repoGroup);
@@ -137,11 +148,12 @@ export class Sidebar {
         // Workspace row
         const wsGroup = document.createElement("div");
         wsGroup.className = "tree-group tree-group-ws";
-        let wsOpen = true;
+        const wsKey = `ws:${repo.alias}:${workspace.name}`;
+        if (!this.expandState.has(wsKey)) this.expandState.set(wsKey, sessions.length > 0);
 
         const wsArrow = document.createElement("span");
         wsArrow.className = "tree-arrow";
-        wsArrow.textContent = sessions.length > 0 ? "▼" : "▶";
+        wsArrow.textContent = this.expandState.get(wsKey) ? "▼" : "▶";
 
         // Default workspace indicator
         const isBase = workspace.name === "main" || workspace.name === "master";
@@ -172,13 +184,14 @@ export class Sidebar {
         wsGroup.appendChild(addSessionBtn);
 
         const wsChildren = document.createElement("div");
-        wsChildren.className = sessions.length > 0 ? "tree-children open" : "tree-children";
+        wsChildren.className = this.expandState.get(wsKey) ? "tree-children open" : "tree-children";
 
         wsGroup.addEventListener("click", (e) => {
           if ((e.target as HTMLElement).closest(".tree-action")) return;
-          wsOpen = !wsOpen;
-          wsChildren.className = wsOpen ? "tree-children open" : "tree-children";
-          wsArrow.textContent = wsOpen ? "▼" : "▶";
+          const open = !this.expandState.get(wsKey);
+          this.expandState.set(wsKey, open);
+          wsChildren.className = open ? "tree-children open" : "tree-children";
+          wsArrow.textContent = open ? "▼" : "▶";
         });
 
         repoChildren.appendChild(wsGroup);
