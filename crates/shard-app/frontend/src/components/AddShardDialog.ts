@@ -1,7 +1,4 @@
-let openDialog: typeof import("@tauri-apps/plugin-dialog").open | null = null;
-import("@tauri-apps/plugin-dialog")
-  .then((mod) => { openDialog = mod.open; })
-  .catch(() => {});
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 export interface AddShardResult {
   url: string;
@@ -70,7 +67,6 @@ export class AddShardDialog {
   }
 
   private async browsePath() {
-    if (!openDialog) return;
     try {
       const selected = await openDialog({ directory: true, multiple: false });
       if (selected) {
