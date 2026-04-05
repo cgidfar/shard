@@ -206,7 +206,12 @@ export class Sidebar {
             stopBtn.addEventListener("click", (e) => {
               e.stopPropagation();
               this.confirmingStopId = null;
-              stopSession(si.session.id).then(() => this.refresh());
+              stopSession(si.session.id)
+                .then(() => this.refresh())
+                .catch(() => {
+                  // Supervisor likely dead (orphaned session) — force remove
+                  removeSession(si.session.id).then(() => this.refresh());
+                });
             });
 
             const cancelBtn = document.createElement("button");
