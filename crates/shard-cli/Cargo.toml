@@ -1,0 +1,20 @@
+[package]
+name = "shard-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "shardctl"
+path = "src/main.rs"
+
+[dependencies]
+shard-core = { path = "../shard-core" }
+shard-transport = { path = "../shard-transport" }
+shard-supervisor = { path = "../shard-supervisor" }
+clap = { workspace = true }
+tokio = { workspace = true }
+crossterm = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }

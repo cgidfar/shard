@@ -1,0 +1,12 @@
+/target
+*.swp
+*.swo
+.env
+
+# Frontend build artifacts
+crates/shard-app/frontend/node_modules/
+crates/shard-app/frontend/dist/
+crates/shard-app/frontend/bun.lock
+
+# Shard workspace directories
+.shard/
