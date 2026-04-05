@@ -29,6 +29,7 @@ export class Sidebar {
   private tree: RepoTree[] = [];
   private activeSessionId: string | null = null;
   private confirmingStopId: string | null = null;
+  private stoppingId: string | null = null;
 
   constructor(el: HTMLElement, callbacks: SidebarCallbacks) {
     this.el = el;
@@ -192,7 +193,14 @@ export class Sidebar {
           const sessionRow = document.createElement("div");
           sessionRow.className = `tree-item tree-item-session${isActive ? " active" : ""}${isDead ? " dead" : ""}`;
 
-          if (isConfirming) {
+          if (si.session.id === this.stoppingId) {
+            // Stopping in progress — show feedback
+            sessionRow.className = "tree-item tree-item-session confirming";
+            const label = document.createElement("span");
+            label.className = "tree-label";
+            label.textContent = "Stopping...";
+            sessionRow.appendChild(label);
+          } else if (isConfirming) {
             // Inline stop confirmation
             sessionRow.className = "tree-item tree-item-session confirming";
 
@@ -206,11 +214,15 @@ export class Sidebar {
             stopBtn.addEventListener("click", (e) => {
               e.stopPropagation();
               this.confirmingStopId = null;
+              this.stoppingId = si.session.id;
+              this.render();
               stopSession(si.session.id)
-                .then(() => this.refresh())
-                .catch(() => {
-                  // Supervisor likely dead (orphaned session) — force remove
-                  removeSession(si.session.id).then(() => this.refresh());
+                .then(() => removeSession(si.session.id))
+                .catch(() => removeSession(si.session.id))
+                .catch(() => {}) // remove might fail too, that's ok
+                .finally(() => {
+                  this.stoppingId = null;
+                  this.refresh();
                 });
             });
 
