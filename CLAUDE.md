@@ -61,3 +61,38 @@ Platform-specific code is behind two traits: `SessionTransport` (IPC) and `Proce
 ## SQLite Concurrency
 
 WAL mode + 5s busy_timeout on every connection (`db::open_connection`). Multiple processes (supervisors, CLI, app) access `repo.db` concurrently. Short transactions only.
+
+## Playwright MCP for Tauri UI Inspection
+
+Playwright MCP can attach to the running Tauri WebView via CDP (Chrome DevTools Protocol). This is the only way to get screenshots, accessibility snapshots, and DOM interaction with the live app. **It does NOT work by navigating to the Vite dev URL** — that creates a separate context without `window.__TAURI__`, breaking IPC.
+
+### Setup
+
+1. **Launch the app with CDP enabled** — set the env var before `cargo run`:
+   ```bash
+   WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--remote-debugging-port=9222" cargo run -p shard-app
+   ```
+
+2. **Playwright MCP is configured** with `--cdp-endpoint http://localhost:9222` (already in Claude Code MCP config). It connects to the existing WebView rather than launching its own browser.
+
+3. **Verify CDP is live** before using Playwright tools:
+   ```bash
+   curl -s http://localhost:9222/json/list
+   ```
+   Should return a JSON array with a page entry titled "Shard".
+
+### Gotchas
+
+- **App relaunch = Playwright reconnect required.** When the Tauri app restarts, the CDP WebSocket changes. Playwright MCP caches the old connection and will return "Target page, context or browser has been closed." Fix: run `/mcp` to reconnect.
+
+- **`tauri.conf.json` changes require full relaunch.** Changes like `decorations: false` are compiled into the Rust binary. Vite HMR won't pick them up — you must kill and re-run `cargo run -p shard-app`.
+
+- **Vite module cache can serve stale code.** If you rewrite a file completely (not incremental edit), Vite's transform cache may keep serving the old version. Fix: delete `node_modules/.vite/`, `touch` all changed files, then relaunch the app. Verify with:
+  ```js
+  // In browser_evaluate:
+  fetch('/src/main.ts').then(r => r.text()).then(t => t.slice(0, 300))
+  ```
+
+- **`browser_evaluate` runs in a CDP-isolated context.** `window.__TAURI__` will be `undefined` in evaluate calls even though it works fine in the actual app. Don't rely on it for diagnostics.
+
+- **Clean up artifacts.** Playwright MCP dumps screenshots, snapshots, and console logs into `.playwright-mcp/` in the working directory. Clean these up before committing — they're not useful to keep.
