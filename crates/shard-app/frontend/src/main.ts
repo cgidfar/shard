@@ -36,8 +36,8 @@ const titleBar = new TitleBar(titlebarEl, {
 });
 
 const sidebar = new Sidebar(sidebarEl, {
-  onSessionClick(repo: string, sessionId: string, sessionLabel: string) {
-    openSession(repo, sessionId, sessionLabel);
+  onSessionClick(repo: string, workspace: string, sessionId: string, sessionLabel: string) {
+    openSession(repo, workspace, sessionId, sessionLabel);
   },
   onSessionClosed(sessionId: string) {
     terminalPane.close(sessionId);
@@ -49,7 +49,9 @@ const sidebar = new Sidebar(sidebarEl, {
   async onCreateSession(repo: string, workspace: string) {
     try {
       const session = await createSession(repo, workspace);
-      openSession(repo, session.id, "session");
+      const cmd: string[] = JSON.parse(session.command_json);
+      const label = cmd[0]?.split(/[/\\]/).pop() || "session";
+      openSession(repo, workspace, session.id, label);
       sidebar.refresh();
     } catch (err) {
       console.error("Failed to create session:", err);
@@ -67,12 +69,12 @@ const sidebar = new Sidebar(sidebarEl, {
   },
 });
 
-function openSession(repo: string, sessionId: string, sessionLabel: string) {
+function openSession(repo: string, workspace: string, sessionId: string, sessionLabel: string) {
   terminalPane.open(sessionId);
   sidebar.setActiveSession(sessionId);
   titleBar.setBreadcrumb({
     repo,
-    workspace: "main",
+    workspace,
     session: sessionLabel,
     status: "running",
   });

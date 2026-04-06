@@ -10,7 +10,7 @@ import {
 } from "../lib/api";
 
 export interface SidebarCallbacks {
-  onSessionClick: (repo: string, sessionId: string, sessionLabel: string) => void;
+  onSessionClick: (repo: string, workspace: string, sessionId: string, sessionLabel: string) => void;
   onSessionClosed: (sessionId: string) => void;
   onCreateSession: (repo: string, workspace: string) => void;
   onCreateWorkspace: (repo: string) => void;
@@ -271,7 +271,7 @@ export class Sidebar {
               sessionRow.style.cursor = "pointer";
               sessionRow.addEventListener("click", (e) => {
                 if ((e.target as HTMLElement).closest(".tree-action")) return;
-                this.callbacks.onSessionClick(si.repo, si.session.id, this.deriveSessionLabel(si));
+                this.callbacks.onSessionClick(si.repo, workspace.name, si.session.id, this.deriveSessionLabel(si));
               });
 
               closeBtn.title = "Stop session";
@@ -285,7 +285,7 @@ export class Sidebar {
               sessionRow.style.cursor = "pointer";
               sessionRow.addEventListener("click", (e) => {
                 if ((e.target as HTMLElement).closest(".tree-action")) return;
-                this.callbacks.onSessionClick(si.repo, si.session.id, this.deriveSessionLabel(si));
+                this.callbacks.onSessionClick(si.repo, workspace.name, si.session.id, this.deriveSessionLabel(si));
               });
 
               closeBtn.title = "Remove session";
