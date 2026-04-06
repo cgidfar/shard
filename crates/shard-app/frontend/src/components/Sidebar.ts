@@ -113,6 +113,7 @@ export class Sidebar {
       // Repo group
       const repoGroup = document.createElement("div");
       repoGroup.className = "tree-group tree-group-repo";
+      repoGroup.dataset.repo = repo.alias;
       const repoKey = `repo:${repo.alias}`;
       if (!this.expandState.has(repoKey)) this.expandState.set(repoKey, true);
 
@@ -154,6 +155,8 @@ export class Sidebar {
         // Workspace row
         const wsGroup = document.createElement("div");
         wsGroup.className = "tree-group tree-group-ws";
+        wsGroup.dataset.repo = repo.alias;
+        wsGroup.dataset.workspace = workspace.name;
         const wsKey = `ws:${repo.alias}:${workspace.name}`;
         if (!this.expandState.has(wsKey)) this.expandState.set(wsKey, sessions.length > 0);
 
@@ -211,6 +214,10 @@ export class Sidebar {
 
           const sessionRow = document.createElement("div");
           sessionRow.className = `tree-item tree-item-session${isActive ? " active" : ""}${isDead ? " dead" : ""}`;
+          sessionRow.dataset.repo = si.repo;
+          sessionRow.dataset.workspace = workspace.name;
+          sessionRow.dataset.sessionId = si.session.id;
+          sessionRow.dataset.sessionStatus = si.session.status;
 
           if (si.session.id === this.stoppingId) {
             // Stopping in progress — show feedback

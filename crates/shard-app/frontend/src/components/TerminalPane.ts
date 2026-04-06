@@ -1,3 +1,4 @@
+import { Terminal } from "@xterm/xterm";
 import { createTerminalSession, type TerminalSession } from "../lib/terminal";
 
 export interface TerminalPaneCallbacks {
@@ -68,6 +69,11 @@ export class TerminalPane {
 
   getActiveId(): string | null {
     return this.activeId;
+  }
+
+  getActiveTerminal(): Terminal | null {
+    if (!this.activeId) return null;
+    return this.sessions.get(this.activeId)?.session.terminal ?? null;
   }
 
   showEmpty() {
