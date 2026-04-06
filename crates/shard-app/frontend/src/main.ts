@@ -52,6 +52,7 @@ const sidebar = new Sidebar(sidebarEl, {
       const cmd: string[] = JSON.parse(session.command_json);
       const label = cmd[0]?.split(/[/\\]/).pop() || "session";
       openSession(repo, workspace, session.id, label);
+      sidebar.expandWorkspace(repo, workspace);
       sidebar.refresh();
     } catch (err) {
       console.error("Failed to create session:", err);

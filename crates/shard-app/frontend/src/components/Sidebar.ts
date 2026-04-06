@@ -39,6 +39,11 @@ export class Sidebar {
     this.callbacks = callbacks;
   }
 
+  expandWorkspace(repo: string, workspace: string) {
+    this.expandState.set(`repo:${repo}`, true);
+    this.expandState.set(`ws:${repo}:${workspace}`, true);
+  }
+
   setActiveSession(sessionId: string | null) {
     this.activeSessionId = sessionId;
     this.render();
