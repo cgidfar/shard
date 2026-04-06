@@ -46,6 +46,19 @@ export function createTerminalSession(
   const fitAddon = new FitAddon();
   terminal.loadAddon(fitAddon);
 
+  // Let browser handle clipboard shortcuts instead of xterm consuming them
+  terminal.attachCustomKeyEventHandler((e: KeyboardEvent) => {
+    if (e.type !== "keydown") return true;
+    if (e.ctrlKey && !e.shiftKey && !e.altKey) {
+      if (e.key === "c" && terminal.hasSelection()) return false;
+      if (e.key === "v") return false;
+    }
+    if (e.ctrlKey && e.shiftKey && !e.altKey) {
+      if (e.key === "C" || e.key === "V") return false;
+    }
+    return true;
+  });
+
   terminal.open(container);
 
   // Load WebGL addon for GPU-accelerated rendering
