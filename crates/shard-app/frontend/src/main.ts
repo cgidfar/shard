@@ -39,6 +39,13 @@ const sidebar = new Sidebar(sidebarEl, {
   onSessionClick(repo: string, sessionId: string, sessionLabel: string) {
     openSession(repo, sessionId, sessionLabel);
   },
+  onSessionClosed(sessionId: string) {
+    terminalPane.close(sessionId);
+    if (!terminalPane.getActiveId()) {
+      terminalPane.showEmpty();
+      titleBar.setBreadcrumb(null);
+    }
+  },
   async onCreateSession(repo: string, workspace: string) {
     try {
       const session = await createSession(repo, workspace);

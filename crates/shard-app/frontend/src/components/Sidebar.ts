@@ -11,6 +11,7 @@ import {
 
 export interface SidebarCallbacks {
   onSessionClick: (repo: string, sessionId: string, sessionLabel: string) => void;
+  onSessionClosed: (sessionId: string) => void;
   onCreateSession: (repo: string, workspace: string) => void;
   onCreateWorkspace: (repo: string) => void;
 }
@@ -228,6 +229,7 @@ export class Sidebar {
               e.stopPropagation();
               this.confirmingStopId = null;
               this.stoppingId = si.session.id;
+              this.callbacks.onSessionClosed(si.session.id);
               this.render();
               stopSession(si.session.id)
                 .then(() => removeSession(si.session.id))

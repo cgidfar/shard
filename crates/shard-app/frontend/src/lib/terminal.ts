@@ -70,9 +70,16 @@ export function createTerminalSession(
   });
 
   // Forward user input to backend
+  let disconnected = false;
   terminal.onData((data: string) => {
+    if (disconnected) return;
     const encoder = new TextEncoder();
-    writeToSession(sessionId, encoder.encode(data)).catch(() => {});
+    writeToSession(sessionId, encoder.encode(data)).catch(() => {
+      if (!disconnected) {
+        disconnected = true;
+        terminal.write("\r\n\x1b[31mSession ended.\x1b[0m\r\n");
+      }
+    });
   });
 
   // Handle resize

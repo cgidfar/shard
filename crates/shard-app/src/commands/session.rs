@@ -170,7 +170,12 @@ pub fn create_session(
 }
 
 #[tauri::command]
-pub async fn stop_session(app: tauri::AppHandle, id: String, force: bool) -> Result<(), String> {
+pub async fn stop_session(
+    app: tauri::AppHandle,
+    id: String,
+    force: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
     let session_store = SessionStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
     let (repo, session) = session_store.find_by_id(&id).map_err(|e| e.to_string())?;
 
@@ -211,6 +216,12 @@ pub async fn stop_session(app: tauri::AppHandle, id: String, force: bool) -> Res
         if let Some(pid) = session.supervisor_pid {
             let _ = PlatformProcessControl::terminate(pid);
         }
+    }
+
+    // Sever the pipe connection so the frontend can't write to the dead session
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.remove(&id);
     }
 
     session_store
