@@ -1,5 +1,6 @@
 use shard_core::workspaces::{Workspace, WorkspaceStore};
 use shard_core::ShardPaths;
+use tauri::Emitter;
 
 #[tauri::command]
 pub fn list_workspaces(repo: String) -> Result<Vec<Workspace>, String> {
@@ -9,18 +10,23 @@ pub fn list_workspaces(repo: String) -> Result<Vec<Workspace>, String> {
 
 #[tauri::command]
 pub fn create_workspace(
+    app: tauri::AppHandle,
     repo: String,
     name: Option<String>,
     branch: Option<String>,
 ) -> Result<Workspace, String> {
     let store = WorkspaceStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
-    store
+    let ws = store
         .create(&repo, name.as_deref(), branch.as_deref(), false)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    let _ = app.emit("sidebar-changed", ());
+    Ok(ws)
 }
 
 #[tauri::command]
-pub fn remove_workspace(repo: String, name: String) -> Result<(), String> {
+pub fn remove_workspace(app: tauri::AppHandle, repo: String, name: String) -> Result<(), String> {
     let store = WorkspaceStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
-    store.remove(&repo, &name).map_err(|e| e.to_string())
+    store.remove(&repo, &name).map_err(|e| e.to_string())?;
+    let _ = app.emit("sidebar-changed", ());
+    Ok(())
 }

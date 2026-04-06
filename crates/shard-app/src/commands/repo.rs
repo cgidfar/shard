@@ -1,6 +1,7 @@
 use shard_core::repos::{Repository, RepositoryStore};
 use shard_core::workspaces::WorkspaceStore;
 use shard_core::ShardPaths;
+use tauri::Emitter;
 
 #[tauri::command]
 pub fn list_repos() -> Result<Vec<Repository>, String> {
@@ -9,7 +10,7 @@ pub fn list_repos() -> Result<Vec<Repository>, String> {
 }
 
 #[tauri::command]
-pub fn add_repo(url: String, alias: Option<String>) -> Result<Repository, String> {
+pub fn add_repo(app: tauri::AppHandle, url: String, alias: Option<String>) -> Result<Repository, String> {
     let paths = ShardPaths::new().map_err(|e| e.to_string())?;
     let store = RepositoryStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
     let repo = store.add(&url, alias.as_deref()).map_err(|e| e.to_string())?;
@@ -29,6 +30,7 @@ pub fn add_repo(url: String, alias: Option<String>) -> Result<Repository, String
         }
     }
 
+    let _ = app.emit("sidebar-changed", ());
     Ok(repo)
 }
 
@@ -39,7 +41,9 @@ pub fn sync_repo(alias: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn remove_repo(alias: String) -> Result<(), String> {
+pub fn remove_repo(app: tauri::AppHandle, alias: String) -> Result<(), String> {
     let store = RepositoryStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
-    store.remove(&alias).map_err(|e| e.to_string())
+    store.remove(&alias).map_err(|e| e.to_string())?;
+    let _ = app.emit("sidebar-changed", ());
+    Ok(())
 }

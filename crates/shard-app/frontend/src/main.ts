@@ -1,4 +1,5 @@
 import "@xterm/xterm/css/xterm.css";
+import { listen } from "@tauri-apps/api/event";
 import { TitleBar } from "./components/TitleBar";
 import { Sidebar } from "./components/Sidebar";
 import { TerminalPane } from "./components/TerminalPane";
@@ -84,5 +85,5 @@ async function init() {
 
 init();
 
-// Refresh sidebar periodically
-setInterval(() => sidebar.refresh(), 5000);
+// Refresh sidebar when backend state changes
+listen("sidebar-changed", () => sidebar.refresh());

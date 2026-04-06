@@ -1,4 +1,5 @@
 use tauri::ipc::Channel;
+use tauri::Emitter;
 
 use shard_core::repos::RepositoryStore;
 use shard_core::sessions::{Session, SessionStore};
@@ -78,6 +79,7 @@ pub fn list_sessions(
 
 #[tauri::command]
 pub fn create_session(
+    app: tauri::AppHandle,
     repo: String,
     workspace_name: String,
     command: Option<Vec<String>>,
@@ -160,13 +162,15 @@ pub fn create_session(
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    session_store
+    let result = session_store
         .get(&repo, &session.id)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    let _ = app.emit("sidebar-changed", ());
+    Ok(result)
 }
 
 #[tauri::command]
-pub async fn stop_session(id: String, force: bool) -> Result<(), String> {
+pub async fn stop_session(app: tauri::AppHandle, id: String, force: bool) -> Result<(), String> {
     let session_store = SessionStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
     let (repo, session) = session_store.find_by_id(&id).map_err(|e| e.to_string())?;
 
@@ -211,16 +215,20 @@ pub async fn stop_session(id: String, force: bool) -> Result<(), String> {
 
     session_store
         .update_status(&repo, &id, "stopped", None)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    let _ = app.emit("sidebar-changed", ());
+    Ok(())
 }
 
 #[tauri::command]
-pub fn remove_session(id: String) -> Result<(), String> {
+pub fn remove_session(app: tauri::AppHandle, id: String) -> Result<(), String> {
     let session_store = SessionStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
     let (repo, _) = session_store.find_by_id(&id).map_err(|e| e.to_string())?;
     session_store
         .remove(&repo, &id)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    let _ = app.emit("sidebar-changed", ());
+    Ok(())
 }
 
 #[tauri::command]
