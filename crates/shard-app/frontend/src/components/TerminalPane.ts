@@ -12,6 +12,10 @@ export class TerminalPane {
     new Map();
   private activeId: string | null = null;
   private hasShards: boolean = false;
+  private dynamicTitles: Map<string, string> = new Map();
+
+  /** Called when a session's terminal title changes via OSC sequences. */
+  onTitleChange?: (sessionId: string, title: string) => void;
 
   constructor(container: HTMLElement, callbacks: TerminalPaneCallbacks) {
     this.container = container;
@@ -34,7 +38,12 @@ export class TerminalPane {
     el.style.display = "none";
     this.container.appendChild(el);
 
-    const session = createTerminalSession(sessionId, el);
+    const session = createTerminalSession(sessionId, el, {
+      onTitleChange: (title) => {
+        this.dynamicTitles.set(sessionId, title);
+        this.onTitleChange?.(sessionId, title);
+      },
+    });
     this.sessions.set(sessionId, { el, session });
     this.show(sessionId);
   }
@@ -61,6 +70,7 @@ export class TerminalPane {
     entry.session.dispose();
     entry.el.remove();
     this.sessions.delete(sessionId);
+    this.dynamicTitles.delete(sessionId);
 
     if (this.activeId === sessionId) {
       this.activeId = null;
@@ -74,6 +84,10 @@ export class TerminalPane {
   getActiveTerminal(): Terminal | null {
     if (!this.activeId) return null;
     return this.sessions.get(this.activeId)?.session.terminal ?? null;
+  }
+
+  getDynamicTitle(sessionId: string): string | undefined {
+    return this.dynamicTitles.get(sessionId);
   }
 
   showEmpty() {

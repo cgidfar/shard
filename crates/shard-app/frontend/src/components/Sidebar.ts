@@ -3,17 +3,20 @@ import {
   listWorkspaces,
   listSessions,
   removeSession,
+  renameSession,
   stopSession,
   type Repository,
   type Workspace,
   type SessionInfo,
 } from "../lib/api";
+import { labelFromCommand } from "../lib/titleFormat";
 
 export interface SidebarCallbacks {
   onSessionClick: (repo: string, workspace: string, sessionId: string, sessionLabel: string) => void;
   onSessionClosed: (sessionId: string) => void;
   onCreateSession: (repo: string, workspace: string) => void;
   onCreateWorkspace: (repo: string) => void;
+  onLabelChanged?: (sessionId: string, label: string) => void;
 }
 
 interface RepoTree {
@@ -31,8 +34,12 @@ export class Sidebar {
   private activeSessionId: string | null = null;
   private confirmingStopId: string | null = null;
   private stoppingId: string | null = null;
-  private expandState: Map<string, boolean> = new Map(); // key → open
+  private expandState: Map<string, boolean> = new Map();
   private refreshing = false;
+  private renamingSessionId: string | null = null;
+  private draftLabel: string = "";
+  private dynamicTitles: Map<string, string> = new Map();
+  private pendingRefresh = false;
 
   constructor(el: HTMLElement, callbacks: SidebarCallbacks) {
     this.el = el;
@@ -49,8 +56,45 @@ export class Sidebar {
     this.render();
   }
 
+  /** Resolve the display label for a session.
+   *  Priority: user label > dynamic OSC title > command-based fallback. */
+  resolveLabel(sessionId: string): string {
+    const si = this.findSessionInfo(sessionId);
+    if (!si) return "session";
+    return this.resolveLabelForSession(si);
+  }
+
+  /** Notify that a terminal's OSC title has changed. */
+  notifyTitleChange(sessionId: string, title: string) {
+    this.dynamicTitles.set(sessionId, title);
+    // Targeted DOM update — avoid full re-render for frequent title changes
+    const si = this.findSessionInfo(sessionId);
+    if (si && si.session.label == null) {
+      const row = this.el.querySelector(
+        `[data-session-id="${sessionId}"] .tree-label`
+      ) as HTMLElement | null;
+      if (row && this.renamingSessionId !== sessionId) {
+        row.textContent = title;
+      }
+    }
+  }
+
+  /** Enter inline rename mode for a session. */
+  startRename(sessionId: string) {
+    const si = this.findSessionInfo(sessionId);
+    if (!si) return;
+    this.renamingSessionId = sessionId;
+    this.draftLabel = this.resolveLabelForSession(si);
+    this.render();
+  }
+
   async refresh() {
     if (this.refreshing) return;
+    // Queue refresh if rename is active — flush after commit/cancel
+    if (this.renamingSessionId !== null) {
+      this.pendingRefresh = true;
+      return;
+    }
     this.refreshing = true;
     try {
       const repos = await listRepos();
@@ -77,13 +121,56 @@ export class Sidebar {
     }
   }
 
-  private deriveSessionLabel(si: SessionInfo): string {
-    try {
-      const cmd: string[] = JSON.parse(si.session.command_json);
-      const exe = cmd[0]?.split(/[/\\]/).pop() || "session";
-      return exe;
-    } catch {
-      return "session";
+  private resolveLabelForSession(si: SessionInfo): string {
+    if (si.session.label != null && si.session.label.trim() !== "") {
+      return si.session.label;
+    }
+    const dynamic = this.dynamicTitles.get(si.session.id);
+    if (dynamic) return dynamic;
+    return labelFromCommand(si.session.command_json);
+  }
+
+  private findSessionInfo(sessionId: string): SessionInfo | undefined {
+    for (const { workspaces } of this.tree) {
+      for (const { sessions } of workspaces) {
+        const found = sessions.find((s) => s.session.id === sessionId);
+        if (found) return found;
+      }
+    }
+    return undefined;
+  }
+
+  private async commitRename() {
+    const id = this.renamingSessionId;
+    const label = this.draftLabel.trim();
+    this.renamingSessionId = null;
+    this.draftLabel = "";
+    if (id) {
+      await renameSession(id, label || null).catch(() => {});
+    }
+    // Flush any queued refresh, otherwise just re-render from cached data
+    if (this.pendingRefresh) {
+      this.pendingRefresh = false;
+      await this.refresh();
+    } else {
+      // refresh() to pick up the new label from DB
+      await this.refresh();
+    }
+
+    // Notify label changed so breadcrumb can update
+    if (id && this.callbacks.onLabelChanged) {
+      this.callbacks.onLabelChanged(id, this.resolveLabel(id));
+    }
+  }
+
+  private cancelRename() {
+    this.renamingSessionId = null;
+    this.draftLabel = "";
+    if (this.pendingRefresh) {
+      this.pendingRefresh = false;
+      this.refresh();
+    } else {
+      this.render();
     }
   }
 
@@ -211,6 +298,8 @@ export class Sidebar {
           const isDead = ["failed", "exited", "stopped"].includes(si.session.status);
           const isActive = si.session.id === this.activeSessionId;
           const isConfirming = si.session.id === this.confirmingStopId;
+          const isRenaming = si.session.id === this.renamingSessionId;
+          const resolvedLabel = this.resolveLabelForSession(si);
 
           const sessionRow = document.createElement("div");
           sessionRow.className = `tree-item tree-item-session${isActive ? " active" : ""}${isDead ? " dead" : ""}`;
@@ -218,6 +307,7 @@ export class Sidebar {
           sessionRow.dataset.workspace = workspace.name;
           sessionRow.dataset.sessionId = si.session.id;
           sessionRow.dataset.sessionStatus = si.session.status;
+          sessionRow.dataset.sessionLabel = resolvedLabel;
 
           if (si.session.id === this.stoppingId) {
             // Stopping in progress — show feedback
@@ -265,6 +355,37 @@ export class Sidebar {
             sessionRow.appendChild(label);
             sessionRow.appendChild(stopBtn);
             sessionRow.appendChild(cancelBtn);
+          } else if (isRenaming) {
+            // Inline rename
+            sessionRow.className = `tree-item tree-item-session${isActive ? " active" : ""} renaming`;
+            const input = document.createElement("input");
+            input.className = "rename-input";
+            input.type = "text";
+            input.value = this.draftLabel;
+            let committed = false;
+            input.addEventListener("input", () => {
+              this.draftLabel = input.value;
+            });
+            input.addEventListener("keydown", (e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                committed = true;
+                this.commitRename();
+              } else if (e.key === "Escape") {
+                e.preventDefault();
+                committed = true;
+                this.cancelRename();
+              }
+              e.stopPropagation();
+            });
+            input.addEventListener("blur", () => {
+              if (!committed && this.renamingSessionId === si.session.id) this.cancelRename();
+            });
+            sessionRow.appendChild(input);
+            requestAnimationFrame(() => {
+              input.focus();
+              input.select();
+            });
           } else {
             const dot = document.createElement("span");
             dot.className = `status-dot ${si.session.status}`;
@@ -272,20 +393,24 @@ export class Sidebar {
 
             const label = document.createElement("span");
             label.className = "tree-label";
-            label.textContent = this.deriveSessionLabel(si);
+            label.textContent = resolvedLabel;
+            label.addEventListener("dblclick", (e) => {
+              e.stopPropagation();
+              this.startRename(si.session.id);
+            });
             sessionRow.appendChild(label);
 
             const closeBtn = document.createElement("button");
             closeBtn.className = "tree-action tree-action-close";
             closeBtn.textContent = "×";
 
-            if (isRunning) {
-              sessionRow.style.cursor = "pointer";
-              sessionRow.addEventListener("click", (e) => {
-                if ((e.target as HTMLElement).closest(".tree-action")) return;
-                this.callbacks.onSessionClick(si.repo, workspace.name, si.session.id, this.deriveSessionLabel(si));
-              });
+            sessionRow.style.cursor = "pointer";
+            sessionRow.addEventListener("click", (e) => {
+              if ((e.target as HTMLElement).closest(".tree-action")) return;
+              this.callbacks.onSessionClick(si.repo, workspace.name, si.session.id, resolvedLabel);
+            });
 
+            if (isRunning) {
               closeBtn.title = "Stop session";
               closeBtn.addEventListener("click", (e) => {
                 e.stopPropagation();
@@ -293,13 +418,6 @@ export class Sidebar {
                 this.render();
               });
             } else {
-              // Dead session — click to view output, × removes
-              sessionRow.style.cursor = "pointer";
-              sessionRow.addEventListener("click", (e) => {
-                if ((e.target as HTMLElement).closest(".tree-action")) return;
-                this.callbacks.onSessionClick(si.repo, workspace.name, si.session.id, this.deriveSessionLabel(si));
-              });
-
               closeBtn.title = "Remove session";
               closeBtn.addEventListener("click", (e) => {
                 e.stopPropagation();

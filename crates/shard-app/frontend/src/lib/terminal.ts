@@ -3,6 +3,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Channel } from "@tauri-apps/api/core";
 import { attachSession, writeToSession, resizeSession, detachSession } from "./api";
+import { formatOscTitle } from "./titleFormat";
 
 export interface TerminalSession {
   terminal: Terminal;
@@ -10,9 +11,14 @@ export interface TerminalSession {
   dispose: () => void;
 }
 
+export interface TerminalSessionOptions {
+  onTitleChange?: (title: string) => void;
+}
+
 export function createTerminalSession(
   sessionId: string,
-  container: HTMLElement
+  container: HTMLElement,
+  options: TerminalSessionOptions = {}
 ): TerminalSession {
   const terminal = new Terminal({
     fontFamily: "'Geist Mono', 'Cascadia Code', 'Consolas', monospace",
@@ -70,6 +76,14 @@ export function createTerminalSession(
   }
 
   fitAddon.fit();
+
+  // Forward OSC title changes (e.g. shell sets CWD as window title)
+  if (options.onTitleChange) {
+    terminal.onTitleChange((raw) => {
+      const formatted = formatOscTitle(raw);
+      if (formatted) options.onTitleChange!(formatted);
+    });
+  }
 
   // Set up data channel from backend
   const channel = new Channel<Uint8Array>();

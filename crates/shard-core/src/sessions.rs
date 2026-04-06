@@ -20,6 +20,7 @@ pub struct Session {
     pub exit_code: Option<i32>,
     pub created_at: u64,
     pub stopped_at: Option<u64>,
+    pub label: Option<String>,
 }
 
 pub struct SessionStore {
@@ -74,6 +75,7 @@ impl SessionStore {
             exit_code: None,
             created_at: now,
             stopped_at: None,
+            label: None,
         })
     }
 
@@ -168,7 +170,7 @@ impl SessionStore {
         if let Some(ws) = workspace_name {
             let mut stmt = conn.prepare(
                 "SELECT id, workspace_name, command_json, transport_addr, log_path,
-                        supervisor_pid, child_pid, status, exit_code, created_at, stopped_at
+                        supervisor_pid, child_pid, status, exit_code, created_at, stopped_at, label
                  FROM sessions WHERE workspace_name = ?1 ORDER BY created_at DESC",
             )?;
             let rows = stmt.query_map(params![ws], row_to_session)?;
@@ -178,7 +180,7 @@ impl SessionStore {
         } else {
             let mut stmt = conn.prepare(
                 "SELECT id, workspace_name, command_json, transport_addr, log_path,
-                        supervisor_pid, child_pid, status, exit_code, created_at, stopped_at
+                        supervisor_pid, child_pid, status, exit_code, created_at, stopped_at, label
                  FROM sessions ORDER BY created_at DESC",
             )?;
             let rows = stmt.query_map([], row_to_session)?;
@@ -196,7 +198,7 @@ impl SessionStore {
         let conn = db::open_connection(&repo_db_path)?;
         conn.query_row(
             "SELECT id, workspace_name, command_json, transport_addr, log_path,
-                    supervisor_pid, child_pid, status, exit_code, created_at, stopped_at
+                    supervisor_pid, child_pid, status, exit_code, created_at, stopped_at, label
              FROM sessions WHERE id = ?1",
             params![session_id],
             row_to_session,
@@ -238,7 +240,7 @@ impl SessionStore {
             let like_pattern = format!("{session_id}%");
             let mut pstmt = conn.prepare(
                 "SELECT id, workspace_name, command_json, transport_addr, log_path,
-                        supervisor_pid, child_pid, status, exit_code, created_at, stopped_at
+                        supervisor_pid, child_pid, status, exit_code, created_at, stopped_at, label
                  FROM sessions WHERE id LIKE ?1",
             )?;
             let rows = pstmt.query_map(params![like_pattern], row_to_session)?;
@@ -278,6 +280,22 @@ impl SessionStore {
 
         Ok(())
     }
+
+    /// Rename a session (set or clear its label).
+    pub fn rename(
+        &self,
+        repo_alias: &str,
+        session_id: &str,
+        label: Option<&str>,
+    ) -> Result<()> {
+        let repo_db_path = self.paths.repo_db(repo_alias);
+        let conn = db::open_connection(&repo_db_path)?;
+        conn.execute(
+            "UPDATE sessions SET label = ?1 WHERE id = ?2",
+            params![label, session_id],
+        )?;
+        Ok(())
+    }
 }
 
 fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
@@ -293,5 +311,6 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
         exit_code: row.get(8)?,
         created_at: row.get(9)?,
         stopped_at: row.get(10)?,
+        label: row.get(11)?,
     })
 }

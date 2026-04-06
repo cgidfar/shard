@@ -6,6 +6,7 @@ use state::AppState;
 /// Prune sessions whose supervisor process is no longer alive.
 /// Runs at app startup to reconcile stale DB records from prior crashes.
 fn prune_stale_sessions() {
+    use shard_core::db;
     use shard_core::repos::RepositoryStore;
     use shard_core::sessions::SessionStore;
     use shard_core::ShardPaths;
@@ -20,6 +21,10 @@ fn prune_stale_sessions() {
     for repo in &repos {
         if !paths.repo_db(&repo.alias).exists() {
             continue;
+        }
+        // Run migrations on existing repo DBs
+        if let Ok(conn) = db::open_connection(&paths.repo_db(&repo.alias)) {
+            let _ = db::init_repo_db(&conn);
         }
         let Ok(sessions) = session_store.list(&repo.alias, None) else {
             continue;
@@ -69,6 +74,7 @@ pub fn run() {
             commands::session::create_session,
             commands::session::stop_session,
             commands::session::remove_session,
+            commands::session::rename_session,
             commands::session::attach_session,
             commands::session::write_to_session,
             commands::session::resize_session,

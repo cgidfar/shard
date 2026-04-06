@@ -32,6 +32,7 @@ export interface Session {
   exit_code: number | null;
   created_at: number;
   stopped_at: number | null;
+  label: string | null;
 }
 
 export interface SessionInfo {
@@ -128,6 +129,10 @@ export function resizeSession(
   cols: number
 ): Promise<void> {
   return invoke("resize_session", { id, rows, cols });
+}
+
+export function renameSession(id: string, label: string | null): Promise<void> {
+  return invoke("rename_session", { id, label });
 }
 
 export function detachSession(id: string): Promise<void> {

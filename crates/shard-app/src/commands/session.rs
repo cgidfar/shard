@@ -329,6 +329,21 @@ pub async fn resize_session(
 }
 
 #[tauri::command]
+pub fn rename_session(
+    app: tauri::AppHandle,
+    id: String,
+    label: Option<String>,
+) -> Result<(), String> {
+    let session_store = SessionStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
+    let (repo, _) = session_store.find_by_id(&id).map_err(|e| e.to_string())?;
+    session_store
+        .rename(&repo, &id, label.as_deref())
+        .map_err(|e| e.to_string())?;
+    let _ = app.emit("sidebar-changed", ());
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn detach_session(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let mut sessions = state.sessions.lock().await;
     sessions.remove(&id);

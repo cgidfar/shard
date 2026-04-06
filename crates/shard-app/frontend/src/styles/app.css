@@ -338,6 +338,26 @@ html, body {
   cursor: pointer;
 }
 
+/* ── Inline Rename ── */
+.tree-item-session.renaming {
+  padding-left: 48px;
+}
+
+.rename-input {
+  flex: 1;
+  height: 20px;
+  padding: 0 6px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-family: var(--font-sans);
+  outline: none;
+  min-width: 0;
+  user-select: text;
+}
+
 /* ── Status Dots ── */
 .status-dot {
   width: 6px;

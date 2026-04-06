@@ -1,17 +1,20 @@
 import "@xterm/xterm/css/xterm.css";
 import { listen } from "@tauri-apps/api/event";
-import { TitleBar } from "./components/TitleBar";
+import { TitleBar, type Breadcrumb } from "./components/TitleBar";
 import { Sidebar } from "./components/Sidebar";
 import { TerminalPane } from "./components/TerminalPane";
 import { AddShardDialog } from "./components/AddShardDialog";
 import { addRepo, createSession, createWorkspace, listRepos, stopSession, removeSession, removeWorkspace, syncRepo, removeRepo } from "./lib/api";
 import { contextMenu, type MenuItemDef } from "./lib/ContextMenu";
+import { labelFromCommand } from "./lib/titleFormat";
 
 const titlebarEl = document.getElementById("titlebar")!;
 const sidebarEl = document.getElementById("sidebar")!;
 const terminalContainer = document.getElementById("terminal-container")!;
 
 const dialog = new AddShardDialog();
+
+let currentBreadcrumb: Breadcrumb | null = null;
 
 async function openAddShardDialog() {
   const result = await dialog.open();
@@ -28,6 +31,17 @@ async function openAddShardDialog() {
 const terminalPane = new TerminalPane(terminalContainer, {
   onAddShard: openAddShardDialog,
 });
+
+// Wire OSC title changes from terminal to sidebar + breadcrumb
+terminalPane.onTitleChange = (sessionId, title) => {
+  sidebar.notifyTitleChange(sessionId, title);
+  if (sessionId === terminalPane.getActiveId() && currentBreadcrumb) {
+    // Only update breadcrumb if session has no user-set label
+    const resolvedLabel = sidebar.resolveLabel(sessionId);
+    currentBreadcrumb = { ...currentBreadcrumb, session: resolvedLabel };
+    titleBar.setBreadcrumb(currentBreadcrumb);
+  }
+};
 
 const titleBar = new TitleBar(titlebarEl, {
   onAddShard: openAddShardDialog,
@@ -50,6 +64,12 @@ const sidebar = new Sidebar(sidebarEl, {
       console.error("Failed to create session:", err);
     }
   },
+  onLabelChanged(sessionId: string, label: string) {
+    if (sessionId === terminalPane.getActiveId() && currentBreadcrumb) {
+      currentBreadcrumb = { ...currentBreadcrumb, session: label };
+      titleBar.setBreadcrumb(currentBreadcrumb);
+    }
+  },
   async onCreateWorkspace(repo: string) {
     try {
       await doCreateWorkspace(repo);
@@ -62,26 +82,27 @@ const sidebar = new Sidebar(sidebarEl, {
 function openSession(repo: string, workspace: string, sessionId: string, sessionLabel: string) {
   terminalPane.open(sessionId);
   sidebar.setActiveSession(sessionId);
-  titleBar.setBreadcrumb({
+  currentBreadcrumb = {
     repo,
     workspace,
     session: sessionLabel,
     status: "running",
-  });
+  };
+  titleBar.setBreadcrumb(currentBreadcrumb);
 }
 
 function closeSession(sessionId: string) {
   terminalPane.close(sessionId);
   if (!terminalPane.getActiveId()) {
     terminalPane.showEmpty();
+    currentBreadcrumb = null;
     titleBar.setBreadcrumb(null);
   }
 }
 
 async function doCreateSession(repo: string, workspace: string) {
   const session = await createSession(repo, workspace);
-  const cmd: string[] = JSON.parse(session.command_json);
-  const label = cmd[0]?.split(/[/\\]/).pop() || "session";
+  const label = labelFromCommand(session.command_json);
   openSession(repo, workspace, session.id, label);
   sidebar.expandWorkspace(repo, workspace);
   sidebar.refresh();
@@ -107,7 +128,16 @@ contextMenu.register(".tree-item-session", (el): MenuItemDef[] => {
   const status = el.dataset.sessionStatus!;
   const isRunning = status === "running";
 
-  const items: MenuItemDef[] = [];
+  const items: MenuItemDef[] = [
+    {
+      kind: "action",
+      label: "Rename",
+      handler() {
+        sidebar.startRename(sessionId);
+      },
+    },
+    { kind: "separator" },
+  ];
 
   if (isRunning) {
     items.push({
