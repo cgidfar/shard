@@ -12,11 +12,15 @@ pub struct PtySession {
 
 impl PtySession {
     /// Spawn a command in a new PTY.
+    ///
+    /// `envs` is a list of extra environment variables injected into the child.
+    /// The child also inherits the supervisor's full environment.
     pub fn spawn(
         command: &[String],
         working_dir: &Path,
         rows: u16,
         cols: u16,
+        envs: &[(&str, &str)],
     ) -> std::io::Result<Self> {
         let pty_system = native_pty_system();
 
@@ -34,6 +38,9 @@ impl PtySession {
             cmd.args(&command[1..]);
         }
         cmd.cwd(working_dir);
+        for (key, val) in envs {
+            cmd.env(key, val);
+        }
 
         let child = pair
             .slave

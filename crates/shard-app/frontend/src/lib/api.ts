@@ -33,6 +33,7 @@ export interface Session {
   created_at: number;
   stopped_at: number | null;
   label: string | null;
+  harness: string | null;
 }
 
 export interface SessionInfo {
@@ -95,12 +96,14 @@ export function listSessions(
 export function createSession(
   repo: string,
   workspaceName: string,
-  command?: string[]
+  command?: string[],
+  harness?: string
 ): Promise<Session> {
   return invoke("create_session", {
     repo,
     workspaceName,
     command: command ?? null,
+    harness: harness ?? null,
   });
 }
 

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, watch};
 
-use shard_transport::protocol::{self, Frame};
+use shard_transport::protocol::{self, ActivityState, Frame};
 #[cfg(windows)]
 use shard_transport::transport_windows::create_pipe_instance;
 #[cfg(windows)]
@@ -15,6 +15,8 @@ use crate::pty::PtySession;
 
 struct Client {
     tx: mpsc::Sender<Vec<u8>>,
+    /// Skip TerminalOutput fan-out for monitor-only clients.
+    monitor_only: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -44,6 +46,10 @@ pub async fn run(
 
     let (resize_tx, mut resize_rx) = mpsc::channel::<(u16, u16)>(16);
     let (shutdown_tx, shutdown_rx) = watch::channel(Shutdown::None);
+
+    // Latest activity state reported by harness hooks (0xFF = unset).
+    // Updated by fire-and-forget hook connections, read for snapshot on Resume.
+    let activity_state = Arc::new(std::sync::atomic::AtomicU8::new(0xFF));
 
     let log_file = Arc::new(Mutex::new(
         std::fs::OpenOptions::new()
@@ -87,7 +93,10 @@ pub async fn run(
                     });
 
                     if let Ok(mut clients) = clients_clone.lock() {
-                        clients.retain(|client| client.tx.try_send(frame_buf.clone()).is_ok());
+                        clients.retain(|client| {
+                            if client.monitor_only { return true; }
+                            client.tx.try_send(frame_buf.clone()).is_ok()
+                        });
                     }
                 }
                 Err(e) => {
@@ -102,6 +111,7 @@ pub async fn run(
     let clients_clone2 = clients.clone();
     let pty_writer_clone = pty_writer.clone();
     let byte_offset_for_accept = byte_offset.clone();
+    let activity_state_for_accept = activity_state.clone();
     let addr = transport_addr.to_string();
 
     let accept_task = tokio::spawn(async move {
@@ -130,14 +140,38 @@ pub async fn run(
             let log_for_replay = log_path_shared.clone();
             let current_offset = byte_offset_for_accept.clone();
             let clients_for_register = clients_clone2.clone();
+            let activity = activity_state_for_accept.clone();
 
             tokio::spawn(async move {
                 let (mut reader, mut writer_half) = tokio::io::split(connected);
 
-                // Wait for first frame — should be Resume
-                let resume_offset = match protocol::read_frame(&mut reader).await {
-                    Ok(Some(Frame::Resume { last_seen_offset })) => last_seen_offset,
-                    _ => 0, // If no resume frame, start from beginning
+                // Read the first frame to determine connection type
+                let first_frame = match protocol::read_frame(&mut reader).await {
+                    Ok(Some(frame)) => frame,
+                    _ => return,
+                };
+
+                // --- Fire-and-forget path: harness hook pushing state ---
+                if let Frame::ActivityUpdate { state } = first_frame {
+                    activity.store(state as u8, std::sync::atomic::Ordering::Relaxed);
+                    let mut buf = Vec::new();
+                    if protocol::write_frame(&mut buf, &Frame::ActivityUpdate { state })
+                        .await
+                        .is_ok()
+                    {
+                        if let Ok(clients) = clients_for_register.lock() {
+                            for client in clients.iter() {
+                                let _ = client.tx.try_send(buf.clone());
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                // --- Streaming client path: Resume → replay → register → stream ---
+                let resume_offset = match first_frame {
+                    Frame::Resume { last_seen_offset } => last_seen_offset,
+                    _ => 0,
                 };
 
                 // Replay log from resume_offset to current position
@@ -148,7 +182,6 @@ pub async fn run(
                         let end = std::cmp::min(live_offset as usize, log_data.len());
                         if start < end {
                             let replay = &log_data[start..end];
-                            // Send replay data as a TerminalOutput frame
                             let frame = Frame::TerminalOutput {
                                 offset: resume_offset,
                                 data: replay.to_vec(),
@@ -161,9 +194,23 @@ pub async fn run(
                     }
                 }
 
-                // Now register for live updates
+                // Register for live updates BEFORE sending snapshot — any
+                // concurrent fan-out will buffer in the channel until send_task
+                // starts, preserving ordering.
+                let is_monitor = resume_offset == u64::MAX;
                 if let Ok(mut clients) = clients_for_register.lock() {
-                    clients.push(Client { tx });
+                    clients.push(Client { tx, monitor_only: is_monitor });
+                }
+
+                // Send activity state snapshot so late-connecting monitors
+                // get the current state even if the hook fired before they joined.
+                let state_val = activity.load(std::sync::atomic::Ordering::Relaxed);
+                if let Ok(snap_state) = ActivityState::try_from(state_val) {
+                    let snap = Frame::ActivityUpdate { state: snap_state };
+                    let mut buf = Vec::new();
+                    if protocol::write_frame(&mut buf, &snap).await.is_ok() {
+                        let _ = writer_half.write_all(&buf).await;
+                    }
                 }
 
                 // Forward live PTY output to client

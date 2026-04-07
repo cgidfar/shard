@@ -10,6 +10,7 @@ import {
   type SessionInfo,
 } from "../lib/api";
 import { labelFromCommand } from "../lib/titleFormat";
+import { activityStore, type DisplayState } from "../lib/activityStore";
 
 export interface SidebarCallbacks {
   onSessionClick: (repo: string, workspace: string, sessionId: string, sessionLabel: string) => void;
@@ -44,6 +45,7 @@ export class Sidebar {
   constructor(el: HTMLElement, callbacks: SidebarCallbacks) {
     this.el = el;
     this.callbacks = callbacks;
+    activityStore.onChange((id, state) => this.updateActivityIndicator(id, state));
   }
 
   expandWorkspace(repo: string, workspace: string) {
@@ -53,6 +55,7 @@ export class Sidebar {
 
   setActiveSession(sessionId: string | null) {
     this.activeSessionId = sessionId;
+    if (sessionId) activityStore.clearAttention(sessionId);
     this.render();
   }
 
@@ -171,6 +174,16 @@ export class Sidebar {
       this.refresh();
     } else {
       this.render();
+    }
+  }
+
+  /** Targeted DOM update for activity state changes — avoids full re-render. */
+  private updateActivityIndicator(sessionId: string, state: DisplayState) {
+    const indicator = this.el.querySelector(
+      `[data-session-id="${sessionId}"] .status-indicator`
+    ) as HTMLElement | null;
+    if (indicator) {
+      indicator.dataset.activityState = state;
     }
   }
 
@@ -387,9 +400,22 @@ export class Sidebar {
               input.select();
             });
           } else {
-            const dot = document.createElement("span");
-            dot.className = `status-dot ${si.session.status}`;
-            sessionRow.appendChild(dot);
+            const indicator = document.createElement("span");
+            indicator.className = "status-indicator";
+            indicator.dataset.lifecycleStatus = si.session.status;
+            // Only show activity state for running sessions — dead sessions
+            // may have stale entries in the store
+            if (isRunning) {
+              const activity = activityStore.get(si.session.id);
+              if (activity) indicator.dataset.activityState = activity;
+            }
+            const ring = document.createElement("span");
+            ring.className = "status-ring";
+            const innerDot = document.createElement("span");
+            innerDot.className = "status-dot-inner";
+            indicator.appendChild(ring);
+            indicator.appendChild(innerDot);
+            sessionRow.appendChild(indicator);
 
             const label = document.createElement("span");
             label.className = "tree-label";

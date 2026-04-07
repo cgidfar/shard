@@ -9,6 +9,7 @@ use crate::{Result, ShardError};
 /// Respects `SHARD_DATA_DIR` env var override.
 /// Default: `%LOCALAPPDATA%\shard\data\` on Windows,
 ///          `~/Library/Application Support/shard/` on Mac.
+#[derive(Clone)]
 pub struct ShardPaths {
     data_dir: PathBuf,
 }

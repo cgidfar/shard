@@ -2,6 +2,7 @@ mod commands;
 mod state;
 
 use state::AppState;
+use tauri::Manager;
 
 /// Prune sessions whose supervisor process is no longer alive.
 /// Runs at app startup to reconcile stale DB records from prior crashes.
@@ -13,8 +14,8 @@ fn prune_stale_sessions() {
     use shard_supervisor::process::{PlatformProcessControl, ProcessControl};
 
     let Ok(paths) = ShardPaths::new() else { return };
-    let repo_store = RepositoryStore::new(ShardPaths::new().unwrap());
-    let session_store = SessionStore::new(ShardPaths::new().unwrap());
+    let repo_store = RepositoryStore::new(paths.clone());
+    let session_store = SessionStore::new(paths.clone());
 
     let Ok(repos) = repo_store.list() else { return };
 
@@ -55,6 +56,53 @@ fn prune_stale_sessions() {
     }
 }
 
+/// Start monitors for all currently running sessions.
+fn start_monitors_for_running_sessions(app: &tauri::AppHandle) {
+    use shard_core::repos::RepositoryStore;
+    use shard_core::sessions::SessionStore;
+    use shard_core::ShardPaths;
+
+    let Ok(paths) = ShardPaths::new() else { return };
+    let repo_store = RepositoryStore::new(ShardPaths::new().unwrap());
+    let session_store = SessionStore::new(ShardPaths::new().unwrap());
+
+    let Ok(repos) = repo_store.list() else { return };
+
+    // Collect running sessions first (DB I/O) without holding the lock
+    let mut running: Vec<(String, String, String)> = Vec::new(); // (id, transport_addr, label)
+    for repo in &repos {
+        if !paths.repo_db(&repo.alias).exists() {
+            continue;
+        }
+        let Ok(sessions) = session_store.list(&repo.alias, None) else {
+            continue;
+        };
+        for session in &sessions {
+            if session.status != "running" {
+                continue;
+            }
+            running.push((
+                session.id.clone(),
+                session.transport_addr.clone(),
+                format!("{}:{}", repo.alias, session.workspace_name),
+            ));
+        }
+    }
+
+    if running.is_empty() {
+        return;
+    }
+
+    // Spawn monitors and batch-insert under a single short lock
+    let state: tauri::State<'_, AppState> = app.state();
+    let mut conns = state.connections.blocking_lock();
+    for (id, addr, label) in running {
+        let task = commands::session::start_monitor(app.clone(), id.clone(), addr);
+        conns.insert(id.clone(), state::SessionConnection::Monitored { task });
+        tracing::info!("Started monitor for session {} [{label}]", &id[..8]);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     prune_stale_sessions();
@@ -62,6 +110,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
+        .setup(|app| {
+            start_monitors_for_running_sessions(&app.handle());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::repo::list_repos,
             commands::repo::add_repo,

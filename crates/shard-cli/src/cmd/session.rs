@@ -32,7 +32,7 @@ fn which_exists(name: &str) -> bool {
 
 pub fn run(command: SessionCommands) -> shard_core::Result<()> {
     match command {
-        SessionCommands::Create { target, command } => create(target, command),
+        SessionCommands::Create { target, harness, command } => create(target, harness, command),
         SessionCommands::List { target, json } => list(target, json),
         SessionCommands::Attach { id } => attach(id),
         SessionCommands::Stop { id, force } => stop(id, force),
@@ -47,7 +47,7 @@ pub fn run(command: SessionCommands) -> shard_core::Result<()> {
     }
 }
 
-fn create(target: String, command: Vec<String>) -> shard_core::Result<()> {
+fn create(target: String, harness: Option<String>, command: Vec<String>) -> shard_core::Result<()> {
     let (repo, ws_name) =
         parse_target(&target).map_err(|e| shard_core::ShardError::Other(e))?;
 
@@ -66,7 +66,7 @@ fn create(target: String, command: Vec<String>) -> shard_core::Result<()> {
     // Create session record (generates UUID internally)
     // We pass a placeholder transport_addr, then update it after we know the ID.
     let session_store = SessionStore::new(ShardPaths::new()?);
-    let session = session_store.create(repo, ws_name, &command, "pending")?;
+    let session = session_store.create(repo, ws_name, &command, "pending", harness.as_deref())?;
     let transport_addr = NamedPipeTransport::session_address(&session.id);
     session_store.update_transport_addr(repo, &session.id, &transport_addr)?;
 
@@ -74,8 +74,15 @@ fn create(target: String, command: Vec<String>) -> shard_core::Result<()> {
     let session_dir = paths.session_dir(repo, &session.id);
     let ready_path = session_dir.join("ready");
 
-    // Spawn detached supervisor
+    // Best-effort: install harness hooks so agents can report activity state
     let exe = std::env::current_exe()?;
+    if !shard_core::hooks::claude_code_hooks_installed() {
+        if let Err(e) = shard_core::hooks::install_claude_code_hooks(&exe) {
+            tracing::warn!("failed to install Claude Code hooks: {e}");
+        }
+    }
+
+    // Spawn detached supervisor
     let args = vec![
         "session".into(),
         "serve".into(),
@@ -336,9 +343,13 @@ fn serve(
     let ws = ws_store.get(&repo, &workspace)?;
     let working_dir = PathBuf::from(&ws.path);
 
-    // Spawn PTY
+    // Spawn PTY with env vars so hook scripts can reach the supervisor
+    let pty_envs: Vec<(&str, &str)> = vec![
+        ("SHARD_PIPE_ADDR", &transport_addr),
+        ("SHARD_SESSION", "1"),
+    ];
     let pty_session =
-        shard_supervisor::pty::PtySession::spawn(&command, &working_dir, 24, 80)
+        shard_supervisor::pty::PtySession::spawn(&command, &working_dir, 24, 80, &pty_envs)
             .map_err(|e| shard_core::ShardError::Other(format!("failed to spawn PTY: {e}")))?;
 
     // Record child PID

@@ -7,6 +7,7 @@ import { AddShardDialog } from "./components/AddShardDialog";
 import { addRepo, createSession, createWorkspace, listRepos, stopSession, removeSession, removeWorkspace, syncRepo, removeRepo } from "./lib/api";
 import { contextMenu, type MenuItemDef } from "./lib/ContextMenu";
 import { labelFromCommand } from "./lib/titleFormat";
+import { activityStore } from "./lib/activityStore";
 
 const titlebarEl = document.getElementById("titlebar")!;
 const sidebarEl = document.getElementById("sidebar")!;
@@ -92,6 +93,7 @@ function openSession(repo: string, workspace: string, sessionId: string, session
 }
 
 function closeSession(sessionId: string) {
+  activityStore.remove(sessionId);
   terminalPane.close(sessionId);
   if (!terminalPane.getActiveId()) {
     terminalPane.showEmpty();
@@ -294,3 +296,9 @@ init();
 
 // Refresh sidebar when backend state changes
 listen("sidebar-changed", () => sidebar.refresh());
+
+// Relay activity state from supervisor to the store
+listen<{ id: string; state: "active" | "idle" | "blocked" }>("session-activity", ({ payload }) => {
+  const isFocused = payload.id === terminalPane.getActiveId();
+  activityStore.notify(payload.id, payload.state, isFocused);
+});

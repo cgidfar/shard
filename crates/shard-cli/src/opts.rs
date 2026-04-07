@@ -32,6 +32,13 @@ pub enum Commands {
         #[command(subcommand)]
         command: SessionCommands,
     },
+
+    /// [hidden] Send activity state to the session supervisor via hook
+    #[command(hide = true)]
+    Notify {
+        /// Activity state: active, idle, blocked
+        state: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -110,6 +117,10 @@ pub enum SessionCommands {
     Create {
         /// Target as repo:workspace
         target: String,
+
+        /// Harness type (e.g., "claude-code", "codex")
+        #[arg(long)]
+        harness: Option<String>,
 
         /// Command to run (defaults to system shell)
         #[arg(last = true)]

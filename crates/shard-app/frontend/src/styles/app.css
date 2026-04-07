@@ -358,19 +358,98 @@ html, body {
   user-select: text;
 }
 
-/* ── Status Dots ── */
-.status-dot {
+/* ── Session Status Indicator ── */
+.status-indicator {
+  position: relative;
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Inner dot — lifecycle state color */
+.status-dot-inner {
   width: 6px;
   height: 6px;
   border-radius: var(--radius-full);
-  flex-shrink: 0;
+  background: var(--text-muted);
+  position: relative;
+  z-index: 1;
+  transition: background 200ms ease;
 }
 
-.status-dot.running { background: var(--success); }
-.status-dot.stopped { background: var(--text-muted); }
-.status-dot.failed { background: var(--danger); }
-.status-dot.starting { background: var(--warning); }
-.status-dot.exited { background: var(--text-muted); }
+/* Outer ring */
+.status-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: var(--radius-full);
+  border: 1.5px solid transparent;
+  transition: border-color 200ms ease;
+}
+
+/* Lifecycle colors — inner dot */
+.status-indicator[data-lifecycle-status="running"] .status-dot-inner { background: var(--success); }
+.status-indicator[data-lifecycle-status="starting"] .status-dot-inner { background: var(--warning); }
+.status-indicator[data-lifecycle-status="failed"] .status-dot-inner { background: var(--danger); }
+.status-indicator[data-lifecycle-status="stopped"] .status-dot-inner,
+.status-indicator[data-lifecycle-status="exited"] .status-dot-inner { background: var(--text-muted); }
+
+/* Starting — ring spins in warning color */
+.status-indicator[data-lifecycle-status="starting"] .status-ring {
+  border-color: var(--warning);
+  border-top-color: transparent;
+  animation: status-spin 1s linear infinite;
+}
+
+/* Running + Active — ring spins in success color */
+.status-indicator[data-lifecycle-status="running"][data-activity-state="active"] .status-ring {
+  border-color: var(--success);
+  border-top-color: transparent;
+  animation: status-spin 1s linear infinite;
+}
+
+/* Running + Idle — ring still, faint */
+.status-indicator[data-lifecycle-status="running"][data-activity-state="idle"] .status-ring {
+  border-color: color-mix(in srgb, var(--success) 30%, transparent);
+}
+
+/* Running + Blocked — amber dot + amber ring spinning (agent waiting for permission) */
+.status-indicator[data-lifecycle-status="running"][data-activity-state="blocked"] .status-dot-inner {
+  background: var(--warning);
+}
+.status-indicator[data-lifecycle-status="running"][data-activity-state="blocked"] .status-ring {
+  border-color: var(--warning);
+  border-top-color: transparent;
+  animation: status-spin 1s linear infinite;
+}
+
+/* Running + Needs attention — amber dot + amber ring pulsing (went idle while unfocused) */
+.status-indicator[data-lifecycle-status="running"][data-activity-state="needs-attention"] .status-dot-inner {
+  background: var(--warning);
+}
+.status-indicator[data-lifecycle-status="running"][data-activity-state="needs-attention"] .status-ring {
+  border-color: color-mix(in srgb, var(--warning) 40%, transparent);
+  animation: status-pulse 2s ease-in-out infinite;
+}
+
+@keyframes status-pulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+
+/* Stopping — red ring spinning (applied via JS when stop is in progress) */
+.status-indicator[data-lifecycle-status="stopping"] .status-dot-inner { background: var(--danger); }
+.status-indicator[data-lifecycle-status="stopping"] .status-ring {
+  border-color: var(--danger);
+  border-top-color: transparent;
+  animation: status-spin 1s linear infinite;
+}
+
+@keyframes status-spin {
+  to { transform: rotate(360deg); }
+}
 
 /* ── Main Area ── */
 #main {

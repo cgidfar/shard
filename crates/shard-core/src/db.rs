@@ -71,5 +71,7 @@ pub fn init_repo_db(conn: &Connection) -> Result<()> {
     let _ = conn.execute_batch("ALTER TABLE workspaces ADD COLUMN is_base INTEGER NOT NULL DEFAULT 0;");
     // Migration: add label column if missing (existing databases)
     let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN label TEXT;");
+    // Migration: add harness column if missing (existing databases)
+    let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN harness TEXT;");
     Ok(())
 }

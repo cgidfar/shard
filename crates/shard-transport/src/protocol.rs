@@ -1,5 +1,30 @@
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+/// Activity state pushed by harness hooks to the supervisor, then fanned out
+/// to all connected clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ActivityState {
+    /// Agent is actively working (processing prompt, executing tools).
+    Active = 0x00,
+    /// Agent is idle (finished responding, waiting for user input).
+    Idle = 0x01,
+    /// Agent is blocked (waiting for permission approval).
+    Blocked = 0x02,
+}
+
+impl TryFrom<u8> for ActivityState {
+    type Error = u8;
+    fn try_from(value: u8) -> std::result::Result<Self, Self::Error> {
+        match value {
+            0x00 => Ok(Self::Active),
+            0x01 => Ok(Self::Idle),
+            0x02 => Ok(Self::Blocked),
+            other => Err(other),
+        }
+    }
+}
+
 /// Frame types for the session transport protocol.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
@@ -19,13 +44,19 @@ pub enum Frame {
     /// Force stop request (client -> supervisor).
     StopForce,
 
-    /// Status update (supervisor -> client).
-    /// 0 = exited normally, 1 = stopped, 2 = failed
+    /// Lifecycle status (supervisor -> client).
+    /// 0 = exited normally, 1 = stopped, 2 = failed.
+    /// Sent once on session termination.
     Status { code: u8 },
 
     /// Resume request (client -> supervisor).
     /// Client sends its last seen offset to resume from.
+    /// A value of `u64::MAX` is a sentinel meaning "skip replay, live-only".
     Resume { last_seen_offset: u64 },
+
+    /// Activity state change (supervisor -> client).
+    /// Pushed on transitions (idle ↔ active), not periodically.
+    ActivityUpdate { state: ActivityState },
 }
 
 const TYPE_TERMINAL_OUTPUT: u8 = 0x00;
@@ -35,6 +66,7 @@ const TYPE_STOP_GRACEFUL: u8 = 0x03;
 const TYPE_STOP_FORCE: u8 = 0x04;
 const TYPE_STATUS: u8 = 0x05;
 const TYPE_RESUME: u8 = 0x06;
+const TYPE_ACTIVITY_UPDATE: u8 = 0x07;
 
 /// Write a frame to an async writer.
 ///
@@ -67,6 +99,10 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &Frame) -
         Frame::Resume { last_seen_offset } => {
             payload.extend_from_slice(&last_seen_offset.to_be_bytes());
             TYPE_RESUME
+        }
+        Frame::ActivityUpdate { state } => {
+            payload.push(*state as u8);
+            TYPE_ACTIVITY_UPDATE
         }
     };
 
@@ -152,6 +188,21 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result
             let last_seen_offset = u64::from_be_bytes(payload[..8].try_into().unwrap());
             Frame::Resume { last_seen_offset }
         }
+        TYPE_ACTIVITY_UPDATE => {
+            if payload.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "activity update frame missing state",
+                ));
+            }
+            let state = ActivityState::try_from(payload[0]).map_err(|b| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unknown activity state: 0x{b:02x}"),
+                )
+            })?;
+            Frame::ActivityUpdate { state }
+        }
         _ => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -217,6 +268,30 @@ mod tests {
     async fn roundtrip_resume() {
         let frame = Frame::Resume {
             last_seen_offset: 1024,
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_activity_update_active() {
+        let frame = Frame::ActivityUpdate {
+            state: ActivityState::Active,
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_activity_update_idle() {
+        let frame = Frame::ActivityUpdate {
+            state: ActivityState::Idle,
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_activity_update_blocked() {
+        let frame = Frame::ActivityUpdate {
+            state: ActivityState::Blocked,
         };
         assert_eq!(roundtrip(frame.clone()).await, frame);
     }

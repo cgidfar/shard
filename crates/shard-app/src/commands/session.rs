@@ -1,15 +1,17 @@
 use tauri::ipc::Channel;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 use shard_core::repos::RepositoryStore;
 use shard_core::sessions::{Session, SessionStore};
 use shard_core::workspaces::WorkspaceStore;
 use shard_core::ShardPaths;
-use shard_transport::protocol::{self, Frame};
+use shard_transport::protocol::{self, ActivityState, Frame};
 use shard_transport::transport_windows::NamedPipeTransport;
 use shard_transport::SessionTransport;
 
-use crate::state::{AppState, SessionWriter};
+use crate::state::{AppState, SessionConnection, SessionWriter};
+
+// ── Shared types & helpers ──
 
 /// Default shell command for new sessions.
 fn default_command() -> Vec<String> {
@@ -36,6 +38,94 @@ pub struct SessionInfo {
     repo: String,
     session: Session,
 }
+
+#[derive(Clone, serde::Serialize)]
+struct SessionActivityEvent {
+    id: String,
+    state: &'static str, // "active" | "idle" | "blocked"
+}
+
+/// Handle ActivityUpdate and Status frames — shared by monitors and attach readers.
+/// Returns `true` if the caller should break its read loop (session ended).
+fn handle_supervisor_frame(app: &tauri::AppHandle, session_id: &str, frame: &Frame) -> bool {
+    match frame {
+        Frame::ActivityUpdate { state } => {
+            let state_str = match state {
+                ActivityState::Active => "active",
+                ActivityState::Idle => "idle",
+                ActivityState::Blocked => "blocked",
+            };
+            let _ = app.emit(
+                "session-activity",
+                SessionActivityEvent {
+                    id: session_id.to_string(),
+                    state: state_str,
+                },
+            );
+            false
+        }
+        Frame::Status { code } => {
+            // Lifecycle termination — update DB and notify sidebar
+            let status = match code {
+                0 => "exited",
+                1 => "stopped",
+                _ => "failed",
+            };
+            if let Ok(paths) = ShardPaths::new() {
+                let store = SessionStore::new(paths);
+                if let Ok((repo, _)) = store.find_by_id(session_id) {
+                    let _ = store.update_status(&repo, session_id, status, Some(*code as i32));
+                }
+            }
+            let _ = app.emit("sidebar-changed", ());
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Start a lightweight monitor connection for a running session.
+/// The monitor discards terminal output but relays ActivityUpdate and Status
+/// frames as Tauri events. Returns the spawned task handle.
+pub fn start_monitor(app: tauri::AppHandle, session_id: String, transport_addr: String) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
+        let client = match NamedPipeTransport::connect(&transport_addr).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!("monitor connect failed for {}: {e}", &session_id[..8.min(session_id.len())]);
+                return;
+            }
+        };
+
+        let (mut reader, mut writer) = tokio::io::split(client);
+
+        // Send Resume with u64::MAX sentinel — skip replay, live-only
+        let _ = protocol::write_frame(
+            &mut writer,
+            &Frame::Resume {
+                last_seen_offset: u64::MAX,
+            },
+        )
+        .await;
+
+        loop {
+            match protocol::read_frame(&mut reader).await {
+                Ok(Some(ref frame @ Frame::ActivityUpdate { .. }))
+                | Ok(Some(ref frame @ Frame::Status { .. })) => {
+                    if handle_supervisor_frame(&app, &session_id, frame) {
+                        break;
+                    }
+                }
+                Ok(Some(_)) => {} // discard TerminalOutput etc.
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        tracing::debug!("monitor ended for session {}", &session_id[..8.min(session_id.len())]);
+    })
+}
+
+// ── IPC Commands ──
 
 #[tauri::command]
 pub fn list_sessions(
@@ -83,6 +173,7 @@ pub fn create_session(
     repo: String,
     workspace_name: String,
     command: Option<Vec<String>>,
+    harness: Option<String>,
 ) -> Result<Session, String> {
     let paths = ShardPaths::new().map_err(|e| e.to_string())?;
 
@@ -95,7 +186,7 @@ pub fn create_session(
 
     let session_store = SessionStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
     let session = session_store
-        .create(&repo, &workspace_name, &command, "pending")
+        .create(&repo, &workspace_name, &command, "pending", harness.as_deref())
         .map_err(|e| e.to_string())?;
     let transport_addr = NamedPipeTransport::session_address(&session.id);
     session_store
@@ -118,6 +209,13 @@ pub fn create_session(
             "shardctl.exe not found at {}",
             shardctl.display()
         ));
+    }
+
+    // Best-effort: install harness hooks so agents can report activity state
+    if !shard_core::hooks::claude_code_hooks_installed() {
+        if let Err(e) = shard_core::hooks::install_claude_code_hooks(&shardctl) {
+            tracing::warn!("failed to install Claude Code hooks: {e}");
+        }
     }
 
     let args: Vec<String> = vec![
@@ -165,6 +263,15 @@ pub fn create_session(
     let result = session_store
         .get(&repo, &session.id)
         .map_err(|e| e.to_string())?;
+
+    // Start a monitor for the new session so sidebar gets activity updates
+    let task = start_monitor(app.clone(), session.id.clone(), transport_addr);
+    {
+        let state: tauri::State<'_, AppState> = app.state();
+        let mut conns = state.connections.blocking_lock();
+        conns.insert(session.id.clone(), SessionConnection::Monitored { task });
+    }
+
     let _ = app.emit("sidebar-changed", ());
     Ok(result)
 }
@@ -183,6 +290,14 @@ pub async fn stop_session(
         return Ok(());
     }
 
+    // Abort any existing monitor/attach task FIRST to avoid DB update races
+    {
+        let mut conns = state.connections.lock().await;
+        if let Some(conn) = conns.remove(&id) {
+            conn.abort();
+        }
+    }
+
     let frame = if force {
         Frame::StopForce
     } else {
@@ -197,7 +312,9 @@ pub async fn stop_session(
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
                     match protocol::read_frame(&mut client).await {
-                        Ok(Some(Frame::Status { .. })) | Ok(None) => return,
+                        // Only break on lifecycle Status (codes 0-2), not activity frames
+                        Ok(Some(Frame::Status { code })) if code <= 2 => return,
+                        Ok(None) => return,
                         _ => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
                     }
                 }
@@ -216,12 +333,6 @@ pub async fn stop_session(
         if let Some(pid) = session.supervisor_pid {
             let _ = PlatformProcessControl::terminate(pid);
         }
-    }
-
-    // Sever the pipe connection so the frontend can't write to the dead session
-    {
-        let mut sessions = state.sessions.lock().await;
-        sessions.remove(&id);
     }
 
     session_store
@@ -244,6 +355,7 @@ pub fn remove_session(app: tauri::AppHandle, id: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn attach_session(
+    app: tauri::AppHandle,
     id: String,
     channel: Channel<Vec<u8>>,
     state: tauri::State<'_, AppState>,
@@ -258,27 +370,30 @@ pub async fn attach_session(
         ));
     }
 
+    // Abort existing monitor if present — we're taking over the connection
+    {
+        let mut conns = state.connections.lock().await;
+        if let Some(conn) = conns.remove(&id) {
+            conn.abort();
+        }
+    }
+
     let client = NamedPipeTransport::connect(&session.transport_addr)
         .await
         .map_err(|e| e.to_string())?;
 
     let (mut reader, writer) = tokio::io::split(client);
 
-    // Send Resume frame — need mutable access, so do it before storing
+    // Send Resume frame
     let mut writer = writer;
     protocol::write_frame(&mut writer, &Frame::Resume { last_seen_offset: 0 })
         .await
         .map_err(|e| e.to_string())?;
 
-    // Store writer for input forwarding
-    {
-        let mut sessions = state.sessions.lock().await;
-        sessions.insert(id.clone(), SessionWriter { writer });
-    }
-
-    // Spawn reader task that forwards terminal output to the Tauri Channel
+    // Spawn reader task that forwards terminal output AND relays activity/status events
     let session_id = id.clone();
-    tokio::spawn(async move {
+    let app_clone = app.clone();
+    let task = tauri::async_runtime::spawn(async move {
         loop {
             match protocol::read_frame(&mut reader).await {
                 Ok(Some(Frame::TerminalOutput { data, .. })) => {
@@ -286,13 +401,32 @@ pub async fn attach_session(
                         break;
                     }
                 }
-                Ok(Some(Frame::Status { .. })) | Ok(None) => break,
+                Ok(Some(ref frame @ Frame::ActivityUpdate { .. })) => {
+                    handle_supervisor_frame(&app_clone, &session_id, frame);
+                }
+                Ok(Some(ref frame @ Frame::Status { .. })) => {
+                    handle_supervisor_frame(&app_clone, &session_id, frame);
+                    break;
+                }
+                Ok(None) => break,
                 Ok(Some(_)) => {}
                 Err(_) => break,
             }
         }
-        tracing::debug!("reader task for session {session_id} ended");
+        tracing::debug!("attach reader ended for session {session_id}");
     });
+
+    // Store writer + reader task as Attached connection
+    {
+        let mut conns = state.connections.lock().await;
+        conns.insert(
+            id.clone(),
+            SessionConnection::Attached {
+                writer: SessionWriter { writer },
+                task,
+            },
+        );
+    }
 
     Ok(())
 }
@@ -303,11 +437,16 @@ pub async fn write_to_session(
     data: Vec<u8>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let mut sessions = state.sessions.lock().await;
-    let entry = sessions.get_mut(&id).ok_or("session not attached")?;
+    let mut conns = state.connections.lock().await;
+    let conn = conns.get_mut(&id).ok_or("session not attached")?;
+
+    let writer = match conn {
+        SessionConnection::Attached { ref mut writer, .. } => &mut writer.writer,
+        SessionConnection::Monitored { .. } => return Err("session not attached".into()),
+    };
 
     let frame = Frame::TerminalInput { data };
-    protocol::write_frame(&mut entry.writer, &frame)
+    protocol::write_frame(writer, &frame)
         .await
         .map_err(|e| e.to_string())
 }
@@ -319,11 +458,16 @@ pub async fn resize_session(
     cols: u16,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let mut sessions = state.sessions.lock().await;
-    let entry = sessions.get_mut(&id).ok_or("session not attached")?;
+    let mut conns = state.connections.lock().await;
+    let conn = conns.get_mut(&id).ok_or("session not attached")?;
+
+    let writer = match conn {
+        SessionConnection::Attached { ref mut writer, .. } => &mut writer.writer,
+        SessionConnection::Monitored { .. } => return Err("session not attached".into()),
+    };
 
     let frame = Frame::Resize { rows, cols };
-    protocol::write_frame(&mut entry.writer, &frame)
+    protocol::write_frame(writer, &frame)
         .await
         .map_err(|e| e.to_string())
 }
@@ -344,8 +488,29 @@ pub fn rename_session(
 }
 
 #[tauri::command]
-pub async fn detach_session(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let mut sessions = state.sessions.lock().await;
-    sessions.remove(&id);
+pub async fn detach_session(
+    app: tauri::AppHandle,
+    id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    // Remove and abort existing connection
+    {
+        let mut conns = state.connections.lock().await;
+        if let Some(conn) = conns.remove(&id) {
+            conn.abort();
+        }
+    }
+    // Lock released — safe to do DB I/O without blocking write_to_session/resize_session
+
+    // If session is still running, start a monitor so sidebar keeps getting updates
+    let session_store = SessionStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
+    if let Ok((_repo, session)) = session_store.find_by_id(&id) {
+        if session.status == "running" {
+            let task = start_monitor(app, id.clone(), session.transport_addr);
+            let mut conns = state.connections.lock().await;
+            conns.insert(id, SessionConnection::Monitored { task });
+        }
+    }
+
     Ok(())
 }

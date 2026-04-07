@@ -21,6 +21,7 @@ pub struct Session {
     pub created_at: u64,
     pub stopped_at: Option<u64>,
     pub label: Option<String>,
+    pub harness: Option<String>,
 }
 
 pub struct SessionStore {
@@ -40,6 +41,7 @@ impl SessionStore {
         workspace_name: &str,
         command: &[String],
         transport_addr: &str,
+        harness: Option<&str>,
     ) -> Result<Session> {
         let repo_db_path = self.paths.repo_db(repo_alias);
         let conn = db::open_connection(&repo_db_path)?;
@@ -58,9 +60,9 @@ impl SessionStore {
         let log_path_str = log_path.to_string_lossy().to_string();
 
         conn.execute(
-            "INSERT INTO sessions (id, workspace_name, command_json, transport_addr, log_path, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'starting', ?6)",
-            params![id, workspace_name, command_json, transport_addr, log_path_str, now],
+            "INSERT INTO sessions (id, workspace_name, command_json, transport_addr, log_path, status, created_at, harness)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'starting', ?6, ?7)",
+            params![id, workspace_name, command_json, transport_addr, log_path_str, now, harness],
         )?;
 
         Ok(Session {
@@ -76,6 +78,7 @@ impl SessionStore {
             created_at: now,
             stopped_at: None,
             label: None,
+            harness: harness.map(|s| s.to_string()),
         })
     }
 
@@ -170,7 +173,7 @@ impl SessionStore {
         if let Some(ws) = workspace_name {
             let mut stmt = conn.prepare(
                 "SELECT id, workspace_name, command_json, transport_addr, log_path,
-                        supervisor_pid, child_pid, status, exit_code, created_at, stopped_at, label
+                        supervisor_pid, child_pid, status, exit_code, created_at, stopped_at, label, harness
                  FROM sessions WHERE workspace_name = ?1 ORDER BY created_at DESC",
             )?;
             let rows = stmt.query_map(params![ws], row_to_session)?;
@@ -180,7 +183,7 @@ impl SessionStore {
         } else {
             let mut stmt = conn.prepare(
                 "SELECT id, workspace_name, command_json, transport_addr, log_path,
-                        supervisor_pid, child_pid, status, exit_code, created_at, stopped_at, label
+                        supervisor_pid, child_pid, status, exit_code, created_at, stopped_at, label, harness
                  FROM sessions ORDER BY created_at DESC",
             )?;
             let rows = stmt.query_map([], row_to_session)?;
@@ -198,7 +201,7 @@ impl SessionStore {
         let conn = db::open_connection(&repo_db_path)?;
         conn.query_row(
             "SELECT id, workspace_name, command_json, transport_addr, log_path,
-                    supervisor_pid, child_pid, status, exit_code, created_at, stopped_at, label
+                    supervisor_pid, child_pid, status, exit_code, created_at, stopped_at, label, harness
              FROM sessions WHERE id = ?1",
             params![session_id],
             row_to_session,
@@ -240,7 +243,7 @@ impl SessionStore {
             let like_pattern = format!("{session_id}%");
             let mut pstmt = conn.prepare(
                 "SELECT id, workspace_name, command_json, transport_addr, log_path,
-                        supervisor_pid, child_pid, status, exit_code, created_at, stopped_at, label
+                        supervisor_pid, child_pid, status, exit_code, created_at, stopped_at, label, harness
                  FROM sessions WHERE id LIKE ?1",
             )?;
             let rows = pstmt.query_map(params![like_pattern], row_to_session)?;
@@ -312,5 +315,6 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
         created_at: row.get(9)?,
         stopped_at: row.get(10)?,
         label: row.get(11)?,
+        harness: row.get(12)?,
     })
 }

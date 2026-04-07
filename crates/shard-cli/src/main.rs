@@ -11,7 +11,8 @@ fn main() {
     // Check if we're running as a supervisor before initializing the
     // default subscriber (to avoid double-init).
     let is_serve = std::env::args().any(|a| a == "serve");
-    if !is_serve {
+    let is_notify = std::env::args().any(|a| a == "notify");
+    if !is_serve && !is_notify {
         tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::from_default_env()
@@ -27,6 +28,7 @@ fn main() {
         Commands::Workspace { command } => cmd::workspace::run(command),
         Commands::Session { command } => cmd::session::run(command),
         Commands::Prune { command } => cmd::prune::run(command),
+        Commands::Notify { state } => cmd::notify::run(state),
     };
 
     if let Err(e) = result {
