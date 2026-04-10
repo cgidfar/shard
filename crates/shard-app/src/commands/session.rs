@@ -4,7 +4,7 @@ use tauri::{Emitter, Manager};
 use shard_core::repos::RepositoryStore;
 use shard_core::sessions::{Session, SessionStore};
 use shard_core::workspaces::WorkspaceStore;
-use shard_core::ShardPaths;
+use shard_core::{Harness, ShardPaths};
 use shard_transport::protocol::{self, ActivityState, Frame};
 use shard_transport::transport_windows::NamedPipeTransport;
 use shard_transport::SessionTransport;
@@ -173,7 +173,7 @@ pub fn create_session(
     repo: String,
     workspace_name: String,
     command: Option<Vec<String>>,
-    harness: Option<String>,
+    harness: Option<Harness>,
 ) -> Result<Session, String> {
     let paths = ShardPaths::new().map_err(|e| e.to_string())?;
 
@@ -186,7 +186,7 @@ pub fn create_session(
 
     let session_store = SessionStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
     let session = session_store
-        .create(&repo, &workspace_name, &command, "pending", harness.as_deref())
+        .create(&repo, &workspace_name, &command, "pending", harness)
         .map_err(|e| e.to_string())?;
     let transport_addr = NamedPipeTransport::session_address(&session.id);
     session_store

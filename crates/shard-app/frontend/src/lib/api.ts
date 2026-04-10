@@ -20,6 +20,8 @@ export interface Workspace {
   created_at: number;
 }
 
+export type Harness = "claude-code" | "codex";
+
 export interface Session {
   id: string;
   workspace_name: string;
@@ -33,7 +35,7 @@ export interface Session {
   created_at: number;
   stopped_at: number | null;
   label: string | null;
-  harness: string | null;
+  harness: Harness | null;
 }
 
 export interface SessionInfo {
@@ -97,7 +99,7 @@ export function createSession(
   repo: string,
   workspaceName: string,
   command?: string[],
-  harness?: string
+  harness?: Harness
 ): Promise<Session> {
   return invoke("create_session", {
     repo,

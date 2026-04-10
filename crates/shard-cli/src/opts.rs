@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use shard_core::Harness;
 
 #[derive(Parser)]
 #[command(name = "shardctl", about = "Workspace manager for parallel coding agents")]
@@ -118,9 +119,9 @@ pub enum SessionCommands {
         /// Target as repo:workspace
         target: String,
 
-        /// Harness type (e.g., "claude-code", "codex")
+        /// Harness type (claude-code, codex)
         #[arg(long)]
-        harness: Option<String>,
+        harness: Option<Harness>,
 
         /// Command to run (defaults to system shell)
         #[arg(last = true)]

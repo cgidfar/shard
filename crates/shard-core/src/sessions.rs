@@ -4,6 +4,7 @@ use rusqlite::params;
 use serde::Serialize;
 
 use crate::db;
+use crate::harness::Harness;
 use crate::paths::ShardPaths;
 use crate::{Result, ShardError};
 
@@ -21,7 +22,7 @@ pub struct Session {
     pub created_at: u64,
     pub stopped_at: Option<u64>,
     pub label: Option<String>,
-    pub harness: Option<String>,
+    pub harness: Option<Harness>,
 }
 
 pub struct SessionStore {
@@ -41,7 +42,7 @@ impl SessionStore {
         workspace_name: &str,
         command: &[String],
         transport_addr: &str,
-        harness: Option<&str>,
+        harness: Option<Harness>,
     ) -> Result<Session> {
         let repo_db_path = self.paths.repo_db(repo_alias);
         let conn = db::open_connection(&repo_db_path)?;
@@ -59,10 +60,11 @@ impl SessionStore {
         let log_path = session_dir.join("session.log");
         let log_path_str = log_path.to_string_lossy().to_string();
 
+        let harness_str = harness.map(|h| h.to_string());
         conn.execute(
             "INSERT INTO sessions (id, workspace_name, command_json, transport_addr, log_path, status, created_at, harness)
              VALUES (?1, ?2, ?3, ?4, ?5, 'starting', ?6, ?7)",
-            params![id, workspace_name, command_json, transport_addr, log_path_str, now, harness],
+            params![id, workspace_name, command_json, transport_addr, log_path_str, now, harness_str],
         )?;
 
         Ok(Session {
@@ -78,7 +80,7 @@ impl SessionStore {
             created_at: now,
             stopped_at: None,
             label: None,
-            harness: harness.map(|s| s.to_string()),
+            harness,
         })
     }
 
@@ -302,6 +304,9 @@ impl SessionStore {
 }
 
 fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
+    let harness_str: Option<String> = row.get(12)?;
+    let harness = harness_str.and_then(|s| s.parse::<Harness>().ok());
+
     Ok(Session {
         id: row.get(0)?,
         workspace_name: row.get(1)?,
@@ -315,6 +320,6 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
         created_at: row.get(9)?,
         stopped_at: row.get(10)?,
         label: row.get(11)?,
-        harness: row.get(12)?,
+        harness,
     })
 }

@@ -47,7 +47,7 @@ pub fn run(command: SessionCommands) -> shard_core::Result<()> {
     }
 }
 
-fn create(target: String, harness: Option<String>, command: Vec<String>) -> shard_core::Result<()> {
+fn create(target: String, harness: Option<shard_core::Harness>, command: Vec<String>) -> shard_core::Result<()> {
     let (repo, ws_name) =
         parse_target(&target).map_err(|e| shard_core::ShardError::Other(e))?;
 
@@ -66,7 +66,7 @@ fn create(target: String, harness: Option<String>, command: Vec<String>) -> shar
     // Create session record (generates UUID internally)
     // We pass a placeholder transport_addr, then update it after we know the ID.
     let session_store = SessionStore::new(ShardPaths::new()?);
-    let session = session_store.create(repo, ws_name, &command, "pending", harness.as_deref())?;
+    let session = session_store.create(repo, ws_name, &command, "pending", harness)?;
     let transport_addr = NamedPipeTransport::session_address(&session.id);
     session_store.update_transport_addr(repo, &session.id, &transport_addr)?;
 
