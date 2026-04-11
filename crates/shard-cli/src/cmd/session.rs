@@ -343,10 +343,17 @@ fn serve(
     let ws = ws_store.get(&repo, &workspace)?;
     let working_dir = PathBuf::from(&ws.path);
 
-    // Spawn PTY with env vars so hook scripts can reach the supervisor
+    // Spawn PTY with env vars so hook scripts can reach the supervisor.
+    // TERM/COLORTERM tell TUI apps what sequences the emulator supports.
+    // TERM_PROGRAM overrides any inherited value (e.g. WarpTerminal) so
+    // that TUI frameworks detect xterm.js capabilities correctly — this
+    // affects whether apps like Claude Code enable alternate-screen mode.
     let pty_envs: Vec<(&str, &str)> = vec![
         ("SHARD_PIPE_ADDR", &transport_addr),
         ("SHARD_SESSION", "1"),
+        ("TERM", "xterm-256color"),
+        ("COLORTERM", "truecolor"),
+        ("TERM_PROGRAM", "xterm"),
     ];
     let pty_session =
         shard_supervisor::pty::PtySession::spawn(&command, &working_dir, 24, 80, &pty_envs)

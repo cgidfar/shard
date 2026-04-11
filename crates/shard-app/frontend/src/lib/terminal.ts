@@ -20,6 +20,7 @@ export function createTerminalSession(
   container: HTMLElement,
   options: TerminalSessionOptions = {}
 ): TerminalSession {
+  const isWindowsHost = navigator.userAgent.includes("Windows");
   const terminal = new Terminal({
     fontFamily: "'Geist Mono', 'Cascadia Code', 'Consolas', monospace",
     fontSize: 14,
@@ -47,6 +48,9 @@ export function createTerminalSession(
     },
     cursorBlink: true,
     allowProposedApi: true,
+    // ConPTY does not behave like a Unix PTY around wrap/reflow. Tell xterm.js
+    // so it enables the same Windows-specific heuristics VS Code depends on.
+    windowsPty: isWindowsHost ? { backend: "conpty" } : undefined,
   });
 
   const fitAddon = new FitAddon();
@@ -85,10 +89,10 @@ export function createTerminalSession(
     });
   }
 
-  // Set up data channel from backend
-  const channel = new Channel<Uint8Array>();
-  channel.onmessage = (data: Uint8Array) => {
-    terminal.write(data);
+  // Set up data channel from backend (binary transfer via Tauri Response)
+  const channel = new Channel<ArrayBuffer>();
+  channel.onmessage = (data: ArrayBuffer) => {
+    terminal.write(new Uint8Array(data));
   };
 
   // Attach to session (sends Resume, starts receiving output)

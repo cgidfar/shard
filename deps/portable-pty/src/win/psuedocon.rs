@@ -26,6 +26,7 @@ pub type HPCON = HANDLE;
 
 pub const PSUEDOCONSOLE_INHERIT_CURSOR: DWORD = 0x1;
 pub const PSEUDOCONSOLE_RESIZE_QUIRK: DWORD = 0x2;
+#[allow(dead_code)]
 pub const PSEUDOCONSOLE_WIN32_INPUT_MODE: DWORD = 0x4;
 #[allow(dead_code)]
 pub const PSEUDOCONSOLE_PASSTHROUGH_MODE: DWORD = 0x8;
@@ -79,30 +80,46 @@ impl Drop for PsuedoCon {
 impl PsuedoCon {
     pub fn new(size: COORD, input: FileDescriptor, output: FileDescriptor) -> Result<Self, Error> {
         let mut con: HPCON = INVALID_HANDLE_VALUE;
+        // Note: WIN32_INPUT_MODE (0x4) is deliberately omitted. That flag
+        // tells ConPTY to expect INPUT_RECORD structs on the input pipe,
+        // but our terminal emulator (xterm.js) sends VT escape sequences.
+        // Matching what VS Code's node-pty does.
         let base_flags = PSUEDOCONSOLE_INHERIT_CURSOR
-            | PSEUDOCONSOLE_RESIZE_QUIRK
-            | PSEUDOCONSOLE_WIN32_INPUT_MODE;
+            | PSEUDOCONSOLE_RESIZE_QUIRK;
 
-        // Try with PASSTHROUGH_MODE first (Windows 11 22H2+).
-        // In passthrough mode ConPTY forwards VT sequences directly to
-        // the terminal emulator instead of interpreting them internally.
-        // This enables proper alternate-screen support (?1049h/l) and
-        // avoids ConPTY-generated redraws that conflict with the
-        // emulator's own reflow on resize.
-        let result = unsafe {
-            (CONPTY.CreatePseudoConsole)(
-                size,
-                input.as_raw_handle() as _,
-                output.as_raw_handle() as _,
-                base_flags | PSEUDOCONSOLE_PASSTHROUGH_MODE,
-                &mut con,
-            )
-        };
+        // Passthrough mode is OFF by default — ConPTY normalizes VT output
+        // through its internal screen buffer (same behavior as VS Code's
+        // node-pty), which produces fewer rendering glitches with xterm.js.
+        // Set SHARD_PASSTHROUGH=1 to enable passthrough for testing.
+        let use_passthrough = std::env::var("SHARD_PASSTHROUGH")
+            .map(|v| v == "1")
+            .unwrap_or(false);
 
-        if result != S_OK {
-            // Passthrough not supported — fall back without it.
-            log::info!("ConPTY passthrough mode not available (HRESULT {}), falling back", result);
-            con = INVALID_HANDLE_VALUE;
+        let mut passthrough_active = false;
+        if use_passthrough {
+            // Try with PASSTHROUGH_MODE first (Windows 11 22H2+).
+            // In passthrough mode ConPTY forwards VT sequences directly to
+            // the terminal emulator instead of interpreting them internally.
+            // This avoids ConPTY-generated redraws that conflict with the
+            // emulator's own reflow on resize.
+            let result = unsafe {
+                (CONPTY.CreatePseudoConsole)(
+                    size,
+                    input.as_raw_handle() as _,
+                    output.as_raw_handle() as _,
+                    base_flags | PSEUDOCONSOLE_PASSTHROUGH_MODE,
+                    &mut con,
+                )
+            };
+            if result == S_OK {
+                passthrough_active = true;
+            } else {
+                log::info!("ConPTY passthrough mode not available (HRESULT {}), falling back", result);
+                con = INVALID_HANDLE_VALUE;
+            }
+        }
+
+        if !passthrough_active {
             let result = unsafe {
                 (CONPTY.CreatePseudoConsole)(
                     size,
@@ -118,9 +135,11 @@ impl PsuedoCon {
                 result
             );
         }
-        if result == S_OK {
-            log::info!("ConPTY created with passthrough mode");
-        }
+
+        log::info!(
+            "ConPTY created (passthrough={})",
+            passthrough_active
+        );
         Ok(Self { con })
     }
 

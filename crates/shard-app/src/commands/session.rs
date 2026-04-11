@@ -1,4 +1,4 @@
-use tauri::ipc::Channel;
+use tauri::ipc::{Channel, Response};
 use tauri::{Emitter, Manager};
 
 use shard_core::repos::RepositoryStore;
@@ -357,7 +357,7 @@ pub fn remove_session(app: tauri::AppHandle, id: String) -> Result<(), String> {
 pub async fn attach_session(
     app: tauri::AppHandle,
     id: String,
-    channel: Channel<Vec<u8>>,
+    channel: Channel<Response>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     let session_store = SessionStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
@@ -397,7 +397,7 @@ pub async fn attach_session(
         loop {
             match protocol::read_frame(&mut reader).await {
                 Ok(Some(Frame::TerminalOutput { data, .. })) => {
-                    if channel.send(data).is_err() {
+                    if channel.send(Response::new(data)).is_err() {
                         break;
                     }
                 }
@@ -417,7 +417,7 @@ pub async fn attach_session(
                         .await
                         {
                             Ok(Ok(Some(Frame::TerminalOutput { data, .. }))) => {
-                                let _ = channel.send(data);
+                                let _ = channel.send(Response::new(data));
                             }
                             _ => break,
                         }

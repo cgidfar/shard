@@ -119,7 +119,7 @@ export function removeSession(id: string): Promise<void> {
 
 export function attachSession(
   id: string,
-  channel: Channel<Uint8Array>
+  channel: Channel<ArrayBuffer>
 ): Promise<void> {
   return invoke("attach_session", { id, channel });
 }
