@@ -1,4 +1,16 @@
 //! Daemon process: owns session supervisor lifecycle, control pipe, and tray icon.
+//!
+//! # Threading Model
+//!
+//! On Windows, the main thread runs the winit event loop (Win32 message pump) which
+//! hosts the system tray icon. The tokio runtime runs on a background thread spawned
+//! by `run_daemon()`. Communication between them uses `EventLoopProxy<TrayEvent>`.
+//!
+//! # TODO(macos): Extract to TrayBackend trait
+//!
+//! The tray implementation below is Windows-specific. For macOS portability, extract
+//! to a `TrayBackend` trait following the pattern of `SessionTransport` and `ProcessControl`.
+//! See Linear issue SHA-34 for details.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -8,8 +20,8 @@ use std::time::Duration;
 use tokio::sync::{watch, Mutex};
 use tracing::{error, info, warn};
 
-use shard_core::sessions::SessionStore;
 use shard_core::repos::RepositoryStore;
+use shard_core::sessions::SessionStore;
 use shard_core::ShardPaths;
 use shard_supervisor::job_object::DaemonJobGuard;
 use shard_supervisor::process::{PlatformProcessControl, ProcessControl};
@@ -22,6 +34,20 @@ use shard_transport::SessionTransport;
 
 use crate::opts::DaemonCommands;
 
+// Tray icon imports (Windows-only)
+#[cfg(windows)]
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+#[cfg(windows)]
+use tray_icon::{Icon, TrayIconBuilder};
+#[cfg(windows)]
+use winit::application::ApplicationHandler;
+#[cfg(windows)]
+use winit::event::WindowEvent;
+#[cfg(windows)]
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+#[cfg(windows)]
+use winit::window::WindowId;
+
 /// In-memory record of a live supervised session.
 struct LiveSession {
     pub session_id: String,
@@ -33,11 +59,144 @@ struct LiveSession {
 }
 
 /// Shutdown mode for the daemon.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ShutdownMode {
     Running,
     Graceful,
     Force,
+}
+
+// ── Tray Icon (Windows) ──────────────────────────────────────────────────────
+
+/// Events sent from the tokio runtime to the winit event loop.
+#[cfg(windows)]
+#[derive(Debug)]
+enum TrayEvent {
+    /// Update the session count label in the tray menu.
+    SessionCount(usize),
+    /// Signal the event loop to exit (daemon is shutting down).
+    Quit,
+}
+
+/// System tray application state.
+#[cfg(windows)]
+struct TrayApp {
+    tray: Option<tray_icon::TrayIcon>,
+    session_count: usize,
+    quit_id: tray_icon::menu::MenuId,
+    shutdown_tx: watch::Sender<ShutdownMode>,
+}
+
+#[cfg(windows)]
+impl TrayApp {
+    fn new(shutdown_tx: watch::Sender<ShutdownMode>) -> Self {
+        Self {
+            tray: None,
+            session_count: 0,
+            quit_id: tray_icon::menu::MenuId::new("quit"),
+            shutdown_tx,
+        }
+    }
+
+    /// Build or rebuild the tray menu with current session count.
+    fn build_menu(&self) -> Menu {
+        // TODO: "Open Shard" should launch/focus the Tauri app.
+        // For now it's disabled. Implementation deferred to follow-up task.
+        let open_item = MenuItem::new("Open Shard", false, None);
+        let separator = PredefinedMenuItem::separator();
+        let count_label = if self.session_count == 1 {
+            "1 active session".to_string()
+        } else {
+            format!("{} active sessions", self.session_count)
+        };
+        let count_item = MenuItem::new(count_label, false, None);
+        let quit_item = MenuItem::with_id(self.quit_id.clone(), "Quit Shard", true, None);
+
+        let menu = Menu::new();
+        let _ = menu.append_items(&[&open_item, &separator, &count_item, &quit_item]);
+        menu
+    }
+
+    /// Create the tray icon. Must be called after the event loop starts.
+    fn create_tray(&mut self) {
+        let menu = self.build_menu();
+
+        // 16x16 placeholder icon (Windows blue #0078D4)
+        let rgba: Vec<u8> = std::iter::repeat([0x00u8, 0x78, 0xD4, 0xFF])
+            .take(16 * 16)
+            .flatten()
+            .collect();
+        let icon = Icon::from_rgba(rgba, 16, 16).expect("valid icon dimensions");
+
+        match TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_tooltip("Shard")
+            .with_icon(icon)
+            .build()
+        {
+            Ok(tray) => {
+                self.tray = Some(tray);
+                info!("Tray icon created");
+            }
+            Err(e) => {
+                error!("Failed to create tray icon: {e}");
+            }
+        }
+    }
+
+    /// Update the menu with a new session count.
+    fn update_session_count(&mut self, count: usize) {
+        self.session_count = count;
+        if let Some(ref tray) = self.tray {
+            let menu = self.build_menu();
+            let _ = tray.set_menu(Some(Box::new(menu)));
+        }
+    }
+}
+
+#[cfg(windows)]
+impl ApplicationHandler<TrayEvent> for TrayApp {
+    fn resumed(&mut self, _event_loop: &ActiveEventLoop) {
+        // Create tray on first resume (required by tray-icon)
+        if self.tray.is_none() {
+            self.create_tray();
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        _event: WindowEvent,
+    ) {
+        // No windows — nothing to handle
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: TrayEvent) {
+        match event {
+            TrayEvent::SessionCount(count) => {
+                self.update_session_count(count);
+            }
+            TrayEvent::Quit => {
+                info!("Tray received quit signal");
+                event_loop.exit();
+            }
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Set Wait control flow to avoid busy-loop CPU burn
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+
+        // Poll for menu events (non-blocking)
+        if let Ok(event) = MenuEvent::receiver().try_recv() {
+            if event.id == self.quit_id {
+                info!("Quit menu item clicked");
+                let _ = self.shutdown_tx.send(ShutdownMode::Force);
+                event_loop.exit();
+            }
+        }
+    }
 }
 
 /// Shared daemon state.
@@ -47,6 +206,9 @@ struct DaemonState {
     paths: ShardPaths,
     exe_path: PathBuf,
     shutdown_tx: watch::Sender<ShutdownMode>,
+    /// Proxy to send events to the tray icon event loop.
+    #[cfg(windows)]
+    tray_proxy: EventLoopProxy<TrayEvent>,
 }
 
 pub fn run(command: DaemonCommands) -> shard_core::Result<()> {
@@ -58,6 +220,7 @@ pub fn run(command: DaemonCommands) -> shard_core::Result<()> {
 }
 
 /// Entry point for the daemon process. Sets up logging, control pipe, and tray.
+#[cfg(windows)]
 fn run_daemon() -> shard_core::Result<()> {
     let paths = ShardPaths::new()?;
 
@@ -102,26 +265,80 @@ fn run_daemon() -> shard_core::Result<()> {
     let exe_path = std::env::current_exe()?;
     let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownMode::Running);
 
+    // Build the winit event loop FIRST — must be created on the main thread.
+    // The EventLoopProxy is Send+Sync and can be passed to the tokio thread.
+    let event_loop = EventLoop::<TrayEvent>::with_user_event()
+        .build()
+        .map_err(|e| shard_core::ShardError::Other(format!("event loop: {e}")))?;
+    let tray_proxy = event_loop.create_proxy();
+
     let state = Arc::new(DaemonState {
         sessions: Mutex::new(HashMap::new()),
         job_guard,
         paths: paths.clone(),
         exe_path,
-        shutdown_tx,
+        shutdown_tx: shutdown_tx.clone(),
+        tray_proxy,
     });
 
-    // Adopt any orphaned supervisors from a previous daemon instance
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| shard_core::ShardError::Other(format!("tokio runtime: {e}")))?;
+    // Spawn the tokio runtime on a background thread.
+    // Main thread will run the winit event loop for the tray icon.
+    let tokio_state = state.clone();
+    let tokio_shutdown_rx = shutdown_rx.clone();
+    let tokio_thread = std::thread::Builder::new()
+        .name("daemon-tokio".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    error!("Failed to create tokio runtime: {e}");
+                    return;
+                }
+            };
 
-    rt.block_on(adopt_orphans(state.clone()));
+            // Adopt orphaned supervisors from a previous daemon instance
+            rt.block_on(adopt_orphans(tokio_state.clone()));
 
-    // Run the control pipe server + heartbeat on the tokio runtime
-    // Tray icon will be added in a follow-up (requires winit event loop on main thread)
-    info!("Daemon ready, entering control pipe loop");
-    rt.block_on(run_control_loop(state, shutdown_rx));
+            info!("Daemon ready, entering control pipe loop");
+            rt.block_on(run_control_loop(tokio_state, tokio_shutdown_rx));
+
+            info!("Daemon control loop exited");
+        })
+        .map_err(|e| shard_core::ShardError::Other(format!("thread spawn: {e}")))?;
+
+    // Spawn a watcher that signals the tray to quit when shutdown is triggered
+    // (e.g., from `shardctl daemon stop` via control pipe)
+    let watcher_proxy = state.tray_proxy.clone();
+    let watcher_rx = shutdown_rx;
+    let watcher_thread = std::thread::Builder::new()
+        .name("shutdown-watcher".into())
+        .spawn(move || {
+            // Poll until shutdown mode changes from Running
+            // Note: Using polling because watch::Receiver doesn't have blocking_recv.
+            // At 100ms intervals this is acceptable for a background watcher.
+            loop {
+                if *watcher_rx.borrow() != ShutdownMode::Running {
+                    let _ = watcher_proxy.send_event(TrayEvent::Quit);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+    // Run the tray icon on the main thread (blocks until quit)
+    let mut app = TrayApp::new(shutdown_tx);
+    if let Err(e) = event_loop.run_app(&mut app) {
+        error!("Event loop error: {e}");
+    }
+
+    // Wait for background threads to finish cleanup
+    let _ = tokio_thread.join();
+    if let Ok(handle) = watcher_thread {
+        let _ = handle.join();
+    }
 
     info!("Daemon shutting down");
     Ok(())
@@ -632,14 +849,24 @@ async fn heartbeat_task(state: Arc<DaemonState>) {
             }
         }
 
-        if !dead_ids.is_empty() {
-            let session_store = SessionStore::new(state.paths.clone());
+        // Update dead sessions and tray count under a single lock
+        let count = {
             let mut sessions = state.sessions.lock().await;
-            for (id, repo) in &dead_ids {
-                sessions.remove(id);
-                let _ = session_store.update_status(repo, id, "exited", None);
-                info!("Heartbeat: session {} supervisor died, marked exited", &id[..8]);
+            if !dead_ids.is_empty() {
+                let session_store = SessionStore::new(state.paths.clone());
+                for (id, repo) in &dead_ids {
+                    sessions.remove(id);
+                    let _ = session_store.update_status(repo, id, "exited", None);
+                    info!("Heartbeat: session {} supervisor died, marked exited", &id[..8]);
+                }
             }
+            sessions.len()
+        };
+
+        // Update tray icon with current session count
+        #[cfg(windows)]
+        {
+            let _ = state.tray_proxy.send_event(TrayEvent::SessionCount(count));
         }
     }
 }
@@ -735,5 +962,12 @@ async fn adopt_orphans(state: Arc<DaemonState>) {
 
     if adopted > 0 || pruned > 0 {
         info!("Orphan adoption: {adopted} adopted, {pruned} pruned");
+    }
+
+    // Send initial session count to tray
+    #[cfg(windows)]
+    {
+        let count = state.sessions.lock().await.len();
+        let _ = state.tray_proxy.send_event(TrayEvent::SessionCount(count));
     }
 }
