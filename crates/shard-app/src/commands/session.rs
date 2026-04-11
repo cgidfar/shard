@@ -406,6 +406,22 @@ pub async fn attach_session(
                 }
                 Ok(Some(ref frame @ Frame::Status { .. })) => {
                     handle_supervisor_frame(&app_clone, &session_id, frame);
+                    // Drain any trailing TerminalOutput (defensive)
+                    let deadline = tokio::time::Instant::now()
+                        + std::time::Duration::from_millis(500);
+                    loop {
+                        match tokio::time::timeout_at(
+                            deadline,
+                            protocol::read_frame(&mut reader),
+                        )
+                        .await
+                        {
+                            Ok(Ok(Some(Frame::TerminalOutput { data, .. }))) => {
+                                let _ = channel.send(data);
+                            }
+                            _ => break,
+                        }
+                    }
                     break;
                 }
                 Ok(None) => break,

@@ -104,28 +104,47 @@ export function createTerminalSession(
     writeToSession(sessionId, encoder.encode(data)).catch(() => {
       if (!disconnected) {
         disconnected = true;
+        // Restore main screen, show cursor, reset SGR (NOT full RIS — preserves scrollback)
+        terminal.write("\x1b[?1049l\x1b[?25h\x1b[0m");
         terminal.write("\r\n\x1b[31mSession ended.\x1b[0m\r\n");
       }
     });
   });
 
   // Handle resize
+  let lastRows = 0;
+  let lastCols = 0;
+  let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+
   const resizeObserver = new ResizeObserver(() => {
-    fitAddon.fit();
-    const dims = fitAddon.proposeDimensions();
-    if (dims) {
-      resizeSession(sessionId, dims.rows, dims.cols).catch(() => {});
-    }
+    // Debounce BOTH fit() and resizeSession() together. Calling fit()
+    // immediately reflows xterm.js locally, but ConPTY later sends its
+    // own redraw after resize — the two independent reflows create
+    // duplicate/garbled content. By deferring fit() until the drag
+    // settles, xterm.js and ConPTY resize simultaneously.
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      fitAddon.fit();
+      const dims = fitAddon.proposeDimensions();
+      if (dims && (dims.rows !== lastRows || dims.cols !== lastCols)) {
+        lastRows = dims.rows;
+        lastCols = dims.cols;
+        resizeSession(sessionId, dims.rows, dims.cols).catch(() => {});
+      }
+    }, 150);
   });
   resizeObserver.observe(container);
 
   // Also send initial size
   const initialDims = fitAddon.proposeDimensions();
   if (initialDims) {
+    lastRows = initialDims.rows;
+    lastCols = initialDims.cols;
     resizeSession(sessionId, initialDims.rows, initialDims.cols).catch(() => {});
   }
 
   function dispose() {
+    if (resizeTimer) clearTimeout(resizeTimer);
     resizeObserver.disconnect();
     detachSession(sessionId).catch(() => {});
     terminal.dispose();

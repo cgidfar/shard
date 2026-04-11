@@ -22,3 +22,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 crossterm = "0.28"
 async-trait = "0.1"
+
+[patch.crates-io]
+portable-pty = { path = "deps/portable-pty" }
