@@ -51,9 +51,7 @@ fn create(target: String, harness: Option<shard_core::Harness>, command: Vec<Str
     let (repo, ws_name) =
         parse_target(&target).map_err(|e| shard_core::ShardError::Other(e))?;
 
-    let paths = ShardPaths::new()?;
-
-    // Verify workspace exists
+    // Verify workspace exists before asking daemon to spawn
     let ws_store = WorkspaceStore::new(ShardPaths::new()?);
     let _ws = ws_store.get(repo, ws_name)?;
 
@@ -63,17 +61,6 @@ fn create(target: String, harness: Option<shard_core::Harness>, command: Vec<Str
         command
     };
 
-    // Create session record (generates UUID internally)
-    // We pass a placeholder transport_addr, then update it after we know the ID.
-    let session_store = SessionStore::new(ShardPaths::new()?);
-    let session = session_store.create(repo, ws_name, &command, "pending", harness)?;
-    let transport_addr = NamedPipeTransport::session_address(&session.id);
-    session_store.update_transport_addr(repo, &session.id, &transport_addr)?;
-
-    // Create the ready file path
-    let session_dir = paths.session_dir(repo, &session.id);
-    let ready_path = session_dir.join("ready");
-
     // Best-effort: install harness hooks so agents can report activity state
     let exe = std::env::current_exe()?;
     if !shard_core::hooks::claude_code_hooks_installed() {
@@ -82,56 +69,92 @@ fn create(target: String, harness: Option<shard_core::Harness>, command: Vec<Str
         }
     }
 
-    // Spawn detached supervisor
-    let args = vec![
-        "session".into(),
-        "serve".into(),
-        "--repo".into(),
-        repo.to_string(),
-        "--workspace".into(),
-        ws_name.to_string(),
-        "--session-id".into(),
-        session.id.clone(),
-        "--transport-addr".into(),
-        transport_addr.clone(),
-        "--".into(),
-    ]
-    .into_iter()
-    .chain(command.iter().cloned())
-    .collect::<Vec<String>>();
+    // Route through daemon: connect-or-spawn, then send SpawnSession RPC
+    let rt = tokio::runtime::Runtime::new()?;
+    let result = rt.block_on(async {
+        use shard_transport::control_protocol::ControlFrame;
 
-    let supervisor_pid = PlatformProcessControl::spawn_detached(&exe, &args)?;
-    session_store.set_supervisor_pid(repo, &session.id, supervisor_pid)?;
+        let mut conn = connect_or_spawn_daemon().await?;
+        conn.handshake().await.map_err(|e| {
+            shard_core::ShardError::Other(format!("daemon handshake failed: {e}"))
+        })?;
 
-    // Wait for readiness (poll for ready file, up to 10 seconds)
-    let start = std::time::Instant::now();
-    loop {
-        if ready_path.exists() {
-            break;
-        }
-        if !PlatformProcessControl::is_alive(supervisor_pid) {
-            // Supervisor died during startup
-            session_store.update_status(repo, &session.id, "failed", None)?;
-            return Err(shard_core::ShardError::Other(
-                "supervisor process exited during startup — check session logs".into(),
-            ));
-        }
-        if start.elapsed() > std::time::Duration::from_secs(10) {
-            session_store.update_status(repo, &session.id, "failed", None)?;
-            let _ = PlatformProcessControl::terminate(supervisor_pid);
-            return Err(shard_core::ShardError::Other(
-                "supervisor did not start within 10 seconds".into(),
-            ));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+        let response = conn
+            .request(&ControlFrame::SpawnSession {
+                repo: repo.to_string(),
+                workspace: ws_name.to_string(),
+                command: command.clone(),
+                harness: harness.map(|h| h.to_string()),
+            })
+            .await
+            .map_err(|e| shard_core::ShardError::Other(format!("daemon request failed: {e}")))?;
 
-    println!("Created session {}", session.id);
+        match response {
+            ControlFrame::SpawnAck {
+                session_id,
+                supervisor_pid,
+                transport_addr,
+            } => Ok((session_id, supervisor_pid, transport_addr)),
+            ControlFrame::Error { message } => {
+                Err(shard_core::ShardError::Other(format!("daemon: {message}")))
+            }
+            other => Err(shard_core::ShardError::Other(format!(
+                "unexpected daemon response: {other:?}"
+            ))),
+        }
+    })?;
+
+    let (session_id, _supervisor_pid, _transport_addr) = result;
+
+    println!("Created session {}", session_id);
     println!("  Workspace: {}:{}", repo, ws_name);
     println!("  Command:   {}", command.join(" "));
-    println!("  Attach:    shardctl session attach {}", session.id);
+    println!("  Attach:    shardctl session attach {}", session_id);
 
     Ok(())
+}
+
+/// Connect to the daemon, spawning it if not running.
+async fn connect_or_spawn_daemon() -> shard_core::Result<
+    shard_transport::daemon_client::DaemonConnection<tokio::net::windows::named_pipe::NamedPipeClient>,
+> {
+    use shard_transport::daemon_client;
+
+    // Try connecting first
+    match daemon_client::connect().await {
+        Ok(conn) => return Ok(conn),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Daemon not running — spawn it
+        }
+        Err(e) if e.raw_os_error() == Some(231) => {
+            // ERROR_PIPE_BUSY — daemon exists but all instances busy, retry
+            let conn = daemon_client::connect_with_retry(std::time::Duration::from_secs(5))
+                .await
+                .map_err(|e| {
+                    shard_core::ShardError::Other(format!("daemon pipe busy, retry failed: {e}"))
+                })?;
+            return Ok(conn);
+        }
+        Err(e) => {
+            return Err(shard_core::ShardError::Other(format!(
+                "cannot connect to daemon: {e}"
+            )));
+        }
+    }
+
+    // Spawn daemon
+    let exe = std::env::current_exe()?;
+    let args = vec!["daemon".to_string(), "start".to_string()];
+    PlatformProcessControl::spawn_detached(&exe, &args)?;
+
+    // Wait for it to become ready
+    let conn = daemon_client::connect_with_retry(std::time::Duration::from_secs(5))
+        .await
+        .map_err(|e| {
+            shard_core::ShardError::Other(format!("daemon did not start: {e}"))
+        })?;
+
+    Ok(conn)
 }
 
 fn list(target: Option<String>, json: bool) -> shard_core::Result<()> {
@@ -227,49 +250,70 @@ fn stop(id: String, force: bool) -> shard_core::Result<()> {
         return Ok(());
     }
 
-    // Try RPC stop via transport
     let rt = tokio::runtime::Runtime::new()?;
-    let frame = if force {
-        shard_transport::protocol::Frame::StopForce
-    } else {
-        shard_transport::protocol::Frame::StopGraceful
-    };
+    let stopped_via_daemon = rt.block_on(async {
+        use shard_transport::control_protocol::ControlFrame;
 
-    let rpc_result = rt.block_on(async {
-        use shard_transport::protocol;
-        use tokio::time::timeout;
-        use std::time::Duration;
-
-        match NamedPipeTransport::connect(&session.transport_addr).await {
-            Ok(mut client) => {
-                let _ = protocol::write_frame(&mut client, &frame).await;
-                // Wait briefly for the supervisor to handle it
-                let _ = timeout(Duration::from_secs(5), async {
-                    loop {
-                        match protocol::read_frame(&mut client).await {
-                            Ok(Some(protocol::Frame::Status { .. })) => return,
-                            Ok(None) => return, // Pipe closed = supervisor exited
-                            _ => tokio::time::sleep(Duration::from_millis(100)).await,
-                        }
-                    }
-                }).await;
-                true
+        // Try routing through daemon first
+        if let Ok(mut conn) = connect_or_spawn_daemon().await {
+            if conn.handshake().await.is_ok() {
+                match conn
+                    .request(&ControlFrame::StopSession {
+                        session_id: session.id.clone(),
+                        force,
+                    })
+                    .await
+                {
+                    Ok(ControlFrame::StopAck) => return true,
+                    _ => {}
+                }
             }
-            Err(_) => false,
         }
+        false
     });
 
-    if !rpc_result {
-        // Fallback: force-kill both processes
-        if let Some(child_pid) = session.child_pid {
-            let _ = PlatformProcessControl::terminate(child_pid);
-        }
-        if let Some(sup_pid) = session.supervisor_pid {
-            let _ = PlatformProcessControl::terminate(sup_pid);
+    if !stopped_via_daemon {
+        // Fallback: direct stop via session pipe (daemon might not be running)
+        let frame = if force {
+            shard_transport::protocol::Frame::StopForce
+        } else {
+            shard_transport::protocol::Frame::StopGraceful
+        };
+
+        let rpc_result = rt.block_on(async {
+            use shard_transport::protocol;
+            use tokio::time::timeout;
+            use std::time::Duration;
+
+            match NamedPipeTransport::connect(&session.transport_addr).await {
+                Ok(mut client) => {
+                    let _ = protocol::write_frame(&mut client, &frame).await;
+                    let _ = timeout(Duration::from_secs(5), async {
+                        loop {
+                            match protocol::read_frame(&mut client).await {
+                                Ok(Some(protocol::Frame::Status { .. })) => return,
+                                Ok(None) => return,
+                                _ => tokio::time::sleep(Duration::from_millis(100)).await,
+                            }
+                        }
+                    }).await;
+                    true
+                }
+                Err(_) => false,
+            }
+        });
+
+        if !rpc_result {
+            if let Some(child_pid) = session.child_pid {
+                let _ = PlatformProcessControl::terminate(child_pid);
+            }
+            if let Some(sup_pid) = session.supervisor_pid {
+                let _ = PlatformProcessControl::terminate(sup_pid);
+            }
         }
     }
 
-    // Wait for supervisor to die, then force the DB status
+    // Wait for supervisor to die, then update DB
     if let Some(sup_pid) = session.supervisor_pid {
         let start = std::time::Instant::now();
         while PlatformProcessControl::is_alive(sup_pid)
@@ -283,7 +327,6 @@ fn stop(id: String, force: bool) -> shard_core::Result<()> {
         }
     }
 
-    // Always write "stopped" — we own the final status after the supervisor is dead
     session_store.update_status(&repo, &session.id, "stopped", None)?;
     println!("Stopped session {}", &session.id[..8]);
 

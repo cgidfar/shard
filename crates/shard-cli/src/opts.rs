@@ -40,6 +40,25 @@ pub enum Commands {
         /// Activity state: active, idle, blocked
         state: String,
     },
+
+    /// Manage the Shard daemon
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum DaemonCommands {
+    /// [hidden] Start the daemon process (auto-started by clients)
+    #[command(hide = true)]
+    Start,
+
+    /// Stop the running daemon (gracefully stops all sessions)
+    Stop,
+
+    /// Show daemon status
+    Status,
 }
 
 #[derive(Subcommand)]

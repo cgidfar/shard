@@ -77,3 +77,11 @@ pub fn create_pipe_instance(address: &str, first: bool) -> std::io::Result<Named
         .first_pipe_instance(first)
         .create(address)
 }
+
+/// Generate the named pipe address for a session.
+///
+/// Equivalent to `NamedPipeTransport::session_address()` but callable
+/// without going through the trait (for use in daemon/client code).
+pub fn session_pipe_name(session_id: &str) -> String {
+    format!(r"\\.\pipe\shard-session-{session_id}")
+}

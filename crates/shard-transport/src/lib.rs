@@ -1,3 +1,5 @@
+pub mod control_protocol;
+pub mod daemon_client;
 pub mod protocol;
 pub mod transport;
 

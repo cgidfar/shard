@@ -175,8 +175,6 @@ pub fn create_session(
     command: Option<Vec<String>>,
     harness: Option<Harness>,
 ) -> Result<Session, String> {
-    let paths = ShardPaths::new().map_err(|e| e.to_string())?;
-
     let ws_store = WorkspaceStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
     let _ws = ws_store
         .get(&repo, &workspace_name)
@@ -184,96 +182,107 @@ pub fn create_session(
 
     let command = command.unwrap_or_else(default_command);
 
+    // Best-effort: install harness hooks
+    let shardctl = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("shardctl.exe")));
+    if let Some(ref exe) = shardctl {
+        if exe.exists() && !shard_core::hooks::claude_code_hooks_installed() {
+            let _ = shard_core::hooks::install_claude_code_hooks(exe);
+        }
+    }
+
+    // Route through daemon
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let (session_id, transport_addr) = rt.block_on(async {
+        use shard_transport::control_protocol::ControlFrame;
+
+        let mut conn = connect_or_spawn_daemon_app()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        conn.handshake()
+            .await
+            .map_err(|e| format!("daemon handshake failed: {e}"))?;
+
+        let response = conn
+            .request(&ControlFrame::SpawnSession {
+                repo: repo.clone(),
+                workspace: workspace_name.clone(),
+                command: command.clone(),
+                harness: harness.map(|h| h.to_string()),
+            })
+            .await
+            .map_err(|e| format!("daemon request failed: {e}"))?;
+
+        match response {
+            ControlFrame::SpawnAck {
+                session_id,
+                transport_addr,
+                ..
+            } => Ok((session_id, transport_addr)),
+            ControlFrame::Error { message } => Err(format!("daemon: {message}")),
+            other => Err(format!("unexpected daemon response: {other:?}")),
+        }
+    })?;
+
+    // Drop runtime before blocking_lock to avoid deadlock
+    drop(rt);
+
+    // Read back the full session record from DB
     let session_store = SessionStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
-    let session = session_store
-        .create(&repo, &workspace_name, &command, "pending", harness)
-        .map_err(|e| e.to_string())?;
-    let transport_addr = NamedPipeTransport::session_address(&session.id);
-    session_store
-        .update_transport_addr(&repo, &session.id, &transport_addr)
-        .map_err(|e| e.to_string())?;
-
-    let session_dir = paths.session_dir(&repo, &session.id);
-    let ready_path = session_dir.join("ready");
-
-    // Find shardctl.exe — same directory as this app's exe
-    let exe_dir = std::env::current_exe()
-        .map_err(|e| e.to_string())?
-        .parent()
-        .ok_or("cannot find exe directory")?
-        .to_path_buf();
-
-    let shardctl = exe_dir.join("shardctl.exe");
-    if !shardctl.exists() {
-        return Err(format!(
-            "shardctl.exe not found at {}",
-            shardctl.display()
-        ));
-    }
-
-    // Best-effort: install harness hooks so agents can report activity state
-    if !shard_core::hooks::claude_code_hooks_installed() {
-        if let Err(e) = shard_core::hooks::install_claude_code_hooks(&shardctl) {
-            tracing::warn!("failed to install Claude Code hooks: {e}");
-        }
-    }
-
-    let args: Vec<String> = vec![
-        "session".into(),
-        "serve".into(),
-        "--repo".into(),
-        repo.to_string(),
-        "--workspace".into(),
-        workspace_name.to_string(),
-        "--session-id".into(),
-        session.id.clone(),
-        "--transport-addr".into(),
-        transport_addr.clone(),
-        "--".into(),
-    ]
-    .into_iter()
-    .chain(command.iter().cloned())
-    .collect();
-
-    use shard_supervisor::process::{PlatformProcessControl, ProcessControl};
-    let supervisor_pid = PlatformProcessControl::spawn_detached(&shardctl, &args)
-        .map_err(|e| e.to_string())?;
-    session_store
-        .set_supervisor_pid(&repo, &session.id, supervisor_pid)
-        .map_err(|e| e.to_string())?;
-
-    // Wait for readiness
-    let start = std::time::Instant::now();
-    loop {
-        if ready_path.exists() {
-            break;
-        }
-        if !PlatformProcessControl::is_alive(supervisor_pid) {
-            let _ = session_store.update_status(&repo, &session.id, "failed", None);
-            return Err("supervisor process exited during startup".into());
-        }
-        if start.elapsed() > std::time::Duration::from_secs(10) {
-            let _ = session_store.update_status(&repo, &session.id, "failed", None);
-            let _ = PlatformProcessControl::terminate(supervisor_pid);
-            return Err("supervisor did not start within 10 seconds".into());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-
     let result = session_store
-        .get(&repo, &session.id)
+        .get(&repo, &session_id)
         .map_err(|e| e.to_string())?;
 
     // Start a monitor for the new session so sidebar gets activity updates
-    let task = start_monitor(app.clone(), session.id.clone(), transport_addr);
+    let task = start_monitor(app.clone(), session_id.clone(), transport_addr);
     {
         let state: tauri::State<'_, AppState> = app.state();
         let mut conns = state.connections.blocking_lock();
-        conns.insert(session.id.clone(), SessionConnection::Monitored { task });
+        conns.insert(session_id.clone(), SessionConnection::Monitored { task });
     }
 
     let _ = app.emit("sidebar-changed", ());
     Ok(result)
+}
+
+/// Connect to daemon, spawning it if not running. For use from app context.
+async fn connect_or_spawn_daemon_app() -> Result<
+    shard_transport::daemon_client::DaemonConnection<tokio::net::windows::named_pipe::NamedPipeClient>,
+    std::io::Error,
+> {
+    use shard_transport::daemon_client;
+
+    // Try connecting first
+    match daemon_client::connect().await {
+        Ok(conn) => return Ok(conn),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    // Spawn daemon — find shardctl.exe relative to app exe
+    let exe_dir = std::env::current_exe()?
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no exe dir"))?
+        .to_path_buf();
+    let shardctl = exe_dir.join("shardctl.exe");
+    if !shardctl.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("shardctl.exe not found at {}", shardctl.display()),
+        ));
+    }
+
+    use shard_supervisor::process::{PlatformProcessControl, ProcessControl};
+    let args = vec!["daemon".to_string(), "start".to_string()];
+    PlatformProcessControl::spawn_detached(&shardctl, &args)?;
+
+    daemon_client::connect_with_retry(std::time::Duration::from_secs(5)).await
 }
 
 #[tauri::command]

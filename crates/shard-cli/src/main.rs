@@ -6,13 +6,16 @@ use clap::Parser;
 use opts::{Cli, Commands};
 
 fn main() {
-    // Note: the `serve` subcommand sets up its own logging to a file.
+    // Note: the `serve` and `daemon start` subcommands set up their own logging.
     // For all other commands, log to stderr with WARN level by default.
-    // Check if we're running as a supervisor before initializing the
-    // default subscriber (to avoid double-init).
     let is_serve = std::env::args().any(|a| a == "serve");
     let is_notify = std::env::args().any(|a| a == "notify");
-    if !is_serve && !is_notify {
+    let is_daemon_start = {
+        let args: Vec<_> = std::env::args().collect();
+        args.iter().any(|a| a == "daemon")
+            && args.iter().any(|a| a == "start")
+    };
+    if !is_serve && !is_notify && !is_daemon_start {
         tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::from_default_env()
@@ -29,6 +32,7 @@ fn main() {
         Commands::Session { command } => cmd::session::run(command),
         Commands::Prune { command } => cmd::prune::run(command),
         Commands::Notify { state } => cmd::notify::run(state),
+        Commands::Daemon { command } => cmd::daemon::run(command),
     };
 
     if let Err(e) = result {

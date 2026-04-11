@@ -1,3 +1,4 @@
+pub mod daemon;
 pub mod notify;
 pub mod prune;
 pub mod repo;

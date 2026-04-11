@@ -4,56 +4,46 @@ mod state;
 use state::AppState;
 use tauri::Manager;
 
-/// Prune sessions whose supervisor process is no longer alive.
-/// Runs at app startup to reconcile stale DB records from prior crashes.
-fn prune_stale_sessions() {
-    use shard_core::db;
-    use shard_core::repos::RepositoryStore;
-    use shard_core::sessions::SessionStore;
-    use shard_core::ShardPaths;
-    use shard_supervisor::process::{PlatformProcessControl, ProcessControl};
+/// Ensure the daemon is running before the app starts.
+/// Spawns it if not already alive. Non-fatal on failure (app still works,
+/// just won't have daemon features until first create_session).
+fn ensure_daemon_running() {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(_) => return,
+    };
 
-    let Ok(paths) = ShardPaths::new() else { return };
-    let repo_store = RepositoryStore::new(paths.clone());
-    let session_store = SessionStore::new(paths.clone());
+    rt.block_on(async {
+        use shard_transport::daemon_client;
 
-    let Ok(repos) = repo_store.list() else { return };
-
-    for repo in &repos {
-        if !paths.repo_db(&repo.alias).exists() {
-            continue;
+        // Check if already running
+        if daemon_client::connect().await.is_ok() {
+            return;
         }
-        // Run migrations on existing repo DBs
-        if let Ok(conn) = db::open_connection(&paths.repo_db(&repo.alias)) {
-            let _ = db::init_repo_db(&conn);
-        }
-        let Ok(sessions) = session_store.list(&repo.alias, None) else {
-            continue;
+
+        // Spawn daemon
+        let exe_dir = match std::env::current_exe() {
+            Ok(p) => match p.parent() {
+                Some(d) => d.to_path_buf(),
+                None => return,
+            },
+            Err(_) => return,
         };
-        for session in &sessions {
-            if session.status != "running" && session.status != "starting" {
-                continue;
-            }
-            let alive = session
-                .supervisor_pid
-                .map(|pid| PlatformProcessControl::is_alive(pid))
-                .unwrap_or(false);
-            if !alive {
-                let _ = session_store.update_status(
-                    &repo.alias,
-                    &session.id,
-                    "failed",
-                    None,
-                );
-                tracing::info!(
-                    "Pruned stale session {} [{}:{}]",
-                    &session.id[..8],
-                    repo.alias,
-                    session.workspace_name,
-                );
-            }
+        let shardctl = exe_dir.join("shardctl.exe");
+        if !shardctl.exists() {
+            return;
         }
-    }
+
+        use shard_supervisor::process::{PlatformProcessControl, ProcessControl};
+        let args = vec!["daemon".to_string(), "start".to_string()];
+        let _ = PlatformProcessControl::spawn_detached(&shardctl, &args);
+
+        // Wait briefly for daemon to be ready (best-effort)
+        let _ = daemon_client::connect_with_retry(std::time::Duration::from_secs(3)).await;
+    });
 }
 
 /// Start monitors for all currently running sessions.
@@ -105,7 +95,9 @@ fn start_monitors_for_running_sessions(app: &tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    prune_stale_sessions();
+    // Ensure daemon is running before anything else.
+    // This handles session pruning/adoption and makes the tray icon visible.
+    ensure_daemon_running();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

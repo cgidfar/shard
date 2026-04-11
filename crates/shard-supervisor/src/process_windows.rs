@@ -81,3 +81,97 @@ impl ProcessControl for WindowsProcessControl {
         Ok(child.id())
     }
 }
+
+/// Spawn a detached process and return both its PID and a process HANDLE.
+///
+/// The handle is opened with sufficient rights for `DaemonJobGuard::assign_process()`.
+/// The caller MUST close the handle via `CloseHandle` after use.
+///
+/// This is used by the daemon to spawn supervisors and immediately assign them
+/// to its Job Object before the handle is dropped.
+pub fn spawn_detached_with_handle(
+    exe: &Path,
+    args: &[String],
+) -> std::io::Result<(u32, windows_sys::Win32::Foundation::HANDLE)> {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::OpenProcess;
+
+    let crash_log = std::env::temp_dir().join("shard-supervisor-stderr.log");
+    let stderr_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&crash_log)?;
+
+    // Spawn without BREAKAWAY — we WANT the child to stay in the daemon's job
+    // if the daemon itself is in one, or to be assignable to our job.
+    let child = Command::new(exe)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_file))
+        .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)
+        .spawn()?;
+
+    let pid = child.id();
+
+    // Open a handle with the rights needed for job assignment.
+    // Keep `child` alive until after OpenProcess to prevent PID reuse race.
+    let handle = unsafe { OpenProcess(JOB_ASSIGN_ACCESS, 0, pid) };
+    drop(child);
+    if handle == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok((pid, handle))
+}
+
+/// Access rights needed for AssignProcessToJobObject + liveness checks.
+const JOB_ASSIGN_ACCESS: u32 = 0x0100  // PROCESS_SET_QUOTA
+    | 0x0001                            // PROCESS_TERMINATE
+    | 0x1000                            // PROCESS_QUERY_LIMITED_INFORMATION
+    | 0x00100000;                       // SYNCHRONIZE
+
+/// Open a handle to an already-running process for job re-adoption.
+///
+/// Returns the handle on success. The caller MUST close it via `CloseHandle`.
+/// Returns an error if the process doesn't exist or access is denied.
+pub fn open_process_for_job(pid: u32) -> std::io::Result<windows_sys::Win32::Foundation::HANDLE> {
+    use windows_sys::Win32::System::Threading::OpenProcess;
+
+    let handle = unsafe { OpenProcess(JOB_ASSIGN_ACCESS, 0, pid) };
+    if handle == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(handle)
+}
+
+/// Get the creation time of a process (for PID reuse detection).
+///
+/// Returns the creation time as a Windows FILETIME value (100ns intervals since 1601-01-01).
+pub fn get_process_creation_time(
+    process_handle: windows_sys::Win32::Foundation::HANDLE,
+) -> std::io::Result<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+
+    unsafe {
+        let mut creation: FILETIME = std::mem::zeroed();
+        let mut exit: FILETIME = std::mem::zeroed();
+        let mut kernel: FILETIME = std::mem::zeroed();
+        let mut user: FILETIME = std::mem::zeroed();
+
+        let result = GetProcessTimes(
+            process_handle,
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        );
+        if result == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let time = (creation.dwHighDateTime as u64) << 32 | creation.dwLowDateTime as u64;
+        Ok(time)
+    }
+}
