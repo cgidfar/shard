@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -168,38 +168,73 @@ pub async fn run(
                     return;
                 }
 
-                // --- Streaming client path: Resume → replay → register → stream ---
+                // --- Streaming client path: Resume → register → replay → stream ---
                 let resume_offset = match first_frame {
                     Frame::Resume { last_seen_offset } => last_seen_offset,
                     _ => 0,
                 };
 
-                // Replay log from resume_offset to current position
-                let live_offset = current_offset.load(std::sync::atomic::Ordering::Relaxed);
-                if resume_offset < live_offset {
-                    if let Ok(log_data) = std::fs::read(&*log_for_replay) {
-                        let start = resume_offset as usize;
-                        let end = std::cmp::min(live_offset as usize, log_data.len());
-                        if start < end {
-                            let replay = &log_data[start..end];
-                            let frame = Frame::TerminalOutput {
-                                offset: resume_offset,
-                                data: replay.to_vec(),
-                            };
-                            let mut buf = Vec::new();
-                            if protocol::write_frame(&mut buf, &frame).await.is_ok() {
-                                let _ = writer_half.write_all(&buf).await;
-                            }
-                        }
-                    }
-                }
-
-                // Register for live updates BEFORE sending snapshot — any
-                // concurrent fan-out will buffer in the channel until send_task
-                // starts, preserving ordering.
+                // Register for live updates BEFORE replay so no bytes are
+                // lost between the offset snapshot and registration. Live
+                // fan-out buffers in the mpsc channel while replay writes
+                // directly to the pipe, preserving ordering.
                 let is_monitor = resume_offset == u64::MAX;
                 if let Ok(mut clients) = clients_for_register.lock() {
                     clients.push(Client { tx, monitor_only: is_monitor });
+                }
+
+                // Replay log from resume_offset to current position, streamed
+                // from disk in small chunks to avoid loading the entire file
+                // into memory and to keep IPC messages small.
+                let live_offset = current_offset.load(std::sync::atomic::Ordering::Relaxed);
+                if resume_offset < live_offset {
+                    const REPLAY_CHUNK: usize = 4096;
+                    match std::fs::File::open(&*log_for_replay) {
+                        Ok(mut file) => {
+                            let start = resume_offset as u64;
+                            let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+                            let end = std::cmp::min(live_offset, file_len);
+                            if start < end {
+                                if let Err(e) = file.seek(std::io::SeekFrom::Start(start)) {
+                                    tracing::warn!("replay seek failed: {e}");
+                                } else {
+                                    let mut remaining = (end - start) as usize;
+                                    let mut offset = start;
+                                    let mut chunk_buf = vec![0u8; REPLAY_CHUNK];
+                                    while remaining > 0 {
+                                        let to_read = std::cmp::min(remaining, REPLAY_CHUNK);
+                                        match file.read(&mut chunk_buf[..to_read]) {
+                                            Ok(0) => break,
+                                            Ok(n) => {
+                                                let frame = Frame::TerminalOutput {
+                                                    offset,
+                                                    data: chunk_buf[..n].to_vec(),
+                                                };
+                                                let mut buf = Vec::new();
+                                                if let Err(e) = protocol::write_frame(&mut buf, &frame).await {
+                                                    tracing::warn!("replay frame serialize failed: {e}");
+                                                    break;
+                                                }
+                                                if let Err(e) = writer_half.write_all(&buf).await {
+                                                    tracing::warn!("replay pipe write failed: {e}");
+                                                    break;
+                                                }
+                                                offset += n as u64;
+                                                remaining -= n;
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("replay log read failed: {e}");
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("failed to open log for replay: {e}");
+                        }
+                    }
                 }
 
                 // Send activity state snapshot so late-connecting monitors
@@ -362,7 +397,16 @@ pub async fn run(
         }
     };
 
-    // Send Status frame to all connected clients before shutdown
+    // 1. Drain PTY reader — child already exited, so ConPTY pipe will EOF
+    //    once buffered data (including alt-screen restore) is consumed.
+    //    Keep resize_task alive so the PtyMaster isn't dropped prematurely.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        pty_read_task,
+    )
+    .await;
+
+    // 2. NOW send Status frame — all TerminalOutput has been flushed
     let status_frame = Frame::Status {
         code: if exit_code == 0 { 0 } else if exit_code == -1 { 1 } else { 2 },
     };
@@ -374,13 +418,10 @@ pub async fn run(
         }
     }
 
-    // Brief delay for status frame delivery
+    // 3. Brief delay for delivery, then clean up
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    // Shut down all tasks
     accept_task.abort();
     resize_task.abort();
-    let _ = pty_read_task.await;
 
     Ok(exit_code)
 }
