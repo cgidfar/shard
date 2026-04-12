@@ -17,6 +17,7 @@ export interface Workspace {
   name: string;
   branch: string;
   path: string;
+  is_base: boolean;
   created_at: number;
 }
 

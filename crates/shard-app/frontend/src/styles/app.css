@@ -206,17 +206,11 @@ html, body {
   color: #4a3f35;
 }
 
-.sidebar-divider {
-  height: 1px;
-  background: var(--border);
-  margin: 6px var(--space-3);
-}
-
 /* ── Tree ── */
 .tree-group {
   display: flex;
   align-items: center;
-  padding: 6px var(--space-3);
+  padding: 5px 6px 5px 16px;
   gap: 6px;
   cursor: pointer;
   transition: background var(--transition-fast);
@@ -226,34 +220,57 @@ html, body {
   background: var(--border);
 }
 
-.tree-group-repo {
-  font-weight: 500;
-}
-
 .tree-group-ws {
-  padding-left: 28px;
+  padding-left: 24px;
   font-size: var(--text-sm);
 }
 
-.tree-arrow {
-  font-size: 10px;
+.repo-group-spaced {
+  margin-top: 10px;
+}
+
+.tree-icon {
+  flex-shrink: 0;
   color: var(--text-muted);
-  width: 12px;
-  text-align: center;
+}
+
+.tree-group-repo > .tree-icon {
+  color: var(--text-secondary);
+}
+
+.tree-label-wrap {
+  flex: 1 1 0%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.tree-arrow {
+  font-size: 9px;
+  line-height: 12px;
+  color: var(--text-muted);
   flex-shrink: 0;
 }
 
 .tree-label {
-  flex: 1;
+  flex: 0 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--text-secondary);
+  min-width: 0;
 }
 
-.tree-group-repo > .tree-label {
+.tree-group-repo > .tree-label-wrap > .tree-label {
   color: var(--text-primary);
   font-size: var(--text-base);
+  font-weight: 600;
+}
+
+.tree-group-ws.active-ws > .tree-label-wrap > .tree-label {
+  color: var(--text-primary);
+  font-weight: 600;
 }
 
 .tree-action {
@@ -264,7 +281,7 @@ html, body {
   cursor: pointer;
   padding: 0 4px;
   border-radius: var(--radius-sm);
-  margin-left: auto;
+  flex-shrink: 0;
   opacity: 0;
   transition: opacity var(--transition-fast), color var(--transition-fast);
 }
@@ -276,13 +293,6 @@ html, body {
 
 .tree-action:hover {
   color: var(--text-primary);
-}
-
-.ws-pin {
-  color: var(--text-muted);
-  display: flex;
-  align-items: center;
-  flex-shrink: 0;
 }
 
 .tree-children {
@@ -297,10 +307,14 @@ html, body {
 .tree-item-session {
   display: flex;
   align-items: center;
-  padding: 5px var(--space-3) 5px 48px;
+  padding: 5px 6px 5px 32px;
   gap: var(--space-2);
   font-size: var(--text-sm);
   transition: background var(--transition-fast);
+}
+
+.tree-item-session > .tree-label {
+  flex: 1 1 0%;
 }
 
 .tree-item-session:hover {
@@ -310,7 +324,7 @@ html, body {
 .tree-item-session.active {
   background: var(--bg-primary);
   border-left: 2px solid var(--accent);
-  padding-left: 46px;
+  padding-left: 30px;
 }
 
 .tree-item-session.active .tree-label {
@@ -329,7 +343,7 @@ html, body {
 .tree-item-session.confirming {
   background: #2a1a14;
   border-left: 2px solid var(--danger);
-  padding-left: 46px;
+  padding-left: 30px;
   gap: 6px;
 }
 
@@ -363,7 +377,7 @@ html, body {
 
 /* ── Inline Rename ── */
 .tree-item-session.renaming {
-  padding-left: 48px;
+  padding-left: 32px;
 }
 
 .rename-input {

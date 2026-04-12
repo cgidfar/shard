@@ -12,6 +12,15 @@ import {
 import { labelFromCommand } from "../lib/titleFormat";
 import { activityStore, type DisplayState } from "../lib/activityStore";
 
+const ICON_FOLDER =
+  `<svg class="tree-icon" width="13" height="13" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M1.6 4.2 L1.6 10.5 Q1.6 11 2.1 11 L11.9 11 Q12.4 11 12.4 10.5 L12.4 5.9 Q12.4 5.4 11.9 5.4 L6.6 5.4 L5.1 3.9 L2.1 3.9 Q1.6 3.9 1.6 4.4 Z" stroke="currentColor" stroke-width="1" stroke-linejoin="round"/></svg>`;
+
+const ICON_HOME =
+  `<svg class="tree-icon" width="13" height="13" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M2 7 L7 2.5 L12 7 L12 11.5 Q12 12 11.5 12 L8.5 12 L8.5 9 L5.5 9 L5.5 12 L2.5 12 Q2 12 2 11.5 Z" stroke="currentColor" stroke-width="1" stroke-linejoin="round"/></svg>`;
+
+const ICON_BRANCH =
+  `<svg class="tree-icon" width="13" height="13" viewBox="0 0 14 14" fill="none" aria-hidden="true"><circle cx="4" cy="3.2" r="1.4" stroke="currentColor" stroke-width="1" fill="none"/><circle cx="4" cy="10.8" r="1.4" stroke="currentColor" stroke-width="1" fill="none"/><circle cx="10" cy="7" r="1.4" stroke="currentColor" stroke-width="1" fill="none"/><path d="M4 4.6 L4 9.4" stroke="currentColor" stroke-width="1"/><path d="M4 7 L8.6 7" stroke="currentColor" stroke-width="1"/></svg>`;
+
 export interface SidebarCallbacks {
   onSessionClick: (repo: string, workspace: string, sessionId: string, sessionLabel: string) => void;
   onSessionClosed: (sessionId: string) => void;
@@ -199,6 +208,18 @@ export class Sidebar {
     }
   }
 
+  private findActiveWorkspace(): { repo: string; workspace: string } | null {
+    if (!this.activeSessionId) return null;
+    for (const { repo, workspaces } of this.tree) {
+      for (const { workspace, sessions } of workspaces) {
+        if (sessions.some((s) => s.session.id === this.activeSessionId)) {
+          return { repo: repo.alias, workspace: workspace.name };
+        }
+      }
+    }
+    return null;
+  }
+
   private render() {
     this.el.innerHTML = "";
 
@@ -213,29 +234,35 @@ export class Sidebar {
       return;
     }
 
+    const activeWs = this.findActiveWorkspace();
+
     for (let ri = 0; ri < this.tree.length; ri++) {
       const { repo, workspaces } = this.tree[ri];
-
-      if (ri > 0) {
-        const divider = document.createElement("div");
-        divider.className = "sidebar-divider";
-        this.el.appendChild(divider);
-      }
-
-      // Repo group
-      const repoGroup = document.createElement("div");
-      repoGroup.className = "tree-group tree-group-repo";
-      repoGroup.dataset.repo = repo.alias;
       const repoKey = `repo:${repo.alias}`;
       if (!this.expandState.has(repoKey)) this.expandState.set(repoKey, true);
 
-      const repoArrow = document.createElement("span");
-      repoArrow.className = "tree-arrow";
-      repoArrow.textContent = this.expandState.get(repoKey) ? "▼" : "▶";
+      // Repo row
+      const repoGroup = document.createElement("div");
+      repoGroup.className = "tree-group tree-group-repo";
+      if (ri > 0) repoGroup.classList.add("repo-group-spaced");
+      repoGroup.dataset.repo = repo.alias;
+      repoGroup.title = repo.local_path || repo.url;
+      repoGroup.insertAdjacentHTML("beforeend", ICON_FOLDER);
+
+      const repoLabelWrap = document.createElement("span");
+      repoLabelWrap.className = "tree-label-wrap";
 
       const repoLabel = document.createElement("span");
       repoLabel.className = "tree-label";
       repoLabel.textContent = repo.alias;
+      repoLabelWrap.appendChild(repoLabel);
+
+      const repoArrow = document.createElement("span");
+      repoArrow.className = "tree-arrow";
+      repoArrow.textContent = this.expandState.get(repoKey) ? "▼" : "▶";
+      repoLabelWrap.appendChild(repoArrow);
+
+      repoGroup.appendChild(repoLabelWrap);
 
       const addWsBtn = document.createElement("button");
       addWsBtn.className = "tree-action";
@@ -245,9 +272,6 @@ export class Sidebar {
         e.stopPropagation();
         this.callbacks.onCreateWorkspace(repo.alias);
       });
-
-      repoGroup.appendChild(repoArrow);
-      repoGroup.appendChild(repoLabel);
       repoGroup.appendChild(addWsBtn);
 
       const repoChildren = document.createElement("div");
@@ -263,34 +287,41 @@ export class Sidebar {
 
       this.el.appendChild(repoGroup);
 
-      for (const { workspace, sessions } of workspaces) {
-        // Workspace row
-        const wsGroup = document.createElement("div");
-        wsGroup.className = "tree-group tree-group-ws";
-        wsGroup.dataset.repo = repo.alias;
-        wsGroup.dataset.workspace = workspace.name;
+      // Sort workspaces: base first, then alphabetical
+      const sortedWs = [...workspaces].sort((a, b) => {
+        if (a.workspace.is_base !== b.workspace.is_base) return a.workspace.is_base ? -1 : 1;
+        return a.workspace.name.localeCompare(b.workspace.name);
+      });
+
+      for (const { workspace, sessions } of sortedWs) {
         const wsKey = `ws:${repo.alias}:${workspace.name}`;
         if (!this.expandState.has(wsKey)) this.expandState.set(wsKey, sessions.length > 0);
 
-        const wsArrow = document.createElement("span");
-        wsArrow.className = "tree-arrow";
-        wsArrow.textContent = this.expandState.get(wsKey) ? "▼" : "▶";
+        const isActiveWs =
+          activeWs?.repo === repo.alias && activeWs?.workspace === workspace.name;
 
-        // Default workspace indicator
-        const isBase = workspace.name === "main" || workspace.name === "master";
-        if (isBase) {
-          const pin = document.createElement("span");
-          pin.className = "ws-pin";
-          pin.innerHTML = `<svg width="10" height="10" viewBox="0 0 10 10"><circle cx="5" cy="5" r="2" fill="none" stroke="currentColor" stroke-width="1.2"/><circle cx="5" cy="5" r="0.8" fill="currentColor"/></svg>`;
-          wsGroup.appendChild(wsArrow);
-          wsGroup.appendChild(pin);
-        } else {
-          wsGroup.appendChild(wsArrow);
-        }
+        const wsGroup = document.createElement("div");
+        wsGroup.className = "tree-group tree-group-ws";
+        if (isActiveWs) wsGroup.classList.add("active-ws");
+        wsGroup.dataset.repo = repo.alias;
+        wsGroup.dataset.workspace = workspace.name;
+        wsGroup.title = workspace.path;
+        wsGroup.insertAdjacentHTML("beforeend", workspace.is_base ? ICON_HOME : ICON_BRANCH);
+
+        const wsLabelWrap = document.createElement("span");
+        wsLabelWrap.className = "tree-label-wrap";
 
         const wsLabel = document.createElement("span");
         wsLabel.className = "tree-label";
         wsLabel.textContent = workspace.name;
+        wsLabelWrap.appendChild(wsLabel);
+
+        const wsArrow = document.createElement("span");
+        wsArrow.className = "tree-arrow";
+        wsArrow.textContent = this.expandState.get(wsKey) ? "▼" : "▶";
+        if (sessions.length > 0) wsLabelWrap.appendChild(wsArrow);
+
+        wsGroup.appendChild(wsLabelWrap);
 
         const addSessionBtn = document.createElement("button");
         addSessionBtn.className = "tree-action";
@@ -300,8 +331,6 @@ export class Sidebar {
           e.stopPropagation();
           this.callbacks.onCreateSession(repo.alias, workspace.name);
         });
-
-        wsGroup.appendChild(wsLabel);
         wsGroup.appendChild(addSessionBtn);
 
         const wsChildren = document.createElement("div");
