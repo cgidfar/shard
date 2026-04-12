@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use shard_core::default_command;
 use shard_core::sessions::SessionStore;
 use shard_core::workspaces::WorkspaceStore;
 use shard_core::ShardPaths;
@@ -8,27 +9,6 @@ use shard_transport::transport_windows::NamedPipeTransport;
 use shard_transport::SessionTransport;
 
 use crate::opts::{parse_target, SessionCommands};
-
-/// Default shell command for new sessions.
-fn default_command() -> Vec<String> {
-    // Prefer PowerShell 7 if available
-    if which_exists("pwsh.exe") {
-        vec!["pwsh.exe".into(), "-NoLogo".into()]
-    } else {
-        let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
-        vec![shell]
-    }
-}
-
-fn which_exists(name: &str) -> bool {
-    std::process::Command::new("where")
-        .arg(name)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
 
 pub fn run(command: SessionCommands) -> shard_core::Result<()> {
     match command {
@@ -126,8 +106,7 @@ async fn connect_or_spawn_daemon() -> shard_core::Result<
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Daemon not running — spawn it
         }
-        Err(e) if e.raw_os_error() == Some(231) => {
-            // ERROR_PIPE_BUSY — daemon exists but all instances busy, retry
+        Err(e) if e.raw_os_error() == Some(daemon_client::ERROR_PIPE_BUSY) => {
             let conn = daemon_client::connect_with_retry(std::time::Duration::from_secs(5))
                 .await
                 .map_err(|e| {

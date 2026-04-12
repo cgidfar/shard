@@ -3863,6 +3863,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

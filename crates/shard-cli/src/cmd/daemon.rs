@@ -22,7 +22,7 @@ use tracing::{error, info, warn};
 
 use shard_core::repos::RepositoryStore;
 use shard_core::sessions::SessionStore;
-use shard_core::ShardPaths;
+use shard_core::{ShardPaths, APP_EXE, APP_NAME};
 use shard_supervisor::job_object::DaemonJobGuard;
 use shard_supervisor::process::{PlatformProcessControl, ProcessControl};
 use shard_supervisor::process_windows::{
@@ -83,26 +83,30 @@ enum TrayEvent {
 struct TrayApp {
     tray: Option<tray_icon::TrayIcon>,
     session_count: usize,
+    open_id: tray_icon::menu::MenuId,
     quit_id: tray_icon::menu::MenuId,
     shutdown_tx: watch::Sender<ShutdownMode>,
+    exe_dir: PathBuf,
 }
 
 #[cfg(windows)]
 impl TrayApp {
-    fn new(shutdown_tx: watch::Sender<ShutdownMode>) -> Self {
+    fn new(shutdown_tx: watch::Sender<ShutdownMode>, exe_dir: PathBuf) -> Self {
         Self {
             tray: None,
             session_count: 0,
+            open_id: tray_icon::menu::MenuId::new("open"),
             quit_id: tray_icon::menu::MenuId::new("quit"),
             shutdown_tx,
+            exe_dir,
         }
     }
 
     /// Build or rebuild the tray menu with current session count.
     fn build_menu(&self) -> Menu {
-        // TODO: "Open Shard" should launch/focus the Tauri app.
-        // For now it's disabled. Implementation deferred to follow-up task.
-        let open_item = MenuItem::new("Open Shard", false, None);
+        let open_label = format!("Open {APP_NAME}");
+        let quit_label = format!("Quit {APP_NAME}");
+        let open_item = MenuItem::with_id(self.open_id.clone(), &open_label, true, None);
         let separator = PredefinedMenuItem::separator();
         let count_label = if self.session_count == 1 {
             "1 active session".to_string()
@@ -110,7 +114,7 @@ impl TrayApp {
             format!("{} active sessions", self.session_count)
         };
         let count_item = MenuItem::new(count_label, false, None);
-        let quit_item = MenuItem::with_id(self.quit_id.clone(), "Quit Shard", true, None);
+        let quit_item = MenuItem::with_id(self.quit_id.clone(), &quit_label, true, None);
 
         let menu = Menu::new();
         let _ = menu.append_items(&[&open_item, &separator, &count_item, &quit_item]);
@@ -130,7 +134,7 @@ impl TrayApp {
 
         match TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("Shard")
+            .with_tooltip(APP_NAME)
             .with_icon(icon)
             .build()
         {
@@ -146,10 +150,80 @@ impl TrayApp {
 
     /// Update the menu with a new session count.
     fn update_session_count(&mut self, count: usize) {
+        if count == self.session_count {
+            return;
+        }
         self.session_count = count;
         if let Some(ref tray) = self.tray {
             let menu = self.build_menu();
             let _ = tray.set_menu(Some(Box::new(menu)));
+        }
+    }
+
+    /// Open the Shard app: find existing window and focus, or spawn new instance.
+    fn open_shard_app(&self) {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
+        };
+
+        // Search by window title (pass null for class to match any class)
+        let title: Vec<u16> = std::ffi::OsStr::new(APP_NAME)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        unsafe {
+            let hwnd: HWND = FindWindowW(std::ptr::null(), title.as_ptr());
+            if hwnd != 0 {
+                // Window found — restore (if minimized) and bring to foreground
+                ShowWindow(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+                info!("Focused existing Shard window");
+                return;
+            }
+        }
+
+        // No existing window — spawn the app
+        let app_path = self.exe_dir.join(APP_EXE);
+        if !app_path.exists() {
+            warn!("{} not found at {:?}", APP_EXE, app_path);
+            return;
+        }
+
+        use std::os::windows::process::CommandExt;
+        use std::process::Stdio;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+
+        // Try with BREAKAWAY first (avoids inheriting daemon's job object limits),
+        // fall back without it if the job doesn't allow breakaway.
+        let spawn_result = std::process::Command::new(&app_path)
+            .current_dir(&self.exe_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB)
+            .spawn()
+            .or_else(|_| {
+                std::process::Command::new(&app_path)
+                    .current_dir(&self.exe_dir)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+                    .spawn()
+            });
+
+        match spawn_result {
+            Ok(child) => {
+                info!("Spawned {} (pid={})", APP_EXE, child.id());
+            }
+            Err(e) => {
+                error!("Failed to spawn {}: {e}", APP_EXE);
+            }
         }
     }
 }
@@ -190,7 +264,10 @@ impl ApplicationHandler<TrayEvent> for TrayApp {
 
         // Poll for menu events (non-blocking)
         if let Ok(event) = MenuEvent::receiver().try_recv() {
-            if event.id == self.quit_id {
+            if event.id == self.open_id {
+                info!("Open {} menu item clicked", APP_NAME);
+                self.open_shard_app();
+            } else if event.id == self.quit_id {
                 info!("Quit menu item clicked");
                 let _ = self.shutdown_tx.send(ShutdownMode::Force);
                 event_loop.exit();
@@ -263,6 +340,7 @@ fn run_daemon() -> shard_core::Result<()> {
     };
 
     let exe_path = std::env::current_exe()?;
+    let exe_dir = exe_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
     let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownMode::Running);
 
     // Build the winit event loop FIRST — must be created on the main thread.
@@ -329,7 +407,7 @@ fn run_daemon() -> shard_core::Result<()> {
         });
 
     // Run the tray icon on the main thread (blocks until quit)
-    let mut app = TrayApp::new(shutdown_tx);
+    let mut app = TrayApp::new(shutdown_tx, exe_dir);
     if let Err(e) = event_loop.run_app(&mut app) {
         error!("Event loop error: {e}");
     }
@@ -839,31 +917,30 @@ async fn heartbeat_task(state: Arc<DaemonState>) {
     loop {
         interval.tick().await;
 
-        let mut dead_ids = Vec::new();
-        {
-            let sessions = state.sessions.lock().await;
+        // Scan for dead sessions and remove from HashMap under lock
+        let (dead_ids, count) = {
+            let mut sessions = state.sessions.lock().await;
+            let mut dead = Vec::new();
             for (id, session) in sessions.iter() {
                 if !PlatformProcessControl::is_alive(session.supervisor_pid) {
-                    dead_ids.push((id.clone(), session.repo.clone()));
+                    dead.push((id.clone(), session.repo.clone()));
                 }
+            }
+            for (id, _) in &dead {
+                sessions.remove(id);
+            }
+            (dead, sessions.len())
+        };
+
+        // Update DB outside lock to avoid blocking other operations
+        if !dead_ids.is_empty() {
+            let session_store = SessionStore::new(state.paths.clone());
+            for (id, repo) in &dead_ids {
+                let _ = session_store.update_status(repo, id, "exited", None);
+                info!("Heartbeat: session {} supervisor died, marked exited", &id[..8]);
             }
         }
 
-        // Update dead sessions and tray count under a single lock
-        let count = {
-            let mut sessions = state.sessions.lock().await;
-            if !dead_ids.is_empty() {
-                let session_store = SessionStore::new(state.paths.clone());
-                for (id, repo) in &dead_ids {
-                    sessions.remove(id);
-                    let _ = session_store.update_status(repo, id, "exited", None);
-                    info!("Heartbeat: session {} supervisor died, marked exited", &id[..8]);
-                }
-            }
-            sessions.len()
-        };
-
-        // Update tray icon with current session count
         #[cfg(windows)]
         {
             let _ = state.tray_proxy.send_event(TrayEvent::SessionCount(count));

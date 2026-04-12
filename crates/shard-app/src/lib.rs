@@ -95,6 +95,26 @@ fn start_monitors_for_running_sessions(app: &tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Initialize tracing to file so logs work even when spawned with Stdio::null()
+    let paths = shard_core::ShardPaths::new().ok();
+    if let Some(ref p) = paths {
+        let log_dir = p.data_dir();
+        let _ = std::fs::create_dir_all(&log_dir);
+        if let Ok(log_file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_dir.join("app.log"))
+        {
+            tracing_subscriber::fmt()
+                .with_writer(std::sync::Mutex::new(log_file))
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::from_default_env()
+                        .add_directive(tracing::Level::INFO.into()),
+                )
+                .init();
+        }
+    }
+
     // Ensure daemon is running before anything else.
     // This handles session pruning/adoption and makes the tray icon visible.
     ensure_daemon_running();

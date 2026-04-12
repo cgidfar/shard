@@ -1,6 +1,7 @@
 use tauri::ipc::{Channel, Response};
 use tauri::{Emitter, Manager};
 
+use shard_core::default_command;
 use shard_core::repos::RepositoryStore;
 use shard_core::sessions::{Session, SessionStore};
 use shard_core::workspaces::WorkspaceStore;
@@ -10,28 +11,6 @@ use shard_transport::transport_windows::NamedPipeTransport;
 use shard_transport::SessionTransport;
 
 use crate::state::{AppState, SessionConnection, SessionWriter};
-
-// ── Shared types & helpers ──
-
-/// Default shell command for new sessions.
-fn default_command() -> Vec<String> {
-    if which_exists("pwsh.exe") {
-        vec!["pwsh.exe".into(), "-NoLogo".into()]
-    } else {
-        let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
-        vec![shell]
-    }
-}
-
-fn which_exists(name: &str) -> bool {
-    std::process::Command::new("where")
-        .arg(name)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
 
 #[derive(Clone, serde::Serialize)]
 pub struct SessionInfo {

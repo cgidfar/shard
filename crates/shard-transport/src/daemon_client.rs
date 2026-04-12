@@ -5,6 +5,10 @@
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
+/// Windows error code for ERROR_PIPE_BUSY (231).
+#[cfg(windows)]
+pub const ERROR_PIPE_BUSY: i32 = 231;
+
 use crate::control_protocol::{
     read_control_frame, write_control_frame, ControlFrame, PROTOCOL_VERSION,
 };
@@ -125,8 +129,7 @@ pub async fn connect_with_retry(
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            Err(e) if e.raw_os_error() == Some(231) => {
-                // ERROR_PIPE_BUSY
+            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
                 if start.elapsed() >= timeout {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,

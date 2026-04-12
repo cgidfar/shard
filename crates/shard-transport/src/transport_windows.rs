@@ -39,8 +39,7 @@ impl SessionTransport for NamedPipeTransport {
         for _ in 0..50 {
             match ClientOptions::new().open(address) {
                 Ok(client) => return Ok(client),
-                Err(e) if e.raw_os_error() == Some(231) => {
-                    // ERROR_PIPE_BUSY — server exists but all instances are busy
+                Err(e) if e.raw_os_error() == Some(crate::daemon_client::ERROR_PIPE_BUSY) => {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
