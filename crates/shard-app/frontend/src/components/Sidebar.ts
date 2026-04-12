@@ -34,7 +34,7 @@ export class Sidebar {
   private tree: RepoTree[] = [];
   private activeSessionId: string | null = null;
   private confirmingStopId: string | null = null;
-  private stoppingId: string | null = null;
+  private pendingStopIds: Set<string> = new Set();
   private expandState: Map<string, boolean> = new Map();
   private refreshing = false;
   private renamingSessionId: string | null = null;
@@ -57,6 +57,18 @@ export class Sidebar {
     this.activeSessionId = sessionId;
     if (sessionId) activityStore.clearAttention(sessionId);
     this.render();
+  }
+
+  /** Hide a session row immediately (e.g. while a stop op is in flight). */
+  beginStopSession(sessionId: string) {
+    this.pendingStopIds.add(sessionId);
+    this.render();
+  }
+
+  /** Clear the hidden state. If the stop failed and the session still exists,
+   *  the next refresh will surface it again. */
+  endStopSession(sessionId: string) {
+    this.pendingStopIds.delete(sessionId);
   }
 
   /** Resolve the display label for a session.
@@ -307,6 +319,7 @@ export class Sidebar {
 
         // Sessions
         for (const si of sessions) {
+          if (this.pendingStopIds.has(si.session.id)) continue;
           const isRunning = si.session.status === "running";
           const isDead = ["failed", "exited", "stopped"].includes(si.session.status);
           const isActive = si.session.id === this.activeSessionId;
@@ -322,14 +335,7 @@ export class Sidebar {
           sessionRow.dataset.sessionStatus = si.session.status;
           sessionRow.dataset.sessionLabel = resolvedLabel;
 
-          if (si.session.id === this.stoppingId) {
-            // Stopping in progress — show feedback
-            sessionRow.className = "tree-item tree-item-session confirming";
-            const label = document.createElement("span");
-            label.className = "tree-label";
-            label.textContent = "Stopping...";
-            sessionRow.appendChild(label);
-          } else if (isConfirming) {
+          if (isConfirming) {
             // Inline stop confirmation
             sessionRow.className = "tree-item tree-item-session confirming";
 
@@ -343,7 +349,7 @@ export class Sidebar {
             stopBtn.addEventListener("click", (e) => {
               e.stopPropagation();
               this.confirmingStopId = null;
-              this.stoppingId = si.session.id;
+              this.pendingStopIds.add(si.session.id);
               this.callbacks.onSessionClosed(si.session.id);
               this.render();
               stopSession(si.session.id)
@@ -351,7 +357,7 @@ export class Sidebar {
                 .catch(() => removeSession(si.session.id))
                 .catch(() => {}) // remove might fail too, that's ok
                 .finally(() => {
-                  this.stoppingId = null;
+                  this.pendingStopIds.delete(si.session.id);
                   this.refresh();
                 });
             });

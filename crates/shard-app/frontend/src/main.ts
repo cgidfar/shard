@@ -147,12 +147,16 @@ contextMenu.register(".tree-item-session", (el): MenuItemDef[] => {
       label: "Stop Session",
       danger: true,
       handler() {
+        sidebar.beginStopSession(sessionId);
         closeSession(sessionId);
         stopSession(sessionId)
           .then(() => removeSession(sessionId))
           .catch(() => removeSession(sessionId))
           .catch(() => {})
-          .finally(() => sidebar.refresh());
+          .finally(() => {
+            sidebar.endStopSession(sessionId);
+            sidebar.refresh();
+          });
       },
     });
   } else {
