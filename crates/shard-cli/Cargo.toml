@@ -27,3 +27,7 @@ windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
 ] }
+# Used by daemon.rs to decode the embedded tray-icon PNG. Already in the
+# workspace dep tree as a transitive dep of tray-icon, so this surfaces it
+# without adding new compile time.
+png = "0.17"

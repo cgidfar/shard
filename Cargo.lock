@@ -3872,6 +3872,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "crossterm",
+ "png",
  "serde_json",
  "shard-core",
  "shard-supervisor",

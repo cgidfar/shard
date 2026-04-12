@@ -1,0 +1,14 @@
+{
+  "name": "shard-icon-gen",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "generate": "bun gen-icon.ts",
+    "iconify": "bun iconify.ts"
+  },
+  "dependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "d3-delaunay": "^6.0.4",
+    "png-to-ico": "^3.0.1"
+  }
+}

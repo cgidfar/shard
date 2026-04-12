@@ -125,12 +125,16 @@ impl TrayApp {
     fn create_tray(&mut self) {
         let menu = self.build_menu();
 
-        // 16x16 placeholder icon (Windows blue #0078D4)
-        let rgba: Vec<u8> = std::iter::repeat([0x00u8, 0x78, 0xD4, 0xFF])
-            .take(16 * 16)
-            .flatten()
-            .collect();
-        let icon = Icon::from_rgba(rgba, 16, 16).expect("valid icon dimensions");
+        let icon = Self::load_tray_icon().unwrap_or_else(|e| {
+            warn!("Failed to load embedded tray icon, using fallback square: {e}");
+            // Fallback: a small Windows-blue square so the daemon still has a
+            // visible tray entry even if the embedded asset is malformed.
+            let rgba: Vec<u8> = std::iter::repeat([0x00u8, 0x78, 0xD4, 0xFF])
+                .take(16 * 16)
+                .flatten()
+                .collect();
+            Icon::from_rgba(rgba, 16, 16).expect("valid icon dimensions")
+        });
 
         match TrayIconBuilder::new()
             .with_menu(Box::new(menu))
@@ -146,6 +150,35 @@ impl TrayApp {
                 error!("Failed to create tray icon: {e}");
             }
         }
+    }
+
+    /// Decode the embedded shard tray-icon PNG into a `tray_icon::Icon`.
+    /// The PNG ships with the binary via `include_bytes!`, so the daemon
+    /// has no runtime file dependency.
+    fn load_tray_icon() -> Result<Icon, String> {
+        // 64×64 RGBA PNG generated from the master icon SVG (see
+        // tools/icon-gen). 64px gives clean rendering at any tray DPI.
+        const TRAY_ICON_PNG: &[u8] = include_bytes!("../../assets/tray-icon.png");
+
+        let decoder = png::Decoder::new(std::io::Cursor::new(TRAY_ICON_PNG));
+        let mut reader = decoder
+            .read_info()
+            .map_err(|e| format!("png header: {e}"))?;
+        let mut buf = vec![0u8; reader.output_buffer_size()];
+        let info = reader
+            .next_frame(&mut buf)
+            .map_err(|e| format!("png frame: {e}"))?;
+
+        if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+            return Err(format!(
+                "expected RGBA8 PNG, got {:?} at {:?}",
+                info.color_type, info.bit_depth
+            ));
+        }
+
+        let bytes = &buf[..info.buffer_size()];
+        Icon::from_rgba(bytes.to_vec(), info.width, info.height)
+            .map_err(|e| format!("icon construction: {e}"))
     }
 
     /// Update the menu with a new session count.
