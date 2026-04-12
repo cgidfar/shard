@@ -11,7 +11,49 @@ import { activityStore } from "./lib/activityStore";
 
 const titlebarEl = document.getElementById("titlebar")!;
 const sidebarEl = document.getElementById("sidebar")!;
+const sidebarResizerEl = document.getElementById("sidebar-resizer")!;
 const terminalContainer = document.getElementById("terminal-container")!;
+
+// ── Sidebar resize ──
+const SIDEBAR_WIDTH_KEY = "shard.sidebarWidth";
+const SIDEBAR_MIN_WIDTH = 180;
+const SIDEBAR_MAX_WIDTH = 500;
+
+const savedWidth = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));
+if (Number.isFinite(savedWidth) && savedWidth >= SIDEBAR_MIN_WIDTH && savedWidth <= SIDEBAR_MAX_WIDTH) {
+  sidebarEl.style.width = `${savedWidth}px`;
+}
+
+sidebarResizerEl.addEventListener("mousedown", (e) => {
+  e.preventDefault();
+  const startX = e.clientX;
+  const startWidth = sidebarEl.getBoundingClientRect().width;
+  sidebarEl.classList.add("resizing");
+  sidebarResizerEl.classList.add("resizing");
+  document.body.style.cursor = "col-resize";
+  document.body.style.userSelect = "none";
+
+  const onMove = (ev: MouseEvent) => {
+    const next = Math.max(
+      SIDEBAR_MIN_WIDTH,
+      Math.min(SIDEBAR_MAX_WIDTH, startWidth + (ev.clientX - startX)),
+    );
+    sidebarEl.style.width = `${next}px`;
+  };
+
+  const onUp = () => {
+    window.removeEventListener("mousemove", onMove);
+    window.removeEventListener("mouseup", onUp);
+    sidebarEl.classList.remove("resizing");
+    sidebarResizerEl.classList.remove("resizing");
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+    localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarEl.getBoundingClientRect().width));
+  };
+
+  window.addEventListener("mousemove", onMove);
+  window.addEventListener("mouseup", onUp);
+});
 
 const dialog = new AddShardDialog();
 
