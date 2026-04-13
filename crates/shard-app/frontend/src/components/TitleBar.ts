@@ -1,4 +1,5 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { createStatusIndicator } from "../lib/statusIndicator";
 
 export interface TitleBarCallbacks {
   onAddShard: () => void;
@@ -52,10 +53,9 @@ export class TitleBar {
       this.breadcrumbEl.appendChild(span);
     }
 
-    const dot = document.createElement("span");
-    dot.className = `status-dot ${crumb.status}`;
-    dot.style.marginLeft = "6px";
-    this.breadcrumbEl.appendChild(dot);
+    const indicator = createStatusIndicator(crumb.status);
+    indicator.style.marginLeft = "6px";
+    this.breadcrumbEl.appendChild(indicator);
   }
 
   private render() {

@@ -11,6 +11,7 @@ import {
 } from "../lib/api";
 import { labelFromCommand } from "../lib/titleFormat";
 import { activityStore, type DisplayState } from "../lib/activityStore";
+import { createStatusIndicator } from "../lib/statusIndicator";
 
 const ICON_FOLDER =
   `<svg class="tree-icon" width="13" height="13" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M1.6 4.2 L1.6 10.5 Q1.6 11 2.1 11 L11.9 11 Q12.4 11 12.4 10.5 L12.4 5.9 Q12.4 5.4 11.9 5.4 L6.6 5.4 L5.1 3.9 L2.1 3.9 Q1.6 3.9 1.6 4.4 Z" stroke="currentColor" stroke-width="1" stroke-linejoin="round"/></svg>`;
@@ -435,22 +436,10 @@ export class Sidebar {
               input.select();
             });
           } else {
-            const indicator = document.createElement("span");
-            indicator.className = "status-indicator";
-            indicator.dataset.lifecycleStatus = si.session.status;
             // Only show activity state for running sessions — dead sessions
             // may have stale entries in the store
-            if (isRunning) {
-              const activity = activityStore.get(si.session.id);
-              if (activity) indicator.dataset.activityState = activity;
-            }
-            const ring = document.createElement("span");
-            ring.className = "status-ring";
-            const innerDot = document.createElement("span");
-            innerDot.className = "status-dot-inner";
-            indicator.appendChild(ring);
-            indicator.appendChild(innerDot);
-            sessionRow.appendChild(indicator);
+            const activity = isRunning ? activityStore.get(si.session.id) : undefined;
+            sessionRow.appendChild(createStatusIndicator(si.session.status, activity));
 
             const label = document.createElement("span");
             label.className = "tree-label";
