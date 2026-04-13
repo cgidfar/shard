@@ -214,18 +214,24 @@ impl WorkspaceStore {
             let ws_dir = std::path::PathBuf::from(&ws.path);
 
             if ws_dir.exists() {
-                // Try the clean path first. If git refuses (broken state —
-                // typically "is not a working tree"), drop stale admin
-                // entries with prune and remove the directory ourselves.
-                if git::worktree_remove(&source_dir, &ws_dir).is_err() {
-                    let _ = git::worktree_prune(&source_dir);
-                    std::fs::remove_dir_all(&ws_dir).map_err(|e| {
-                        ShardError::Other(format!(
-                            "failed to remove worktree directory {}: {}",
-                            ws_dir.display(),
-                            e
-                        ))
-                    })?;
+                // Try the clean path first. Only fall back to manual deletion
+                // when git no longer recognizes this path as a registered
+                // worktree; any other failure must preserve the directory so
+                // we don't discard local state on transient git errors.
+                if let Err(remove_err) = git::worktree_remove(&source_dir, &ws_dir) {
+                    match is_registered_worktree(&source_dir, &ws_dir) {
+                        Ok(false) => {
+                            git::worktree_prune(&source_dir)?;
+                            std::fs::remove_dir_all(&ws_dir).map_err(|e| {
+                                ShardError::Other(format!(
+                                    "failed to remove worktree directory {}: {}",
+                                    ws_dir.display(),
+                                    e
+                                ))
+                            })?;
+                        }
+                        Ok(true) | Err(_) => return Err(remove_err),
+                    }
                 }
             } else {
                 // Missing state: dir already gone. Prune in case git still
@@ -240,5 +246,36 @@ impl WorkspaceStore {
         conn.execute("DELETE FROM workspaces WHERE name = ?1", params![ws_name])?;
 
         Ok(())
+    }
+}
+
+fn is_registered_worktree(repo_dir: &std::path::Path, ws_dir: &std::path::Path) -> Result<bool> {
+    let ws_key = normalize_worktree_path(ws_dir);
+    let entries = git::worktree_list_porcelain(repo_dir)?;
+    Ok(entries
+        .iter()
+        .any(|entry| normalize_worktree_path(&entry.path) == ws_key))
+}
+
+fn normalize_worktree_path(path: &std::path::Path) -> String {
+    std::fs::canonicalize(path)
+        .map(git::strip_unc_prefix)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_worktree_path_ignores_case_and_separator_style() {
+        let a =
+            normalize_worktree_path(std::path::Path::new("C:\\Repos\\Shard\\.shard\\Feature\\"));
+        let b = normalize_worktree_path(std::path::Path::new("c:/repos/shard/.shard/feature"));
+        assert_eq!(a, b);
     }
 }
