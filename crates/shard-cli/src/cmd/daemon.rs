@@ -58,6 +58,17 @@ struct LiveSession {
     pub creation_time: u64,
 }
 
+/// Snapshot of the minimum session info the tray quit path needs,
+/// captured under the `DaemonState.sessions` lock and then released so the
+/// lock is not held across the graceful-stop RPCs or the confirmation dialog.
+#[cfg(windows)]
+#[derive(Clone)]
+struct LiveSessionSnapshot {
+    session_id: String,
+    repo: String,
+    transport_addr: String,
+}
+
 /// Shutdown mode for the daemon.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ShutdownMode {
@@ -87,11 +98,23 @@ struct TrayApp {
     quit_id: tray_icon::menu::MenuId,
     shutdown_tx: watch::Sender<ShutdownMode>,
     exe_dir: PathBuf,
+    /// Shared daemon state, used by the quit handler to take a fresh snapshot
+    /// of live sessions and to reach `paths` for DB status updates.
+    state: Arc<DaemonState>,
+    /// Handle to the daemon's tokio runtime. The tray runs on the winit main
+    /// thread, so any async work (locking `state.sessions`, parallel stop RPCs)
+    /// is dispatched here via `block_on`.
+    tokio_handle: tokio::runtime::Handle,
 }
 
 #[cfg(windows)]
 impl TrayApp {
-    fn new(shutdown_tx: watch::Sender<ShutdownMode>, exe_dir: PathBuf) -> Self {
+    fn new(
+        shutdown_tx: watch::Sender<ShutdownMode>,
+        exe_dir: PathBuf,
+        state: Arc<DaemonState>,
+        tokio_handle: tokio::runtime::Handle,
+    ) -> Self {
         Self {
             tray: None,
             session_count: 0,
@@ -99,6 +122,8 @@ impl TrayApp {
             quit_id: tray_icon::menu::MenuId::new("quit"),
             shutdown_tx,
             exe_dir,
+            state,
+            tokio_handle,
         }
     }
 
@@ -259,6 +284,240 @@ impl TrayApp {
             }
         }
     }
+
+    /// Take a fresh snapshot of sessions whose supervisor processes are
+    /// *actually alive right now*. Runs under the `state.sessions` lock and
+    /// probes each supervisor PID synchronously via `is_alive`, so stale
+    /// entries (supervisor crashed but the 5s heartbeat hasn't pruned yet)
+    /// are filtered out at click time rather than relying on the pruned map.
+    fn collect_live_active_sessions(&self) -> Vec<LiveSessionSnapshot> {
+        self.tokio_handle.block_on(async {
+            let sessions = self.state.sessions.lock().await;
+            sessions
+                .values()
+                .filter(|s| PlatformProcessControl::is_alive(s.supervisor_pid))
+                .map(|s| LiveSessionSnapshot {
+                    session_id: s.session_id.clone(),
+                    repo: s.repo.clone(),
+                    transport_addr: s.transport_addr.clone(),
+                })
+                .collect()
+        })
+    }
+
+    /// Show a Yes/No native confirmation dialog via Win32 `MessageBoxW`.
+    /// Blocks the winit thread until the user dismisses it; `MessageBoxW`
+    /// runs its own internal message loop, so the OS continues pumping
+    /// messages and the tray icon stays responsive. Returns true only for
+    /// an explicit Yes click.
+    fn confirm_quit(&self, count: usize) -> bool {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            MessageBoxW, IDYES, MB_ICONWARNING, MB_TOPMOST, MB_YESNO,
+        };
+
+        let plural = if count == 1 { "" } else { "s" };
+        let title = format!("Quit {APP_NAME}?");
+        let text = format!("{count} active session{plural} will be closed. Continue?");
+
+        let to_wide = |s: &str| -> Vec<u16> {
+            std::ffi::OsStr::new(s)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
+        };
+        let title_w = to_wide(&title);
+        let text_w = to_wide(&text);
+
+        let result = unsafe {
+            MessageBoxW(
+                0, // no owner window — the tray has no HWND
+                text_w.as_ptr(),
+                title_w.as_ptr(),
+                MB_YESNO | MB_ICONWARNING | MB_TOPMOST,
+            )
+        };
+
+        result == IDYES as i32
+    }
+
+    /// Signal the tokio side to finish and exit the winit event loop. This is
+    /// the terminal step of every quit path (dialog-confirmed or zero-session
+    /// fast path). After this returns, `run_control_loop` drops the
+    /// `DaemonJobGuard`, which force-kills any supervisors still alive.
+    fn force_quit(&self, event_loop: &ActiveEventLoop) {
+        let _ = self.shutdown_tx.send(ShutdownMode::Force);
+        event_loop.exit();
+    }
+}
+
+// ── Tray quit: daemon-layer orchestration ───────────────────────────────────
+//
+// These live outside `TrayApp` because daemon lifecycle policy (quiesce the
+// control pipe, flip DB rows, kill the GUI, drain supervisors) is not UI
+// code. The tray is a thin initiator: it gathers the snapshot, shows the
+// confirmation dialog, calls `execute_quit`, then exits the event loop.
+
+/// Orchestrate a tray-initiated daemon quit. Called once the user has
+/// confirmed — must run on the tokio runtime. Steps:
+///
+/// 1. Flip `state.quitting` so any control-pipe request landing during the
+///    drain window is rejected for mutating frames. Prevents a relaunched
+///    GUI from spawning a new supervisor that would die when the Job
+///    Object drops a moment later.
+/// 2. Mark rows `stopped` in SQLite so a relaunched GUI's
+///    `start_monitors_for_running_sessions` finds nothing to attach to.
+/// 3. Kill the GUI process immediately so the user cannot interact with
+///    a frozen window during the drain.
+/// 4. Send StopGraceful to every live supervisor in parallel (≤3s).
+///
+/// The caller (the tray thread) is expected to follow this with
+/// `force_quit`, which drops the `DaemonJobGuard` and terminates any
+/// supervisors that did not shut down cleanly within the deadline.
+#[cfg(windows)]
+async fn execute_quit(
+    state: Arc<DaemonState>,
+    exe_dir: std::path::PathBuf,
+    active: Vec<LiveSessionSnapshot>,
+) {
+    state
+        .quitting
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    if !active.is_empty() {
+        mark_stopped_in_db(&state.paths, &active);
+    }
+
+    terminate_app_processes(&exe_dir);
+
+    if !active.is_empty() {
+        stop_all_graceful(active, Duration::from_secs(3)).await;
+    }
+}
+
+/// Persist `stopped` status for every session we're about to kill, so the
+/// next app launch does not spin up monitors against dead pipes. Without
+/// this the daemon heartbeat (which normally handles status cleanup) is
+/// aborted before it has a chance to run, and stale `running` rows leak
+/// into the next session.
+#[cfg(windows)]
+fn mark_stopped_in_db(paths: &ShardPaths, snapshots: &[LiveSessionSnapshot]) {
+    let store = SessionStore::new(paths.clone());
+    for snap in snapshots {
+        let short = &snap.session_id[..8.min(snap.session_id.len())];
+        if let Err(e) = store.update_status(&snap.repo, &snap.session_id, "stopped", None) {
+            warn!("Failed to mark session {short} stopped: {e}");
+        }
+    }
+}
+
+/// Enumerate running processes and `TerminateProcess` any `APP_EXE`
+/// whose **full image path** matches the sibling binary next to this
+/// daemon. Used on tray quit to honour the "close any open GUI windows"
+/// requirement — the shard-app process is independent of the daemon's
+/// Job Object, so dropping the job guard does not reach it.
+///
+/// Full-path matching (not basename) is deliberate: developer machines
+/// may have multiple `shard-app.exe` instances from different checkouts
+/// or an installed build. Only the one that this daemon would have
+/// launched (same `exe_dir`) should be killed.
+#[cfg(windows)]
+fn terminate_app_processes(exe_dir: &std::path::Path) {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use std::path::PathBuf;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+
+    // Canonicalize the expected path once. If we don't know where our
+    // sibling app binary lives, bail — killing arbitrary processes by
+    // basename is not acceptable.
+    let expected_canon = match std::fs::canonicalize(exe_dir.join(APP_EXE)) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                "Cannot canonicalize expected {APP_EXE} path at {:?}: {e}; skipping GUI termination",
+                exe_dir.join(APP_EXE)
+            );
+            return;
+        }
+    };
+
+    let self_pid = std::process::id();
+
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snap == INVALID_HANDLE_VALUE {
+        warn!("CreateToolhelp32Snapshot failed; cannot enumerate app processes");
+        return;
+    }
+
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+    let mut ok = unsafe { Process32FirstW(snap, &mut entry) };
+    while ok != 0 {
+        let pid = entry.th32ProcessID;
+
+        // Never suicide — we're the daemon, not the app.
+        if pid != self_pid {
+            // Fast basename prefilter: skip anything that isn't even
+            // named shard-app.exe before paying for OpenProcess.
+            let len = entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let name = OsString::from_wide(&entry.szExeFile[..len]);
+
+            if name.to_string_lossy().eq_ignore_ascii_case(APP_EXE) {
+                let handle = unsafe {
+                    OpenProcess(
+                        PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+                        0,
+                        pid,
+                    )
+                };
+                if handle != 0 {
+                    let mut buf = [0u16; 1024];
+                    let mut buf_len: u32 = buf.len() as u32;
+                    let rc = unsafe {
+                        QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut buf_len)
+                    };
+                    if rc != 0 {
+                        let full_path =
+                            PathBuf::from(OsString::from_wide(&buf[..buf_len as usize]));
+                        let candidate_canon = std::fs::canonicalize(&full_path).ok();
+                        if candidate_canon.as_ref() == Some(&expected_canon) {
+                            let terminated = unsafe { TerminateProcess(handle, 1) };
+                            if terminated != 0 {
+                                info!("Terminated {APP_EXE} (pid={pid})");
+                            } else {
+                                warn!("TerminateProcess failed for {APP_EXE} (pid={pid})");
+                            }
+                        } else {
+                            info!("Skipping unrelated {APP_EXE} at {:?} (pid={pid})", full_path);
+                        }
+                    } else {
+                        warn!("QueryFullProcessImageNameW failed for pid={pid}; leaving alive");
+                    }
+                    unsafe { CloseHandle(handle) };
+                } else {
+                    warn!("OpenProcess failed for {APP_EXE} (pid={pid})");
+                }
+            }
+        }
+
+        ok = unsafe { Process32NextW(snap, &mut entry) };
+    }
+
+    unsafe { CloseHandle(snap) };
 }
 
 #[cfg(windows)]
@@ -302,9 +561,123 @@ impl ApplicationHandler<TrayEvent> for TrayApp {
                 self.open_shard_app();
             } else if event.id == self.quit_id {
                 info!("Quit menu item clicked");
-                let _ = self.shutdown_tx.send(ShutdownMode::Force);
-                event_loop.exit();
+
+                let active = self.collect_live_active_sessions();
+
+                if !active.is_empty() && !self.confirm_quit(active.len()) {
+                    info!(
+                        "Quit cancelled by user; {} active session(s) preserved",
+                        active.len()
+                    );
+                    return;
+                }
+                info!("Quit confirmed; stopping {} active session(s)", active.len());
+
+                self.tokio_handle.block_on(execute_quit(
+                    self.state.clone(),
+                    self.exe_dir.clone(),
+                    active,
+                ));
+
+                self.force_quit(event_loop);
             }
+        }
+    }
+}
+
+/// Send `StopGraceful` to every live supervisor in parallel, bounded by
+/// `overall_deadline`. Any session that hasn't acknowledged within the
+/// deadline will be logged at `warn!` and left for the `DaemonJobGuard`
+/// drop to kill via `KILL_ON_JOB_CLOSE` on the way out of `run_daemon`.
+#[cfg(windows)]
+async fn stop_all_graceful(snapshots: Vec<LiveSessionSnapshot>, overall_deadline: Duration) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let total = snapshots.len();
+    let completed = Arc::new(AtomicUsize::new(0));
+    let mut set = tokio::task::JoinSet::new();
+
+    for snap in snapshots {
+        let completed = completed.clone();
+        set.spawn(async move {
+            let short = &snap.session_id[..8.min(snap.session_id.len())].to_string();
+            match stop_one_graceful(&snap.transport_addr).await {
+                Ok(()) => {
+                    completed.fetch_add(1, Ordering::Relaxed);
+                    info!("Stopped session {short} gracefully");
+                }
+                Err(e) => {
+                    warn!("Failed to stop session {short}: {e}");
+                }
+            }
+        });
+    }
+
+    let drain = async {
+        while set.join_next().await.is_some() {}
+    };
+
+    match tokio::time::timeout(overall_deadline, drain).await {
+        Ok(()) => {
+            let done = completed.load(Ordering::Relaxed);
+            if done == total {
+                info!("All {total} session(s) stopped gracefully");
+            } else {
+                warn!(
+                    "Graceful stop finished with errors: {done}/{total} session(s) stopped cleanly; remainder will be force-killed by job object"
+                );
+            }
+        }
+        Err(_) => {
+            let done = completed.load(Ordering::Relaxed);
+            warn!(
+                "Graceful stop deadline ({:?}) exceeded: {}/{} session(s) stopped cleanly; remaining will be force-killed by job object",
+                overall_deadline, done, total
+            );
+            set.abort_all();
+        }
+    }
+}
+
+/// Send `Resume { u64::MAX }` as the connection-type probe (registers as a
+/// monitor-only client and skips log replay since `MAX > live_offset`), then
+/// send `StopGraceful`, then wait for a `Status` frame or pipe EOF.
+///
+/// The initial `Resume` frame is load-bearing: the supervisor's accept
+/// handler only dispatches stop frames via the *post-first-frame* recv loop
+/// (see `crates/shard-supervisor/src/event_loop.rs:148-289`), so sending
+/// `StopGraceful` as the first frame would be silently discarded. See
+/// SHA-43 for the matching bug in the existing non-tray callers.
+#[cfg(windows)]
+async fn stop_one_graceful(transport_addr: &str) -> shard_core::Result<()> {
+    use shard_core::ShardError;
+    use shard_transport::protocol::{read_frame, write_frame, Frame};
+
+    let mut client = shard_transport::PlatformTransport::connect(transport_addr)
+        .await
+        .map_err(|e| ShardError::Other(format!("connect: {e}")))?;
+
+    write_frame(
+        &mut client,
+        &Frame::Resume {
+            last_seen_offset: u64::MAX,
+        },
+    )
+    .await
+    .map_err(|e| ShardError::Other(format!("resume handshake: {e}")))?;
+
+    write_frame(&mut client, &Frame::StopGraceful)
+        .await
+        .map_err(|e| ShardError::Other(format!("stop-graceful write: {e}")))?;
+
+    // Wait for a lifecycle Status frame or pipe EOF. Skip any PTY output
+    // frames that the supervisor fans out in the drain window.
+    loop {
+        match read_frame(&mut client).await {
+            Ok(Some(Frame::Status { code })) if code <= 2 => return Ok(()),
+            Ok(None) => return Ok(()),
+            Ok(Some(_)) => continue,
+            Err(e) => return Err(ShardError::Other(format!("read: {e}"))),
         }
     }
 }
@@ -316,6 +689,12 @@ struct DaemonState {
     paths: ShardPaths,
     exe_path: PathBuf,
     shutdown_tx: watch::Sender<ShutdownMode>,
+    /// Set to `true` the moment the user confirms a tray quit. The control
+    /// pipe `dispatch_request` checks this and rejects mutating frames
+    /// (`SpawnSession`, `StopSession`) so a GUI relaunched during the ≤3s
+    /// graceful drain window cannot spawn a new supervisor under a daemon
+    /// that is about to drop its Job Object and kill everything.
+    quitting: std::sync::atomic::AtomicBool,
     /// Proxy to send events to the tray icon event loop.
     #[cfg(windows)]
     tray_proxy: EventLoopProxy<TrayEvent>,
@@ -389,32 +768,36 @@ fn run_daemon() -> shard_core::Result<()> {
         paths: paths.clone(),
         exe_path,
         shutdown_tx: shutdown_tx.clone(),
+        quitting: std::sync::atomic::AtomicBool::new(false),
         tray_proxy,
     });
 
-    // Spawn the tokio runtime on a background thread.
-    // Main thread will run the winit event loop for the tray icon.
+    // Build the tokio runtime on the main thread and share it via Arc. The
+    // runtime is only dropped when the last Arc drops — which happens at the
+    // end of `run_daemon` on the main thread, after `event_loop.run_app`
+    // returns and after the tokio thread joins. This keeps the tray's
+    // `tokio_handle` safe to use for the entire lifetime of the event loop:
+    // even if `run_control_loop` exits early (e.g. via `shardctl daemon
+    // stop`), the runtime stays alive until the tray itself tears down.
+    let rt = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| shard_core::ShardError::Other(format!("tokio runtime: {e}")))?,
+    );
+    let tokio_handle = rt.handle().clone();
+
     let tokio_state = state.clone();
     let tokio_shutdown_rx = shutdown_rx.clone();
+    let tokio_rt = rt.clone();
     let tokio_thread = std::thread::Builder::new()
         .name("daemon-tokio".into())
         .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    error!("Failed to create tokio runtime: {e}");
-                    return;
-                }
-            };
-
             // Adopt orphaned supervisors from a previous daemon instance
-            rt.block_on(adopt_orphans(tokio_state.clone()));
+            tokio_rt.block_on(adopt_orphans(tokio_state.clone()));
 
             info!("Daemon ready, entering control pipe loop");
-            rt.block_on(run_control_loop(tokio_state, tokio_shutdown_rx));
+            tokio_rt.block_on(run_control_loop(tokio_state, tokio_shutdown_rx));
 
             info!("Daemon control loop exited");
         })
@@ -440,7 +823,7 @@ fn run_daemon() -> shard_core::Result<()> {
         });
 
     // Run the tray icon on the main thread (blocks until quit)
-    let mut app = TrayApp::new(shutdown_tx, exe_dir);
+    let mut app = TrayApp::new(shutdown_tx, exe_dir, state.clone(), tokio_handle);
     if let Err(e) = event_loop.run_app(&mut app) {
         error!("Event loop error: {e}");
     }
@@ -726,6 +1109,23 @@ async fn handle_client(
 
 /// Dispatch a control request to the appropriate handler.
 async fn dispatch_request(state: &Arc<DaemonState>, frame: ControlFrame) -> ControlFrame {
+    // Reject mutating frames if the daemon is in the middle of a tray-
+    // initiated quit. Read-only frames (Ping, ListSessions, Shutdown) are
+    // still serviced so observers and `shardctl daemon stop` continue to
+    // behave sensibly during the ≤3s drain window.
+    if state
+        .quitting
+        .load(std::sync::atomic::Ordering::Acquire)
+        && matches!(
+            frame,
+            ControlFrame::SpawnSession { .. } | ControlFrame::StopSession { .. }
+        )
+    {
+        return ControlFrame::Error {
+            message: "daemon is shutting down".to_string(),
+        };
+    }
+
     match frame {
         ControlFrame::Ping => ControlFrame::Pong,
 
