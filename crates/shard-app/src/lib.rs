@@ -1,4 +1,5 @@
 mod commands;
+mod daemon_ipc;
 mod state;
 
 use state::AppState;
@@ -124,6 +125,15 @@ pub fn run() {
         .manage(AppState::new())
         .setup(|app| {
             start_monitors_for_running_sessions(&app.handle());
+
+            // Long-lived daemon state subscription. Runs for the lifetime
+            // of the app, reconnects with backoff on daemon drop, keeps
+            // the last-known RepoState cache warm in AppState.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                daemon_ipc::run_state_subscriber(handle).await;
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

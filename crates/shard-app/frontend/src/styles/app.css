@@ -302,6 +302,36 @@ input {
   color: var(--text-primary);
 }
 
+.tree-group-ws > .tree-label-wrap > .tree-label.ws-detached {
+  font-style: italic;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  color: var(--text-muted);
+}
+
+.tree-group-ws > .tree-label-wrap > .tree-label.ws-broken {
+  color: #f0b450;
+}
+
+.tree-group-ws > .tree-label-wrap > .tree-label.ws-missing {
+  color: #ff7070;
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
+.tree-group-ws > .ws-action-remove {
+  display: none;
+}
+
+.tree-group-ws:has(> .tree-label-wrap > .tree-label.ws-missing) > .ws-action-add,
+.tree-group-ws:has(> .tree-label-wrap > .tree-label.ws-broken) > .ws-action-add {
+  display: none;
+}
+
+.tree-group-ws:has(> .tree-label-wrap > .tree-label.ws-missing) > .ws-action-remove,
+.tree-group-ws:has(> .tree-label-wrap > .tree-label.ws-broken) > .ws-action-remove {
+  display: inline-block;
+}
+
 .tree-action {
   background: none;
   border: none;

@@ -7,6 +7,7 @@ pub mod paths;
 pub mod repos;
 pub mod sessions;
 pub mod shell;
+pub mod state;
 pub mod workspaces;
 
 pub use error::{ShardError, Result};

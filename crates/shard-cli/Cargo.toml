@@ -18,6 +18,11 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+# File-system watcher for the daemon's WorkspaceMonitor — observes external
+# git activity (checkouts, worktree deletion) via ReadDirectoryChangesW on
+# Windows and fs events on macOS.
+notify = "8"
+notify-debouncer-full = "0.7"
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.19"

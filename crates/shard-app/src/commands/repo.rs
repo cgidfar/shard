@@ -3,6 +3,8 @@ use shard_core::workspaces::WorkspaceStore;
 use shard_core::ShardPaths;
 use tauri::Emitter;
 
+use crate::daemon_ipc::spawn_topology_poke;
+
 #[tauri::command]
 pub fn list_repos() -> Result<Vec<Repository>, String> {
     let store = RepositoryStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
@@ -30,6 +32,7 @@ pub fn add_repo(app: tauri::AppHandle, url: String, alias: Option<String>) -> Re
         }
     }
 
+    spawn_topology_poke(Some(repo.alias.clone()));
     let _ = app.emit("sidebar-changed", ());
     Ok(repo)
 }
@@ -44,6 +47,7 @@ pub fn sync_repo(alias: String) -> Result<(), String> {
 pub fn remove_repo(app: tauri::AppHandle, alias: String) -> Result<(), String> {
     let store = RepositoryStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
     store.remove(&alias).map_err(|e| e.to_string())?;
+    spawn_topology_poke(Some(alias));
     let _ = app.emit("sidebar-changed", ());
     Ok(())
 }

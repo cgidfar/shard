@@ -187,6 +187,20 @@ impl WorkspaceStore {
     ///
     /// If the workspace is a base checkout (`is_base=true`), only the DB record
     /// is removed — the original directory is never touched.
+    ///
+    /// Handles three filesystem states for non-base workspaces:
+    ///
+    /// - **Healthy**: `git worktree remove --force` succeeds and removes the
+    ///   directory + admin entry in one call.
+    /// - **Missing** (directory gone): skips git remove and runs `worktree
+    ///   prune` to drop any stale `.git/worktrees/<name>/` admin entry that
+    ///   survived the directory deletion.
+    /// - **Broken** (directory exists but git doesn't recognize it as a
+    ///   worktree — happens after manual deletion + recreation, after a
+    ///   prior prune, or when a directory was created out-of-band): falls
+    ///   back to `prune` + `std::fs::remove_dir_all`. Without this fallback,
+    ///   the user's only path to clean up a broken row is to manually
+    ///   delete files then re-run remove, which the UI doesn't expose.
     pub fn remove(&self, repo_alias: &str, ws_name: &str) -> Result<()> {
         let ws = self.get(repo_alias, ws_name)?;
 
@@ -200,7 +214,23 @@ impl WorkspaceStore {
             let ws_dir = std::path::PathBuf::from(&ws.path);
 
             if ws_dir.exists() {
-                git::worktree_remove(&source_dir, &ws_dir)?;
+                // Try the clean path first. If git refuses (broken state —
+                // typically "is not a working tree"), drop stale admin
+                // entries with prune and remove the directory ourselves.
+                if git::worktree_remove(&source_dir, &ws_dir).is_err() {
+                    let _ = git::worktree_prune(&source_dir);
+                    std::fs::remove_dir_all(&ws_dir).map_err(|e| {
+                        ShardError::Other(format!(
+                            "failed to remove worktree directory {}: {}",
+                            ws_dir.display(),
+                            e
+                        ))
+                    })?;
+                }
+            } else {
+                // Missing state: dir already gone. Prune in case git still
+                // has an admin entry pointing at the vanished path.
+                let _ = git::worktree_prune(&source_dir);
             }
         }
 

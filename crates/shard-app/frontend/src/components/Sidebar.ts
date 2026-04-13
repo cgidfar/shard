@@ -3,10 +3,12 @@ import {
   listWorkspaces,
   listSessions,
   removeSession,
+  removeWorkspace,
   renameSession,
   stopSession,
   type Repository,
   type Workspace,
+  type WorkspaceStatus,
   type SessionInfo,
 } from "../lib/api";
 import { labelFromCommand } from "../lib/titleFormat";
@@ -28,6 +30,58 @@ export interface SidebarCallbacks {
   onCreateSession: (repo: string, workspace: string) => void;
   onCreateWorkspace: (repo: string) => void;
   onLabelChanged?: (sessionId: string, label: string) => void;
+}
+
+/** Paint a workspace row's primary label from its live `WorkspaceStatus`.
+ *  The label IS the branch name in the healthy case — there is no
+ *  separate alias display. The `alias` argument is the workspace's DB
+ *  name, used as a fallback when the daemon hasn't reported a status
+ *  yet, when the worktree is missing/broken, or when HEAD is detached
+ *  with no readable sha. Modifier classes (`ws-detached`, `ws-missing`,
+ *  `ws-broken`) drive color/style. Callers: first render and every
+ *  targeted patch from the `workspace-status-changed` listener.
+ *
+ *  Active-row styling is preserved: callers must re-add `.active-ws` to
+ *  the parent row, not to the label, so health colors aren't fighting
+ *  the active state. */
+function applyWorkspaceStatus(
+  row: HTMLElement,
+  alias: string,
+  status: WorkspaceStatus | null,
+) {
+  const labelEl = row.querySelector(
+    ":scope > .tree-label-wrap > .tree-label",
+  ) as HTMLElement | null;
+  if (!labelEl) return;
+
+  labelEl.className = "tree-label";
+
+  if (!status) {
+    // Loading: daemon hasn't reported yet. Use alias as placeholder so
+    // the row isn't blank during the brief monitor warmup.
+    labelEl.textContent = alias;
+    return;
+  }
+
+  if (status.health === "missing") {
+    labelEl.textContent = alias;
+    labelEl.classList.add("ws-missing");
+    return;
+  }
+
+  if (status.health === "broken") {
+    labelEl.textContent = alias;
+    labelEl.classList.add("ws-broken");
+    return;
+  }
+
+  if (status.detached) {
+    labelEl.textContent = status.head_sha ? status.head_sha.slice(0, 7) : alias;
+    labelEl.classList.add("ws-detached");
+    return;
+  }
+
+  labelEl.textContent = status.current_branch || alias;
 }
 
 interface RepoTree {
@@ -63,10 +117,42 @@ export class Sidebar {
     this.expandState.set(`ws:${repo}:${workspace}`, true);
   }
 
+  isWorkspaceUnhealthy(repo: string, workspace: string): boolean {
+    for (const rt of this.tree) {
+      if (rt.repo.alias !== repo) continue;
+      for (const entry of rt.workspaces) {
+        if (entry.workspace.name === workspace) {
+          const h = entry.workspace.status?.health;
+          return h === "missing" || h === "broken";
+        }
+      }
+    }
+    return false;
+  }
+
   setActiveSession(sessionId: string | null) {
     this.activeSessionId = sessionId;
     if (sessionId) activityStore.clearAttention(sessionId);
     this.render();
+  }
+
+  /** Patch a single workspace's live status without re-rendering the
+   *  whole sidebar. Called by the daemon state subscriber on every
+   *  `workspace-status-changed` event. Updates the in-memory tree so
+   *  later full refreshes carry the fresh value. */
+  patchWorkspaceStatus(repo: string, workspace: string, status: WorkspaceStatus | null) {
+    for (const rt of this.tree) {
+      if (rt.repo.alias !== repo) continue;
+      for (const entry of rt.workspaces) {
+        if (entry.workspace.name === workspace) {
+          entry.workspace.status = status;
+        }
+      }
+    }
+
+    const selector = `.tree-group-ws[data-repo="${CSS.escape(repo)}"][data-workspace="${CSS.escape(workspace)}"]`;
+    const row = this.el.querySelector(selector) as HTMLElement | null;
+    if (row) applyWorkspaceStatus(row, workspace, status);
   }
 
   /** Hide a session row immediately (e.g. while a stop op is in flight). */
@@ -306,7 +392,9 @@ export class Sidebar {
         if (isActiveWs) wsGroup.classList.add("active-ws");
         wsGroup.dataset.repo = repo.alias;
         wsGroup.dataset.workspace = workspace.name;
-        wsGroup.title = workspace.path;
+        // Tooltip carries the alias + path so the DB-side workspace name
+        // is still discoverable when the label shows a divergent branch.
+        wsGroup.title = `${workspace.name}\n${workspace.path}`;
         wsGroup.insertAdjacentHTML("beforeend", workspace.is_base ? ICON_HOME : ICON_BRANCH);
 
         const wsLabelWrap = document.createElement("span");
@@ -314,7 +402,6 @@ export class Sidebar {
 
         const wsLabel = document.createElement("span");
         wsLabel.className = "tree-label";
-        wsLabel.textContent = workspace.name;
         wsLabelWrap.appendChild(wsLabel);
 
         const wsArrow = document.createElement("span");
@@ -323,9 +410,10 @@ export class Sidebar {
         if (sessions.length > 0) wsLabelWrap.appendChild(wsArrow);
 
         wsGroup.appendChild(wsLabelWrap);
+        applyWorkspaceStatus(wsGroup, workspace.name, workspace.status);
 
         const addSessionBtn = document.createElement("button");
-        addSessionBtn.className = "tree-action";
+        addSessionBtn.className = "tree-action ws-action-add";
         addSessionBtn.textContent = "+";
         addSessionBtn.title = "New session";
         addSessionBtn.addEventListener("click", (e) => {
@@ -333,6 +421,22 @@ export class Sidebar {
           this.callbacks.onCreateSession(repo.alias, workspace.name);
         });
         wsGroup.appendChild(addSessionBtn);
+
+        const removeWsBtn = document.createElement("button");
+        removeWsBtn.className = "tree-action tree-action-close ws-action-remove";
+        removeWsBtn.textContent = "×";
+        removeWsBtn.title = "Remove workspace";
+        removeWsBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const ok = window.confirm(
+            `Remove workspace "${workspace.name}" from ${repo.alias}?\n\nThis only removes the record; any remaining files are left alone.`,
+          );
+          if (!ok) return;
+          removeWorkspace(repo.alias, workspace.name)
+            .then(() => this.refresh())
+            .catch((err) => alert(`Failed to remove workspace: ${err}`));
+        });
+        wsGroup.appendChild(removeWsBtn);
 
         const wsChildren = document.createElement("div");
         wsChildren.className = this.expandState.get(wsKey) ? "tree-children open" : "tree-children";
