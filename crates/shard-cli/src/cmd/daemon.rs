@@ -1162,6 +1162,7 @@ async fn run_subscribe_loop(
     mut stream: tokio::net::windows::named_pipe::NamedPipeServer,
     mut shutdown_rx: watch::Receiver<ShutdownMode>,
 ) -> std::io::Result<()> {
+    use crate::cmd::workspace_monitor::ChangeKind;
     use tokio::sync::broadcast::error::RecvError;
 
     // Subscribe BEFORE snapshotting. If this order were reversed any repo
@@ -1189,7 +1190,7 @@ async fn run_subscribe_loop(
             }
             recv = change_rx.recv() => {
                 match recv {
-                    Ok(alias) => {
+                    Ok(ChangeKind::State(alias)) => {
                         if let Some(state) = monitor.get(&alias).await {
                             let frame = ControlFrame::StateSnapshot {
                                 state: (*state).clone(),
@@ -1200,11 +1201,31 @@ async fn run_subscribe_loop(
                             }
                         }
                     }
+                    Ok(ChangeKind::Sessions(repo)) => {
+                        let frame = ControlFrame::SessionsChanged { repo };
+                        if let Err(e) = write_control_frame(&mut stream, &frame).await {
+                            info!("subscribe: client disconnected ({e})");
+                            return Ok(());
+                        }
+                    }
                     Err(RecvError::Lagged(n)) => {
+                        // We may have dropped both State and Sessions events.
+                        // Re-send a full snapshot per repo AND a SessionsChanged
+                        // per repo so the client refreshes both axes of state.
                         info!("subscribe: lagged by {n}, resyncing");
-                        for state in monitor.snapshot().await {
+                        let states = monitor.snapshot().await;
+                        for state in &states {
                             let frame = ControlFrame::StateSnapshot {
-                                state: (*state).clone(),
+                                state: (**state).clone(),
+                            };
+                            if let Err(e) = write_control_frame(&mut stream, &frame).await {
+                                info!("subscribe: resync write failed: {e}");
+                                return Ok(());
+                            }
+                        }
+                        for state in &states {
+                            let frame = ControlFrame::SessionsChanged {
+                                repo: state.repo_alias.clone(),
                             };
                             if let Err(e) = write_control_frame(&mut stream, &frame).await {
                                 info!("subscribe: resync write failed: {e}");

@@ -47,11 +47,6 @@ pub struct RepoState {
     /// out-of-order delivery across reconnects harmless.
     pub version: u64,
     pub workspaces: HashMap<String, WorkspaceStatus>,
-    /// PID liveness for supervisors the daemon currently owns for this repo.
-    /// Keyed by session id. A dead entry (false) means the supervisor process
-    /// is no longer running; the daemon removes the entry entirely on the next
-    /// reconcile.
-    pub sessions_alive: HashMap<String, bool>,
 }
 
 impl RepoState {
@@ -60,7 +55,6 @@ impl RepoState {
             repo_alias: repo_alias.into(),
             version: 0,
             workspaces: HashMap::new(),
-            sessions_alive: HashMap::new(),
         }
     }
 }
@@ -75,7 +69,6 @@ mod tests {
         assert_eq!(state.repo_alias, "my-repo");
         assert_eq!(state.version, 0);
         assert!(state.workspaces.is_empty());
-        assert!(state.sessions_alive.is_empty());
     }
 
     #[test]

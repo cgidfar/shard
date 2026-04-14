@@ -62,9 +62,22 @@ pub struct MonitorHandle {
     inner: Arc<MonitorInner>,
 }
 
+/// What kind of change a subscriber is being notified about.
+///
+/// The two kinds map to two different wire frames: `State` triggers a
+/// `StateSnapshot` (re-read `RepoState` and push it), `Sessions` triggers
+/// a `SessionsChanged` (hint the client to re-query the sessions table).
+/// Both carry only the affected repo alias; the receiver is responsible
+/// for fetching whatever it needs.
+#[derive(Clone, Debug)]
+pub enum ChangeKind {
+    State(String),
+    Sessions(String),
+}
+
 struct MonitorInner {
     repos: RwLock<HashMap<String, Arc<RepoState>>>,
-    change_tx: broadcast::Sender<String>,
+    change_tx: broadcast::Sender<ChangeKind>,
     /// Topology-poke channel. `Some(alias)` scopes the reload to one repo;
     /// `None` means "reload everything" (used rarely, e.g. at startup).
     topology_tx: mpsc::UnboundedSender<Option<String>>,
@@ -82,9 +95,11 @@ impl MonitorHandle {
         self.inner.repos.read().await.get(alias).cloned()
     }
 
-    /// Subscribe to change notifications. Returns the alias of any repo whose
-    /// `RepoState` just changed. Call `snapshot`/`get` to read the fresh value.
-    pub fn subscribe(&self) -> broadcast::Receiver<String> {
+    /// Subscribe to change notifications. Returns `ChangeKind` events scoped
+    /// to one repo at a time — `State` when `RepoState` changes (call
+    /// `snapshot`/`get` to read the fresh value), `Sessions` when the sessions
+    /// table for that repo has transitioned (re-query the DB).
+    pub fn subscribe(&self) -> broadcast::Receiver<ChangeKind> {
         self.inner.change_tx.subscribe()
     }
 
@@ -196,8 +211,6 @@ impl WorkspaceMonitor {
             self.load_repo(&repo).await;
         }
 
-        // Seed session liveness from the daemon's current registry.
-        self.seed_session_liveness().await;
         self.broadcast_all().await;
         Ok(())
     }
@@ -327,35 +340,13 @@ impl WorkspaceMonitor {
         Ok(())
     }
 
-    async fn seed_session_liveness(&mut self) {
-        let sessions = self.daemon.sessions.lock().await;
-        let mut by_repo: HashMap<String, HashMap<String, bool>> = HashMap::new();
-        for (id, live) in sessions.iter() {
-            by_repo
-                .entry(live.repo.clone())
-                .or_default()
-                .insert(id.clone(), PlatformProcessControl::is_alive(live.supervisor_pid));
-        }
-        drop(sessions);
-
-        let mut repos = self.inner.repos.write().await;
-        for (alias, alive_map) in by_repo {
-            if let Some(state_arc) = repos.get_mut(&alias) {
-                let mut state = (**state_arc).clone();
-                state.sessions_alive = alive_map;
-                state.version += 1;
-                *state_arc = Arc::new(state);
-            }
-        }
-    }
-
     /// Emit a change notification for every repo currently in the map.
     /// Used after the initial load so any subscriber that connected before
     /// load finished gets a refresh.
     async fn broadcast_all(&self) {
         let aliases: Vec<String> = self.inner.repos.read().await.keys().cloned().collect();
         for alias in aliases {
-            let _ = self.inner.change_tx.send(alias);
+            let _ = self.inner.change_tx.send(ChangeKind::State(alias));
         }
     }
 
@@ -406,12 +397,12 @@ impl WorkspaceMonitor {
                         debug!("topology: reloading repo {alias}");
                         self.drop_repo(alias).await;
                         self.load_repo(&repo).await;
-                        let _ = self.inner.change_tx.send(alias.clone());
+                        let _ = self.inner.change_tx.send(ChangeKind::State(alias.clone()));
                     }
                     Err(_) => {
                         debug!("topology: repo {alias} removed");
                         self.drop_repo(alias).await;
-                        let _ = self.inner.change_tx.send(alias.clone());
+                        let _ = self.inner.change_tx.send(ChangeKind::State(alias.clone()));
                     }
                 }
             }
@@ -495,7 +486,10 @@ impl WorkspaceMonitor {
         state.version += 1;
         repos.insert(alias.to_string(), Arc::new(state));
         drop(repos);
-        let _ = self.inner.change_tx.send(alias.to_string());
+        let _ = self
+            .inner
+            .change_tx
+            .send(ChangeKind::State(alias.to_string()));
     }
 
     /// Fast tick: PID liveness + DB exit transitions + tray update. This is
@@ -503,31 +497,20 @@ impl WorkspaceMonitor {
     async fn fast_tick(&mut self) {
         // Scan the daemon sessions map. Mirrors the old heartbeat_task — if
         // a supervisor's PID has died, mark it exited in the DB and remove
-        // it from the live map. Then fold the live set into each repo's
-        // RepoState.sessions_alive.
-        let (dead_ids, current_count, by_repo): (
-            Vec<(String, String)>,
-            usize,
-            HashMap<String, HashMap<String, bool>>,
-        ) = {
+        // it from the live map.
+        let (dead_ids, current_count): (Vec<(String, String)>, usize) = {
             let mut sessions = self.daemon.sessions.lock().await;
             let mut dead = Vec::new();
-            let mut by_repo: HashMap<String, HashMap<String, bool>> = HashMap::new();
 
             for (id, s) in sessions.iter() {
-                let alive = PlatformProcessControl::is_alive(s.supervisor_pid);
-                if !alive {
+                if !PlatformProcessControl::is_alive(s.supervisor_pid) {
                     dead.push((id.clone(), s.repo.clone()));
                 }
-                by_repo
-                    .entry(s.repo.clone())
-                    .or_default()
-                    .insert(id.clone(), alive);
             }
             for (id, _) in &dead {
                 sessions.remove(id);
             }
-            (dead, sessions.len(), by_repo)
+            (dead, sessions.len())
         };
 
         if !dead_ids.is_empty() {
@@ -538,6 +521,19 @@ impl WorkspaceMonitor {
                     "WorkspaceMonitor: session {} supervisor died, marked exited",
                     &id[..8.min(id.len())]
                 );
+            }
+
+            // Notify subscribers once per affected repo so the frontend
+            // re-queries the sessions table and drops the stale "running"
+            // row. Dedup so a repo with N dead sessions sends one event.
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for (_, repo) in &dead_ids {
+                if seen.insert(repo.as_str()) {
+                    let _ = self
+                        .inner
+                        .change_tx
+                        .send(ChangeKind::Sessions(repo.clone()));
+                }
             }
         }
 
@@ -552,47 +548,6 @@ impl WorkspaceMonitor {
         #[cfg(not(windows))]
         {
             let _ = current_count;
-        }
-
-        // Fold session liveness into RepoState for every repo that has live
-        // sessions. Also clear sessions_alive for repos with none left so
-        // dead rows drop from the UI.
-        let mut repos = self.inner.repos.write().await;
-        let mut changed_aliases: Vec<String> = Vec::new();
-
-        // First pass: apply live liveness maps.
-        for (alias, alive_map) in &by_repo {
-            if let Some(existing) = repos.get(alias) {
-                if existing.sessions_alive != *alive_map {
-                    let mut state = (**existing).clone();
-                    state.sessions_alive = alive_map.clone();
-                    state.version += 1;
-                    repos.insert(alias.clone(), Arc::new(state));
-                    changed_aliases.push(alias.clone());
-                }
-            }
-        }
-
-        // Second pass: clear liveness for repos the scan didn't touch.
-        let all_aliases: Vec<String> = repos.keys().cloned().collect();
-        for alias in all_aliases {
-            if by_repo.contains_key(&alias) {
-                continue;
-            }
-            if let Some(existing) = repos.get(&alias) {
-                if !existing.sessions_alive.is_empty() {
-                    let mut state = (**existing).clone();
-                    state.sessions_alive.clear();
-                    state.version += 1;
-                    repos.insert(alias.clone(), Arc::new(state));
-                    changed_aliases.push(alias);
-                }
-            }
-        }
-        drop(repos);
-
-        for alias in changed_aliases {
-            let _ = self.inner.change_tx.send(alias);
         }
     }
 

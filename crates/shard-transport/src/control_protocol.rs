@@ -7,7 +7,7 @@ use shard_core::state::{RepoState, WorkspaceHealth, WorkspaceStatus};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current control protocol version. Bumped on breaking wire changes.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Well-known named pipe address for the daemon control channel.
 #[cfg(windows)]
@@ -77,10 +77,17 @@ pub enum ControlFrame {
     Subscribe,
 
     /// Daemon → Client: full per-repo state snapshot. Carries the complete
-    /// WorkspaceStatus set plus session liveness for one repo, tagged with a
-    /// monotonic version. Snapshots are idempotent — subscribers may safely
-    /// drop or reorder them; the latest version wins.
+    /// WorkspaceStatus set for one repo, tagged with a monotonic version.
+    /// Snapshots are idempotent — subscribers may safely drop or reorder
+    /// them; the latest version wins.
     StateSnapshot { state: RepoState },
+
+    /// Daemon → Client: one or more sessions in this repo just transitioned
+    /// to a terminal status in the DB (the daemon's `fast_tick` detected a
+    /// dead supervisor PID and marked the row `exited`). Payload is just the
+    /// affected repo alias — the client's job is to re-query the sessions
+    /// table for that repo. Fire-and-forget; no reply.
+    SessionsChanged { repo: String },
 
     /// Client → Daemon: one-shot poke telling the daemon that the repo /
     /// workspace topology has changed (add/remove) and it should reload its
@@ -123,6 +130,7 @@ const TYPE_SUBSCRIBE: u8 = 0x8C;
 const TYPE_STATE_SNAPSHOT: u8 = 0x8D;
 const TYPE_TOPOLOGY_CHANGED: u8 = 0x8E;
 const TYPE_ERROR: u8 = 0x8F;
+const TYPE_SESSIONS_CHANGED: u8 = 0x90;
 
 /// Write a control frame to an async writer.
 pub async fn write_control_frame<W: AsyncWrite + Unpin>(
@@ -216,15 +224,6 @@ pub async fn write_control_frame<W: AsyncWrite + Unpin>(
                 write_workspace_status(&mut payload, status);
             }
 
-            // Session liveness
-            let mut sess: Vec<(&String, &bool)> = state.sessions_alive.iter().collect();
-            sess.sort_by(|a, b| a.0.cmp(b.0));
-            payload.extend_from_slice(&(sess.len() as u32).to_be_bytes());
-            for (session_id, alive) in sess {
-                write_str(&mut payload, session_id);
-                payload.push(if *alive { 1 } else { 0 });
-            }
-
             TYPE_STATE_SNAPSHOT
         }
         ControlFrame::TopologyChanged { repo_alias } => {
@@ -236,6 +235,10 @@ pub async fn write_control_frame<W: AsyncWrite + Unpin>(
                 None => payload.push(0),
             }
             TYPE_TOPOLOGY_CHANGED
+        }
+        ControlFrame::SessionsChanged { repo } => {
+            write_str(&mut payload, repo);
+            TYPE_SESSIONS_CHANGED
         }
         ControlFrame::Error { message } => {
             write_str(&mut payload, message);
@@ -407,27 +410,11 @@ pub async fn read_control_frame<R: AsyncRead + Unpin>(
                 workspaces.insert(name, status);
             }
 
-            ensure_len(&payload[offset..], 4, "StateSnapshot sess count")?;
-            let sess_count =
-                u32::from_be_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
-            offset += 4;
-
-            let mut sessions_alive = std::collections::HashMap::with_capacity(sess_count);
-            for _ in 0..sess_count {
-                let (session_id, n) = read_str(&payload[offset..])?;
-                offset += n;
-                ensure_len(&payload[offset..], 1, "StateSnapshot alive byte")?;
-                let alive = payload[offset] == 1;
-                offset += 1;
-                sessions_alive.insert(session_id, alive);
-            }
-
             ControlFrame::StateSnapshot {
                 state: RepoState {
                     repo_alias,
                     version,
                     workspaces,
-                    sessions_alive,
                 },
             }
         }
@@ -440,6 +427,10 @@ pub async fn read_control_frame<R: AsyncRead + Unpin>(
                 None
             };
             ControlFrame::TopologyChanged { repo_alias }
+        }
+        TYPE_SESSIONS_CHANGED => {
+            let (repo, _) = read_str(payload)?;
+            ControlFrame::SessionsChanged { repo }
         }
         TYPE_ERROR => {
             let (message, _) = read_str(payload)?;
@@ -735,6 +726,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn roundtrip_sessions_changed() {
+        let f = ControlFrame::SessionsChanged {
+            repo: "my-repo".to_string(),
+        };
+        assert_eq!(roundtrip(f.clone()).await, f);
+    }
+
+    #[tokio::test]
     async fn roundtrip_state_snapshot_full() {
         let mut state = RepoState::new("my-repo");
         state.version = 42;
@@ -765,13 +764,6 @@ mod tests {
                 health: WorkspaceHealth::Missing,
             },
         );
-        state
-            .sessions_alive
-            .insert("sess-1".to_string(), true);
-        state
-            .sessions_alive
-            .insert("sess-2".to_string(), false);
-
         let frame = ControlFrame::StateSnapshot {
             state: state.clone(),
         };

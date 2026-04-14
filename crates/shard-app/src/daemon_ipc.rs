@@ -54,13 +54,6 @@ struct WorkspaceStatusChanged<'a> {
     status: Option<&'a shard_core::state::WorkspaceStatus>,
 }
 
-/// Event payload for `session-liveness-changed` Tauri events.
-#[derive(serde::Serialize, Clone)]
-struct SessionLivenessChanged<'a> {
-    session_id: &'a str,
-    alive: bool,
-}
-
 /// Subscribe to the daemon's state broadcast and re-emit updates as Tauri
 /// events for the frontend to consume. Runs in its own background task for
 /// the lifetime of the app.
@@ -111,6 +104,13 @@ async fn connect_and_subscribe(app: &AppHandle) -> std::io::Result<()> {
             ControlFrame::StateSnapshot { state } => {
                 apply_snapshot(app, state).await;
             }
+            ControlFrame::SessionsChanged { repo: _ } => {
+                // Daemon detected a supervisor death and marked a session
+                // exited in the DB. Kick the sidebar to re-query; we don't
+                // bother scoping the refresh by repo since list_sessions
+                // is cheap and sidebar.refresh() reloads everything.
+                let _ = app.emit("sidebar-changed", ());
+            }
             ControlFrame::Error { message } => {
                 warn!("state subscriber: daemon error: {message}");
                 return Ok(());
@@ -133,10 +133,11 @@ async fn apply_snapshot(app: &AppHandle, state: RepoState) {
     let prev = cache.get(&alias).cloned();
 
     // Ignore out-of-order snapshots (defensive against reconnect reorderings).
+    // Version is monotonic per repo, so anything non-increasing is stale —
+    // even if the payload happens to differ, trusting a lower-versioned
+    // snapshot would overwrite fresher state.
     if let Some(ref prev_state) = prev {
-        if state.version <= prev_state.version && prev_state.workspaces == state.workspaces
-            && prev_state.sessions_alive == state.sessions_alive
-        {
+        if state.version <= prev_state.version {
             return;
         }
     }
@@ -174,23 +175,6 @@ async fn apply_snapshot(app: &AppHandle, state: RepoState) {
                     repo: &alias,
                     workspace: ws_name,
                     status: None,
-                },
-            );
-        }
-    }
-
-    // Diff session liveness. Only emit when a value changes — the set of
-    // sessions themselves is driven by the existing sidebar-changed path.
-    let prev_sessions: HashMap<String, bool> =
-        prev.as_ref().map(|p| p.sessions_alive.clone()).unwrap_or_default();
-    for (sid, alive) in &state.sessions_alive {
-        let changed = prev_sessions.get(sid) != Some(alive);
-        if changed {
-            let _ = app.emit(
-                "session-liveness-changed",
-                SessionLivenessChanged {
-                    session_id: sid,
-                    alive: *alive,
                 },
             );
         }
