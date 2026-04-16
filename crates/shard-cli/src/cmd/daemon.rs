@@ -49,7 +49,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::window::WindowId;
 
 /// In-memory record of a live supervised session.
-struct LiveSession {
+pub(crate) struct LiveSession {
     pub session_id: String,
     pub supervisor_pid: u32,
     pub transport_addr: String,
@@ -71,7 +71,7 @@ struct LiveSessionSnapshot {
 
 /// Shutdown mode for the daemon.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ShutdownMode {
+pub(crate) enum ShutdownMode {
     Running,
     Graceful,
     Force,
@@ -82,7 +82,7 @@ enum ShutdownMode {
 /// Events sent from the tokio runtime to the winit event loop.
 #[cfg(windows)]
 #[derive(Debug)]
-enum TrayEvent {
+pub(crate) enum TrayEvent {
     /// Update the session count label in the tray menu.
     SessionCount(usize),
     /// Signal the event loop to exit (daemon is shutting down).
@@ -683,10 +683,10 @@ async fn stop_one_graceful(transport_addr: &str) -> shard_core::Result<()> {
 }
 
 /// Shared daemon state.
-struct DaemonState {
-    sessions: Mutex<HashMap<String, LiveSession>>,
+pub(crate) struct DaemonState {
+    pub(crate) sessions: Mutex<HashMap<String, LiveSession>>,
     job_guard: DaemonJobGuard,
-    paths: ShardPaths,
+    pub(crate) paths: ShardPaths,
     exe_path: PathBuf,
     shutdown_tx: watch::Sender<ShutdownMode>,
     /// Set to `true` the moment the user confirms a tray quit. The control
@@ -697,7 +697,11 @@ struct DaemonState {
     quitting: std::sync::atomic::AtomicBool,
     /// Proxy to send events to the tray icon event loop.
     #[cfg(windows)]
-    tray_proxy: EventLoopProxy<TrayEvent>,
+    pub(crate) tray_proxy: EventLoopProxy<TrayEvent>,
+    /// Handle to the WorkspaceMonitor task. Set once, during
+    /// `run_control_loop` startup; read by control-pipe clients that
+    /// subscribe to state updates or send topology pokes.
+    monitor: std::sync::OnceLock<crate::cmd::workspace_monitor::MonitorHandle>,
 }
 
 pub fn run(command: DaemonCommands) -> shard_core::Result<()> {
@@ -770,6 +774,7 @@ fn run_daemon() -> shard_core::Result<()> {
         shutdown_tx: shutdown_tx.clone(),
         quitting: std::sync::atomic::AtomicBool::new(false),
         tray_proxy,
+        monitor: std::sync::OnceLock::new(),
     });
 
     // Build the tokio runtime on the main thread and share it via Arc. The
@@ -946,7 +951,7 @@ fn is_daemon_running() -> bool {
     }
 }
 
-/// Main async loop: control pipe server + heartbeat.
+/// Main async loop: control pipe server + WorkspaceMonitor.
 async fn run_control_loop(state: Arc<DaemonState>, mut shutdown_rx: watch::Receiver<ShutdownMode>) {
     // Create the first control pipe instance
     let server = match create_pipe_instance(CONTROL_PIPE_NAME, true) {
@@ -957,9 +962,14 @@ async fn run_control_loop(state: Arc<DaemonState>, mut shutdown_rx: watch::Recei
         }
     };
 
-    // Spawn heartbeat task
-    let heartbeat_state = state.clone();
-    let heartbeat_handle = tokio::spawn(heartbeat_task(heartbeat_state));
+    // Spawn WorkspaceMonitor. This replaces the former 5s heartbeat task —
+    // PID liveness, DB exit transitions, and tray session-count updates now
+    // live in the monitor's 1s fast tick alongside git-state syncing.
+    let (monitor_handle, monitor_task) =
+        crate::cmd::workspace_monitor::spawn(state.clone(), shutdown_rx.clone());
+    if state.monitor.set(monitor_handle).is_err() {
+        warn!("WorkspaceMonitor handle already set — ignoring");
+    }
 
     // Accept loop
     let accept_state = state.clone();
@@ -973,9 +983,9 @@ async fn run_control_loop(state: Arc<DaemonState>, mut shutdown_rx: watch::Recei
     let mode = *shutdown_rx.borrow();
     info!("Shutdown signal received (mode={:?})", mode as u8);
 
-    // Cancel accept loop and heartbeat
+    // Cancel accept loop and monitor task
     accept_handle.abort();
-    heartbeat_handle.abort();
+    monitor_task.abort();
 
     match mode {
         ShutdownMode::Graceful => {
@@ -1081,28 +1091,153 @@ async fn handle_client(
         None => return Ok(()),
     }
 
-    // Request/response loop
+    // Request/response loop. Two special frames change the loop's shape:
+    //   - `Subscribe` converts this connection into a long-lived state push
+    //     stream. After that point, nothing more is read from the client —
+    //     closing the pipe is the only way to unsubscribe.
+    //   - `TopologyChanged` is a fire-and-forget poke with no response.
     loop {
         let frame = match read_control_frame(&mut stream).await? {
             Some(f) => f,
             None => return Ok(()), // Client disconnected
         };
 
-        // Capture shutdown mode before dispatching
-        let shutdown_mode = match &frame {
-            ControlFrame::Shutdown { graceful } => {
-                Some(if *graceful { ShutdownMode::Graceful } else { ShutdownMode::Force })
+        match frame {
+            ControlFrame::Subscribe => {
+                if let Some(monitor) = state.monitor.get() {
+                    let shutdown_rx = state.shutdown_tx.subscribe();
+                    return run_subscribe_loop(monitor.clone(), stream, shutdown_rx).await;
+                } else {
+                    write_control_frame(
+                        &mut stream,
+                        &ControlFrame::Error {
+                            message: "monitor not ready".to_string(),
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
             }
-            _ => None,
+            ControlFrame::TopologyChanged { repo_alias } => {
+                if let Some(monitor) = state.monitor.get() {
+                    monitor.poke_topology(repo_alias);
+                }
+                // No response — fire-and-forget.
+                continue;
+            }
+            other => {
+                // Capture shutdown mode before dispatching.
+                let shutdown_mode = match &other {
+                    ControlFrame::Shutdown { graceful } => Some(if *graceful {
+                        ShutdownMode::Graceful
+                    } else {
+                        ShutdownMode::Force
+                    }),
+                    _ => None,
+                };
+
+                let response = dispatch_request(&state, other).await;
+                write_control_frame(&mut stream, &response).await?;
+
+                // If we just acked a shutdown, signal with the correct mode and exit
+                if let Some(mode) = shutdown_mode {
+                    let _ = state.shutdown_tx.send(mode);
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+/// Long-lived subscribe loop. The client has already handshaked and sent
+/// `Subscribe`; from here on the daemon pushes `StateSnapshot` frames for
+/// every repo whose state changes. There is no explicit unsubscribe —
+/// closing the pipe terminates the loop on the next send attempt.
+///
+/// On subscriber lag (`broadcast::RecvError::Lagged`) the daemon resyncs by
+/// re-sending every repo's current state. Snapshots are idempotent and
+/// versioned, so this is always safe.
+async fn run_subscribe_loop(
+    monitor: crate::cmd::workspace_monitor::MonitorHandle,
+    mut stream: tokio::net::windows::named_pipe::NamedPipeServer,
+    mut shutdown_rx: watch::Receiver<ShutdownMode>,
+) -> std::io::Result<()> {
+    use crate::cmd::workspace_monitor::ChangeKind;
+    use tokio::sync::broadcast::error::RecvError;
+
+    // Subscribe BEFORE snapshotting. If this order were reversed any repo
+    // updates that landed between the snapshot read and the subscribe
+    // registration would be lost. Subscribing first means we may get
+    // duplicate notifications for the initial set, but snapshots are
+    // versioned and idempotent so duplicates are harmless.
+    let mut change_rx = monitor.subscribe();
+
+    // Initial snapshot — one frame per known repo.
+    for state in monitor.snapshot().await {
+        let frame = ControlFrame::StateSnapshot {
+            state: (*state).clone(),
         };
-
-        let response = dispatch_request(&state, frame).await;
-        write_control_frame(&mut stream, &response).await?;
-
-        // If we just acked a shutdown, signal with the correct mode and exit
-        if let Some(mode) = shutdown_mode {
-            let _ = state.shutdown_tx.send(mode);
+        if let Err(e) = write_control_frame(&mut stream, &frame).await {
+            info!("subscribe: initial snapshot write failed: {e}");
             return Ok(());
+        }
+    }
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                return Ok(());
+            }
+            recv = change_rx.recv() => {
+                match recv {
+                    Ok(ChangeKind::State(alias)) => {
+                        if let Some(state) = monitor.get(&alias).await {
+                            let frame = ControlFrame::StateSnapshot {
+                                state: (*state).clone(),
+                            };
+                            if let Err(e) = write_control_frame(&mut stream, &frame).await {
+                                info!("subscribe: client disconnected ({e})");
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Ok(ChangeKind::Sessions(repo)) => {
+                        let frame = ControlFrame::SessionsChanged { repo };
+                        if let Err(e) = write_control_frame(&mut stream, &frame).await {
+                            info!("subscribe: client disconnected ({e})");
+                            return Ok(());
+                        }
+                    }
+                    Err(RecvError::Lagged(n)) => {
+                        // We may have dropped both State and Sessions events.
+                        // Re-send a full snapshot per repo AND a SessionsChanged
+                        // per repo so the client refreshes both axes of state.
+                        info!("subscribe: lagged by {n}, resyncing");
+                        let states = monitor.snapshot().await;
+                        for state in &states {
+                            let frame = ControlFrame::StateSnapshot {
+                                state: (**state).clone(),
+                            };
+                            if let Err(e) = write_control_frame(&mut stream, &frame).await {
+                                info!("subscribe: resync write failed: {e}");
+                                return Ok(());
+                            }
+                        }
+                        for state in &states {
+                            let frame = ControlFrame::SessionsChanged {
+                                repo: state.repo_alias.clone(),
+                            };
+                            if let Err(e) = write_control_frame(&mut stream, &frame).await {
+                                info!("subscribe: resync write failed: {e}");
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Err(RecvError::Closed) => {
+                        return Ok(());
+                    }
+                }
+            }
         }
     }
 }
@@ -1341,43 +1476,6 @@ async fn handle_stop(state: &Arc<DaemonState>, session_id: String, force: bool) 
         Err(e) => ControlFrame::Error {
             message: format!("failed to connect to session pipe: {e}"),
         },
-    }
-}
-
-/// Periodic heartbeat: check if supervised processes are still alive.
-async fn heartbeat_task(state: Arc<DaemonState>) {
-    let mut interval = tokio::time::interval(Duration::from_secs(5));
-    loop {
-        interval.tick().await;
-
-        // Scan for dead sessions and remove from HashMap under lock
-        let (dead_ids, count) = {
-            let mut sessions = state.sessions.lock().await;
-            let mut dead = Vec::new();
-            for (id, session) in sessions.iter() {
-                if !PlatformProcessControl::is_alive(session.supervisor_pid) {
-                    dead.push((id.clone(), session.repo.clone()));
-                }
-            }
-            for (id, _) in &dead {
-                sessions.remove(id);
-            }
-            (dead, sessions.len())
-        };
-
-        // Update DB outside lock to avoid blocking other operations
-        if !dead_ids.is_empty() {
-            let session_store = SessionStore::new(state.paths.clone());
-            for (id, repo) in &dead_ids {
-                let _ = session_store.update_status(repo, id, "exited", None);
-                info!("Heartbeat: session {} supervisor died, marked exited", &id[..8]);
-            }
-        }
-
-        #[cfg(windows)]
-        {
-            let _ = state.tray_proxy.send_event(TrayEvent::SessionCount(count));
-        }
     }
 }
 

@@ -4,7 +4,7 @@ import { TitleBar, type Breadcrumb } from "./components/TitleBar";
 import { Sidebar } from "./components/Sidebar";
 import { TerminalPane } from "./components/TerminalPane";
 import { AddShardDialog } from "./components/AddShardDialog";
-import { addRepo, createSession, createWorkspace, listRepos, stopSession, removeSession, removeWorkspace, syncRepo, removeRepo } from "./lib/api";
+import { addRepo, createSession, createWorkspace, listRepos, stopSession, removeSession, removeWorkspace, syncRepo, removeRepo, type WorkspaceStatus } from "./lib/api";
 import { contextMenu, type MenuItemDef } from "./lib/ContextMenu";
 import { labelFromCommand } from "./lib/titleFormat";
 import { activityStore } from "./lib/activityStore";
@@ -229,27 +229,31 @@ contextMenu.register(".tree-item-session", (el): MenuItemDef[] => {
 contextMenu.register(".tree-group-ws", (el): MenuItemDef[] => {
   const repo = el.dataset.repo!;
   const workspace = el.dataset.workspace!;
-  return [
-    {
+  const unhealthy = sidebar.isWorkspaceUnhealthy(repo, workspace);
+
+  const items: MenuItemDef[] = [];
+  if (!unhealthy) {
+    items.push({
       kind: "action",
       label: "New Session",
       handler() {
         doCreateSession(repo, workspace).catch((err) =>
           console.error("Failed to create session:", err));
       },
+    });
+    items.push({ kind: "separator" });
+  }
+  items.push({
+    kind: "action",
+    label: "Remove Workspace",
+    danger: true,
+    handler() {
+      removeWorkspace(repo, workspace)
+        .then(() => sidebar.refresh())
+        .catch((err) => alert(`Failed to remove workspace: ${err}`));
     },
-    { kind: "separator" },
-    {
-      kind: "action",
-      label: "Remove Workspace",
-      danger: true,
-      handler() {
-        removeWorkspace(repo, workspace)
-          .then(() => sidebar.refresh())
-          .catch((err) => alert(`Failed to remove workspace: ${err}`));
-      },
-    },
-  ];
+  });
+  return items;
 });
 
 // Repo right-click
@@ -340,8 +344,19 @@ async function init() {
 
 init();
 
-// Refresh sidebar when backend state changes
+// Refresh sidebar when backend structural state changes (add/remove)
 listen("sidebar-changed", () => sidebar.refresh());
+
+// Targeted workspace-status patch: the daemon WorkspaceMonitor has observed
+// external git activity (branch flip, worktree deletion) or completed a
+// reconcile pass. Apply a single-row update instead of a full refresh so
+// frequent branch flips during rebases don't repaint the whole tree.
+listen<{ repo: string; workspace: string; status: WorkspaceStatus | null }>(
+  "workspace-status-changed",
+  ({ payload }) => {
+    sidebar.patchWorkspaceStatus(payload.repo, payload.workspace, payload.status);
+  }
+);
 
 // Relay activity state from supervisor to the store
 listen<{ id: string; state: "active" | "idle" | "blocked" }>("session-activity", ({ payload }) => {

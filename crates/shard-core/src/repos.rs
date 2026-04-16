@@ -50,7 +50,7 @@ impl RepositoryStore {
 
         let conn = self.open_index()?;
 
-        // Check for duplicates
+        // Check for duplicates by url or alias
         let exists: bool = conn.query_row(
             "SELECT COUNT(*) > 0 FROM repos WHERE url = ?1 OR alias = ?2",
             params![url, alias],
@@ -76,6 +76,21 @@ impl RepositoryStore {
                 None
             }
         };
+
+        // Also reject duplicate canonical local paths. Two aliases pointing at
+        // the same checkout would create duplicate WorkspaceMonitor watchers
+        // and confuse the daemon's RepoState. The url column is a raw string
+        // so plain url-matching above misses `./repo` vs `C:\abs\repo`.
+        if let Some(ref canon) = local_path {
+            let dup: bool = conn.query_row(
+                "SELECT COUNT(*) > 0 FROM repos WHERE local_path = ?1",
+                params![canon],
+                |row| row.get(0),
+            )?;
+            if dup {
+                return Err(ShardError::RepoAlreadyExists(alias));
+            }
+        }
 
         // For remote repos, create a bare clone.
         // For local repos, skip — we use the existing checkout directly.

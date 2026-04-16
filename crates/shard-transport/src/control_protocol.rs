@@ -3,10 +3,11 @@
 //! Uses the same wire format as the session protocol: `[u32 len][u8 type][payload]`.
 //! Type bytes are in the `0x80+` range to avoid collision with session frame types.
 
+use shard_core::state::{RepoState, WorkspaceHealth, WorkspaceStatus};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current control protocol version. Bumped on breaking wire changes.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Well-known named pipe address for the daemon control channel.
 #[cfg(windows)]
@@ -67,6 +68,36 @@ pub enum ControlFrame {
     /// Daemon → Client: shutdown acknowledged.
     ShutdownAck,
 
+    // --- State Subscription ---
+    /// Client → Daemon: switch this connection into long-lived subscribe
+    /// mode. The daemon will start pushing `StateSnapshot` frames (one per
+    /// repo) and stop accepting request/response frames on this connection.
+    /// Sent once, after `Hello`/`HelloAck`. Closing the pipe is the only way
+    /// to unsubscribe — there is no explicit Unsubscribe frame.
+    Subscribe,
+
+    /// Daemon → Client: full per-repo state snapshot. Carries the complete
+    /// WorkspaceStatus set for one repo, tagged with a monotonic version.
+    /// Snapshots are idempotent — subscribers may safely drop or reorder
+    /// them; the latest version wins.
+    StateSnapshot { state: RepoState },
+
+    /// Daemon → Client: one or more sessions in this repo just transitioned
+    /// to a terminal status in the DB (the daemon's `fast_tick` detected a
+    /// dead supervisor PID and marked the row `exited`). Payload is just the
+    /// affected repo alias — the client's job is to re-query the sessions
+    /// table for that repo. Fire-and-forget; no reply.
+    SessionsChanged { repo: String },
+
+    /// Client → Daemon: one-shot poke telling the daemon that the repo /
+    /// workspace topology has changed (add/remove) and it should reload its
+    /// in-memory set and adjust watchers. `repo_alias = None` requests a
+    /// full reload; `Some(alias)` scopes the reload to one repo.
+    ///
+    /// Sent by Tauri commands after DB mutations commit. Fire-and-forget:
+    /// the daemon does not reply.
+    TopologyChanged { repo_alias: Option<String> },
+
     // --- Errors ---
     /// Daemon → Client: request failed.
     Error { message: String },
@@ -95,7 +126,11 @@ const TYPE_LIST_SESSIONS: u8 = 0x88;
 const TYPE_SESSION_LIST: u8 = 0x89;
 const TYPE_SHUTDOWN: u8 = 0x8A;
 const TYPE_SHUTDOWN_ACK: u8 = 0x8B;
+const TYPE_SUBSCRIBE: u8 = 0x8C;
+const TYPE_STATE_SNAPSHOT: u8 = 0x8D;
+const TYPE_TOPOLOGY_CHANGED: u8 = 0x8E;
 const TYPE_ERROR: u8 = 0x8F;
+const TYPE_SESSIONS_CHANGED: u8 = 0x90;
 
 /// Write a control frame to an async writer.
 pub async fn write_control_frame<W: AsyncWrite + Unpin>(
@@ -173,6 +208,38 @@ pub async fn write_control_frame<W: AsyncWrite + Unpin>(
             TYPE_SHUTDOWN
         }
         ControlFrame::ShutdownAck => TYPE_SHUTDOWN_ACK,
+        ControlFrame::Subscribe => TYPE_SUBSCRIBE,
+        ControlFrame::StateSnapshot { state } => {
+            write_str(&mut payload, &state.repo_alias);
+            payload.extend_from_slice(&state.version.to_be_bytes());
+
+            // Workspaces — sort for deterministic encoding so roundtrip tests
+            // are stable. Order is not semantically meaningful: consumers
+            // diff against a map.
+            let mut ws: Vec<(&String, &WorkspaceStatus)> = state.workspaces.iter().collect();
+            ws.sort_by(|a, b| a.0.cmp(b.0));
+            payload.extend_from_slice(&(ws.len() as u32).to_be_bytes());
+            for (name, status) in ws {
+                write_str(&mut payload, name);
+                write_workspace_status(&mut payload, status);
+            }
+
+            TYPE_STATE_SNAPSHOT
+        }
+        ControlFrame::TopologyChanged { repo_alias } => {
+            match repo_alias {
+                Some(alias) => {
+                    payload.push(1);
+                    write_str(&mut payload, alias);
+                }
+                None => payload.push(0),
+            }
+            TYPE_TOPOLOGY_CHANGED
+        }
+        ControlFrame::SessionsChanged { repo } => {
+            write_str(&mut payload, repo);
+            TYPE_SESSIONS_CHANGED
+        }
         ControlFrame::Error { message } => {
             write_str(&mut payload, message);
             TYPE_ERROR
@@ -318,6 +385,53 @@ pub async fn read_control_frame<R: AsyncRead + Unpin>(
             ControlFrame::Shutdown { graceful }
         }
         TYPE_SHUTDOWN_ACK => ControlFrame::ShutdownAck,
+        TYPE_SUBSCRIBE => ControlFrame::Subscribe,
+        TYPE_STATE_SNAPSHOT => {
+            let mut offset = 0;
+            let (repo_alias, n) = read_str(&payload[offset..])?;
+            offset += n;
+
+            ensure_len(&payload[offset..], 8, "StateSnapshot version")?;
+            let version =
+                u64::from_be_bytes(payload[offset..offset + 8].try_into().unwrap());
+            offset += 8;
+
+            ensure_len(&payload[offset..], 4, "StateSnapshot ws count")?;
+            let ws_count =
+                u32::from_be_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+
+            let mut workspaces = std::collections::HashMap::with_capacity(ws_count);
+            for _ in 0..ws_count {
+                let (name, n) = read_str(&payload[offset..])?;
+                offset += n;
+                let (status, n) = read_workspace_status(&payload[offset..])?;
+                offset += n;
+                workspaces.insert(name, status);
+            }
+
+            ControlFrame::StateSnapshot {
+                state: RepoState {
+                    repo_alias,
+                    version,
+                    workspaces,
+                },
+            }
+        }
+        TYPE_TOPOLOGY_CHANGED => {
+            ensure_len(payload, 1, "TopologyChanged tag")?;
+            let repo_alias = if payload[0] == 1 {
+                let (alias, _) = read_str(&payload[1..])?;
+                Some(alias)
+            } else {
+                None
+            };
+            ControlFrame::TopologyChanged { repo_alias }
+        }
+        TYPE_SESSIONS_CHANGED => {
+            let (repo, _) = read_str(payload)?;
+            ControlFrame::SessionsChanged { repo }
+        }
         TYPE_ERROR => {
             let (message, _) = read_str(payload)?;
             ControlFrame::Error { message }
@@ -331,6 +445,88 @@ pub async fn read_control_frame<R: AsyncRead + Unpin>(
     };
 
     Ok(Some(frame))
+}
+
+// --- WorkspaceStatus wire encoding ---
+//
+// Layout: [branch_tag u8][branch_str?][sha_tag u8][sha_str?][detached u8][health u8]
+
+const HEALTH_HEALTHY: u8 = 0;
+const HEALTH_MISSING: u8 = 1;
+const HEALTH_BROKEN: u8 = 2;
+
+fn write_workspace_status(buf: &mut Vec<u8>, status: &WorkspaceStatus) {
+    match &status.current_branch {
+        Some(b) => {
+            buf.push(1);
+            write_str(buf, b);
+        }
+        None => buf.push(0),
+    }
+    match &status.head_sha {
+        Some(s) => {
+            buf.push(1);
+            write_str(buf, s);
+        }
+        None => buf.push(0),
+    }
+    buf.push(if status.detached { 1 } else { 0 });
+    buf.push(match status.health {
+        WorkspaceHealth::Healthy => HEALTH_HEALTHY,
+        WorkspaceHealth::Missing => HEALTH_MISSING,
+        WorkspaceHealth::Broken => HEALTH_BROKEN,
+    });
+}
+
+fn read_workspace_status(buf: &[u8]) -> std::io::Result<(WorkspaceStatus, usize)> {
+    let mut offset = 0;
+    ensure_len(&buf[offset..], 1, "WorkspaceStatus branch tag")?;
+    let branch = if buf[offset] == 1 {
+        offset += 1;
+        let (s, n) = read_str(&buf[offset..])?;
+        offset += n;
+        Some(s)
+    } else {
+        offset += 1;
+        None
+    };
+
+    ensure_len(&buf[offset..], 1, "WorkspaceStatus sha tag")?;
+    let sha = if buf[offset] == 1 {
+        offset += 1;
+        let (s, n) = read_str(&buf[offset..])?;
+        offset += n;
+        Some(s)
+    } else {
+        offset += 1;
+        None
+    };
+
+    ensure_len(&buf[offset..], 2, "WorkspaceStatus detached + health")?;
+    let detached = buf[offset] == 1;
+    offset += 1;
+    let health = match buf[offset] {
+        HEALTH_HEALTHY => WorkspaceHealth::Healthy,
+        HEALTH_MISSING => WorkspaceHealth::Missing,
+        HEALTH_BROKEN => WorkspaceHealth::Broken,
+        other => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown WorkspaceHealth code: {other}"),
+            ))
+        }
+    };
+    offset += 1;
+
+    Ok((
+        WorkspaceStatus {
+            current_branch: branch,
+            head_sha: sha,
+            detached,
+            health,
+        },
+        offset,
+    ))
 }
 
 // --- Helpers for length-prefixed string encoding ---
@@ -508,5 +704,76 @@ mod tests {
     async fn read_eof_returns_none() {
         let mut cursor = std::io::Cursor::new(Vec::new());
         assert!(read_control_frame(&mut cursor).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn roundtrip_subscribe() {
+        assert_eq!(
+            roundtrip(ControlFrame::Subscribe).await,
+            ControlFrame::Subscribe
+        );
+    }
+
+    #[tokio::test]
+    async fn roundtrip_topology_changed() {
+        let f1 = ControlFrame::TopologyChanged { repo_alias: None };
+        assert_eq!(roundtrip(f1.clone()).await, f1);
+
+        let f2 = ControlFrame::TopologyChanged {
+            repo_alias: Some("my-repo".to_string()),
+        };
+        assert_eq!(roundtrip(f2.clone()).await, f2);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_sessions_changed() {
+        let f = ControlFrame::SessionsChanged {
+            repo: "my-repo".to_string(),
+        };
+        assert_eq!(roundtrip(f.clone()).await, f);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_state_snapshot_full() {
+        let mut state = RepoState::new("my-repo");
+        state.version = 42;
+        state.workspaces.insert(
+            "main".to_string(),
+            WorkspaceStatus {
+                current_branch: Some("main".to_string()),
+                head_sha: Some("abc123def4567890abc123def4567890abc12345".to_string()),
+                detached: false,
+                health: WorkspaceHealth::Healthy,
+            },
+        );
+        state.workspaces.insert(
+            "feature".to_string(),
+            WorkspaceStatus {
+                current_branch: None,
+                head_sha: Some("def4567890abc123def4567890abc123def45678".to_string()),
+                detached: true,
+                health: WorkspaceHealth::Broken,
+            },
+        );
+        state.workspaces.insert(
+            "stale".to_string(),
+            WorkspaceStatus {
+                current_branch: None,
+                head_sha: None,
+                detached: false,
+                health: WorkspaceHealth::Missing,
+            },
+        );
+        let frame = ControlFrame::StateSnapshot {
+            state: state.clone(),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_state_snapshot_empty() {
+        let state = RepoState::new("empty-repo");
+        let frame = ControlFrame::StateSnapshot { state };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
     }
 }

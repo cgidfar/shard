@@ -13,12 +13,26 @@ export interface Repository {
   created_at: number;
 }
 
+export type WorkspaceHealth = "healthy" | "missing" | "broken";
+
+export interface WorkspaceStatus {
+  current_branch: string | null;
+  head_sha: string | null;
+  detached: boolean;
+  health: WorkspaceHealth;
+}
+
 export interface Workspace {
   name: string;
+  /** @deprecated Branch stored in SQLite — a stale snapshot from workspace
+   *  creation. Use `status.current_branch` for the live value. */
   branch: string;
   path: string;
   is_base: boolean;
   created_at: number;
+  /** Live-state overlay supplied by the daemon WorkspaceMonitor. `null`
+   *  when the monitor has not yet reported a snapshot for this repo. */
+  status: WorkspaceStatus | null;
 }
 
 export type Harness = "claude-code" | "codex";

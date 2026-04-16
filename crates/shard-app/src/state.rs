@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use shard_core::state::RepoState;
 use tokio::io::WriteHalf;
 use tokio::net::windows::named_pipe::NamedPipeClient;
 use tokio::sync::Mutex;
@@ -32,12 +33,18 @@ impl SessionConnection {
 
 pub struct AppState {
     pub connections: Mutex<HashMap<String, SessionConnection>>,
+    /// Last-known `RepoState` per alias, populated by the daemon-subscribe
+    /// task in `daemon_ipc::run_state_subscriber`. Read by
+    /// `list_workspaces` to enrich the workspace list with live status
+    /// without doing another daemon round-trip.
+    pub repo_states: Mutex<HashMap<String, RepoState>>,
 }
 
 impl AppState {
     pub fn new() -> Self {
         Self {
             connections: Mutex::new(HashMap::new()),
+            repo_states: Mutex::new(HashMap::new()),
         }
     }
 }
