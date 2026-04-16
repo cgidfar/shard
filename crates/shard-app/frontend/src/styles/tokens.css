@@ -33,35 +33,35 @@
   --fw-medium: 500;
   --fw-semibold: 600;
 
-  /* Colors — Desert Dusk */
-  --bg-surface: #0f0d0a;
-  --bg-secondary: #161310;
-  --bg-primary: #1e1a15;
-  --bg-elevated: #23201a;
+  /* Colors — Gunmetal Rose */
+  --bg-surface: #0b0c0f;
+  --bg-secondary: #121316;
+  --bg-primary: #1a1c20;
+  --bg-elevated: #23252a;
 
   /* Interaction overlays — layer on any bg */
-  --bg-hover: rgba(232, 221, 208, 0.045);
-  --bg-selected: rgba(232, 149, 106, 0.09);
-  --bg-pressed: rgba(232, 221, 208, 0.08);
+  --bg-hover: rgba(211, 215, 222, 0.045);
+  --bg-selected: rgba(196, 117, 138, 0.09);
+  --bg-pressed: rgba(211, 215, 222, 0.08);
 
-  --border-subtle: #241f19;
-  --border: #302820;
-  --border-strong: #3d3327;
+  --border-subtle: #1e1f24;
+  --border: #292b30;
+  --border-strong: #3a3d44;
 
-  --text-faint: #4a3f35;
-  --text-muted: #6b5d4f;
-  --text-secondary: #b0a08c;
-  --text-primary: #e8ddd0;
+  --text-faint: #3a3d44;
+  --text-muted: #51555e;
+  --text-secondary: #9296a0;
+  --text-primary: #d3d7de;
 
-  --accent: #e8956a;
-  --accent-hover: #f0a57e;
-  --accent-soft: rgba(232, 149, 106, 0.14);
+  --accent: #c4758a;
+  --accent-hover: #d48aa0;
+  --accent-soft: rgba(196, 117, 138, 0.14);
 
   /* Status */
-  --success: #a3d977;
-  --warning: #f0c75e;
-  --danger: #e06c75;
-  --danger-bg: #2a1812;
+  --success: #4aba78;
+  --warning: #d4a444;
+  --danger: #d44e4e;
+  --danger-bg: #2a1419;
 
   /* Spacing (4px base) */
   --space-1: 4px;
@@ -82,14 +82,14 @@
 
   /* Elevation */
   --shadow-inset:
-    inset 0 1px 0 rgba(255, 246, 232, 0.03),
+    inset 0 1px 0 rgba(255, 255, 255, 0.03),
     inset 0 2px 14px rgba(0, 0, 0, 0.45);
   --shadow-pop:
     0 10px 28px rgba(0, 0, 0, 0.5),
     0 2px 6px rgba(0, 0, 0, 0.25);
   --shadow-dialog:
     0 28px 72px rgba(0, 0, 0, 0.65),
-    0 0 0 1px rgba(255, 246, 232, 0.03);
+    0 0 0 1px rgba(255, 255, 255, 0.03);
 
   /* Transitions */
   --transition-fast: 120ms ease;

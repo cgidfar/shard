@@ -121,7 +121,31 @@ const palettes: Record<string, ColorStop[]> = {
     [0.95, [62, 30, 38]],    // dark burgundy
     [1.00, [20, 10, 14]],    // near-black wine
   ],
+  // Gunmetal Rose: pink-cream center → dusty rose accent → cool gunmetal edge.
+  // Passes through the UI accent color #c4758a at t≈0.44.
+  rose: [
+    [0.00, [252, 232, 228]], // warm cream with pink tint
+    [0.13, [240, 200, 200]], // soft blush
+    [0.28, [220, 160, 168]], // light rose
+    [0.44, [196, 117, 138]], // dusty rose — accent #c4758a
+    [0.60, [148, 82, 108]],  // deep mauve
+    [0.76, [88, 52, 72]],    // dark plum
+    [0.90, [36, 26, 34]],    // near-black with rose tint
+    [1.00, [11, 12, 15]],    // gunmetal black — surface #0b0c0f
+  ],
 };
+
+// Chrome colors for the SVG frame — backing disc, outer stroke, glow tint.
+// Warm palettes use the original dark-brown chrome; cool palettes get matched.
+interface ChromeColors { disc: string; stroke: string; glow: string }
+const paletteChrome: Record<string, ChromeColors> = {
+  rose:     { disc: "#08090c", stroke: "#292b30", glow: "#fff0f2" },
+};
+const defaultChrome: ChromeColors = { disc: "#080604", stroke: "#2a1a14", glow: "#fff8ee" };
+
+function getChromeColors(paletteName: string): ChromeColors {
+  return paletteChrome[paletteName] ?? defaultChrome;
+}
 
 function interpolatePalette(palette: ColorStop[], t: number): string {
   const c = Math.max(0, Math.min(1, t));
@@ -174,6 +198,7 @@ interface Params {
   angleJitter: number;   // 0..1, fraction of slot width
   radiusJitter: number;  // px
   dropRings: number;     // drop the N outermost rings (jagged edge); 0 = smooth
+  fade: number;          // 0..1, how far through the palette the edge reaches
 }
 
 function defaultParams(seed: number, overrides: Partial<Params> = {}): Params {
@@ -192,6 +217,7 @@ function defaultParams(seed: number, overrides: Partial<Params> = {}): Params {
     angleJitter: 0.55,
     radiusJitter: 14,
     dropRings: 0,
+    fade: 1.0,
     ...overrides,
   };
 }
@@ -275,6 +301,7 @@ function generateIcon(p: Params): { svg: string; cellCount: number } {
   const voronoi = delaunay.voronoi([-size, -size, size * 2, size * 2]);
 
   const palette = palettes[p.palette] ?? palettes.sunset;
+  const chrome = getChromeColors(p.palette);
 
   // When dropRings > 0 we drop the smooth disc, clip, and outer stroke
   // entirely so the icon ends with the natural cell-edge silhouette.
@@ -306,7 +333,7 @@ function generateIcon(p: Params): { svg: string; cellCount: number } {
 
     const shrunk = shrinkTowardPoint(verts, sx, sy, shrink / 2);
 
-    const color = interpolatePalette(palette, tDist);
+    const color = interpolatePalette(palette, tDist * p.fade);
 
     const pts = shrunk
       .map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`)
@@ -321,21 +348,21 @@ function generateIcon(p: Params): { svg: string; cellCount: number } {
   const defs = jagged
     ? `  <defs>
     <radialGradient id="glow" cx="50%" cy="50%" r="18%">
-      <stop offset="0%" stop-color="#fff8ee" stop-opacity="0.35"/>
-      <stop offset="100%" stop-color="#fff8ee" stop-opacity="0"/>
+      <stop offset="0%" stop-color="${chrome.glow}" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="${chrome.glow}" stop-opacity="0"/>
     </radialGradient>
   </defs>`
     : `  <defs>
     <clipPath id="d"><circle cx="${cx}" cy="${cy}" r="${discR}"/></clipPath>
     <radialGradient id="glow" cx="50%" cy="50%" r="18%">
-      <stop offset="0%" stop-color="#fff8ee" stop-opacity="0.35"/>
-      <stop offset="100%" stop-color="#fff8ee" stop-opacity="0"/>
+      <stop offset="0%" stop-color="${chrome.glow}" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="${chrome.glow}" stop-opacity="0"/>
     </radialGradient>
   </defs>`;
 
   const backing = jagged
     ? ""
-    : `  <circle cx="${cx}" cy="${cy}" r="${discR + 4}" fill="#080604"/>\n`;
+    : `  <circle cx="${cx}" cy="${cy}" r="${discR + 4}" fill="${chrome.disc}"/>\n`;
 
   const cellsGroup = jagged
     ? `  <g>\n${polyStrs.join("\n")}\n  </g>`
@@ -343,7 +370,7 @@ function generateIcon(p: Params): { svg: string; cellCount: number } {
 
   const outerRing = jagged
     ? ""
-    : `  <circle cx="${cx}" cy="${cy}" r="${discR}" fill="none" stroke="#2a1a14" stroke-width="2"/>\n`;
+    : `  <circle cx="${cx}" cy="${cy}" r="${discR}" fill="none" stroke="${chrome.stroke}" stroke-width="2"/>\n`;
 
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size} ${size}" width="${size}" height="${size}">
 ${defs}
@@ -371,6 +398,7 @@ interface CliArgs {
   radiusJitter: number;
   angleJitter: number;
   dropRings: number;
+  fade: number;
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -388,6 +416,7 @@ function parseArgs(argv: string[]): CliArgs {
     radiusJitter: 14,
     angleJitter: 0.55,
     dropRings: 0,
+    fade: 1.0,
   };
 
   for (let i = 2; i < argv.length; i++) {
@@ -408,6 +437,7 @@ function parseArgs(argv: string[]): CliArgs {
       case "--radius-jitter": out.radiusJitter = parseFloat(next()); break;
       case "--angle-jitter": out.angleJitter = parseFloat(next()); break;
       case "--drop-rings": out.dropRings = parseInt(next(), 10); break;
+      case "--fade": out.fade = parseFloat(next()); break;
       case "--help":
       case "-h":
         printHelp();
@@ -431,7 +461,7 @@ Options:
   --count N           Number of variants to generate (default 20)
   --out DIR           Output directory (default: runs/<timestamp>_<params>/)
   --palette NAME      sunset | ember | desert | volcano | twilight | dusk
-                      | amethyst | cinder (default sunset)
+                      | amethyst | cinder | rose (default sunset)
   --rings N           Number of concentric rings of seeds (default 5)
   --base N            Points in innermost ring (default 6; alias: --base-points)
   --density X         Each ring has density^i times more points (default 1.55)
@@ -444,6 +474,9 @@ Options:
                       stroke, leaving a jagged silhouette (default 0 = smooth).
                       Pair with a higher --rings if you want to keep the icon's
                       visual size, e.g. --rings 6 --drop-rings 1.
+  --fade F            0..1, how far through the palette the edge reaches
+                      (default 1.0). Lower = lighter edges. 0.6 stops at
+                      deep mauve, 0.4 stays near the accent color.
 `);
 }
 
@@ -477,6 +510,19 @@ function writeGallery(
     ...(args.dropRings > 0 ? [`drop=${args.dropRings}`] : []),
   ].join(" · ");
 
+  // Gallery chrome matches the palette family — warm for warm, cool for cool.
+  const isRose = args.palette === "rose";
+  const g = {
+    bg:       isRose ? "#0b0c0f" : "#0f0d0a",
+    text:     isRose ? "#d3d7de" : "#e8ddd0",
+    accent:   isRose ? "#c4758a" : "#e8956a",
+    muted:    isRose ? "#9296a0" : "#b0a08c",
+    cardBg:   isRose ? "#121316" : "#161310",
+    border:   isRose ? "#292b30" : "#302820",
+    dim:      isRose ? "#51555e" : "#6b5d4f",
+    label:    isRose ? "#d4a0b0" : "#f0a57e",
+  };
+
   const html = `<!DOCTYPE html>
 <html>
 <head>
@@ -484,15 +530,15 @@ function writeGallery(
   <title>Shard — Generated Icon Variants</title>
   <style>
     body {
-      background: #0f0d0a;
-      color: #e8ddd0;
+      background: ${g.bg};
+      color: ${g.text};
       font-family: system-ui, -apple-system, sans-serif;
       margin: 0;
       padding: 32px 40px;
     }
-    h1 { color: #e8956a; margin: 0 0 8px; font-size: 22px; }
+    h1 { color: ${g.accent}; margin: 0 0 8px; font-size: 22px; }
     .params {
-      color: #b0a08c;
+      color: ${g.muted};
       font-family: ui-monospace, "Cascadia Mono", monospace;
       font-size: 12px;
       margin-bottom: 24px;
@@ -503,14 +549,14 @@ function writeGallery(
       gap: 20px;
     }
     .card {
-      background: #161310;
-      border: 1px solid #302820;
+      background: ${g.cardBg};
+      border: 1px solid ${g.border};
       border-radius: 8px;
       padding: 12px;
       text-align: center;
       transition: transform 0.1s;
     }
-    .card:hover { transform: scale(1.03); border-color: #e8956a; }
+    .card:hover { transform: scale(1.03); border-color: ${g.accent}; }
     .card .previews {
       display: flex;
       align-items: flex-end;
@@ -527,17 +573,17 @@ function writeGallery(
       width: 32px;
       height: 32px;
       display: block;
-      border: 1px solid #302820;
+      border: 1px solid ${g.border};
       background: #000;
     }
     .card .label {
-      color: #f0a57e;
+      color: ${g.label};
       font-family: ui-monospace, "Cascadia Mono", monospace;
       font-size: 13px;
       margin-top: 8px;
     }
     .card .sub {
-      color: #6b5d4f;
+      color: ${g.dim};
       font-family: ui-monospace, "Cascadia Mono", monospace;
       font-size: 11px;
     }
@@ -577,7 +623,8 @@ function makeAutoDirName(args: CliArgs): string {
   // Compact param summary — palette, rings, base, density, gap range, curve.
   // Format: 20260411-143022_sunset_r5b6_d1.55_g1.5-9_quad[_drop1]
   const dropPart = args.dropRings > 0 ? `_drop${args.dropRings}` : "";
-  return `${ts}_${args.palette}_r${args.rings}b${args.basePoints}_d${args.density}_g${args.gapMin}-${args.gapMax}_${args.gapCurve}${dropPart}`;
+  const fadePart = args.fade < 1.0 ? `_f${args.fade}` : "";
+  return `${ts}_${args.palette}_r${args.rings}b${args.basePoints}_d${args.density}_g${args.gapMin}-${args.gapMax}_${args.gapCurve}${dropPart}${fadePart}`;
 }
 
 // ───────────────────────── Main ─────────────────────────
@@ -617,6 +664,7 @@ function main() {
       radiusJitter: args.radiusJitter,
       angleJitter: args.angleJitter,
       dropRings: args.dropRings,
+      fade: args.fade,
     });
 
     const { svg, cellCount } = generateIcon(params);
@@ -646,6 +694,7 @@ function main() {
       radiusJitter: args.radiusJitter,
       angleJitter: args.angleJitter,
       dropRings: args.dropRings,
+      fade: args.fade,
     },
   };
   writeFileSync(join(outDir, "params.json"), JSON.stringify(paramsJson, null, 2));

@@ -309,11 +309,11 @@ input {
 }
 
 .tree-group-ws > .tree-label-wrap > .tree-label.ws-broken {
-  color: #f0b450;
+  color: var(--warning);
 }
 
 .tree-group-ws > .tree-label-wrap > .tree-label.ws-missing {
-  color: #ff7070;
+  color: var(--danger);
   text-decoration: line-through;
   text-decoration-thickness: 1px;
 }
@@ -651,7 +651,7 @@ input {
   font-family: var(--font-sans);
   cursor: pointer;
   box-shadow:
-    0 2px 10px rgba(232, 149, 106, 0.22),
+    0 2px 10px rgba(196, 117, 138, 0.22),
     inset 0 1px 0 rgba(255, 255, 255, 0.15);
   transition: background var(--transition-fast), transform var(--transition-fast);
 }
@@ -687,7 +687,7 @@ input {
 .dialog-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(15, 13, 10, 0.72);
+  background: rgba(11, 12, 15, 0.72);
   backdrop-filter: blur(6px);
   display: flex;
   align-items: center;
