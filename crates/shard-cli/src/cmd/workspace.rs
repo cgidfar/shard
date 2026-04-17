@@ -1,4 +1,4 @@
-use shard_core::workspaces::WorkspaceStore;
+use shard_core::workspaces::{WorkspaceMode, WorkspaceStore};
 use shard_core::ShardPaths;
 
 use crate::opts::{parse_target, WorkspaceCommands};
@@ -9,7 +9,13 @@ pub fn run(command: WorkspaceCommands) -> shard_core::Result<()> {
 
     match command {
         WorkspaceCommands::Create { repo, name, branch } => {
-            let ws = store.create(&repo, name.as_deref(), branch.as_deref(), false)?;
+            let ws = store.create(
+                &repo,
+                name.as_deref(),
+                WorkspaceMode::NewBranch,
+                branch.as_deref(),
+                false,
+            )?;
             println!("Created workspace '{}:{}' on branch '{}'", repo, ws.name, ws.branch);
             println!("  Path: {}", ws.path);
         }

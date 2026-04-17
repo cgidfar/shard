@@ -1,5 +1,5 @@
 use shard_core::state::WorkspaceStatus;
-use shard_core::workspaces::{Workspace, WorkspaceStore};
+use shard_core::workspaces::{BranchInfo, Workspace, WorkspaceMode, WorkspaceStore};
 use shard_core::ShardPaths;
 use tauri::{Emitter, Manager};
 
@@ -49,15 +49,22 @@ pub fn create_workspace(
     app: tauri::AppHandle,
     repo: String,
     name: Option<String>,
+    mode: WorkspaceMode,
     branch: Option<String>,
 ) -> Result<Workspace, String> {
     let store = WorkspaceStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
     let ws = store
-        .create(&repo, name.as_deref(), branch.as_deref(), false)
+        .create(&repo, name.as_deref(), mode, branch.as_deref(), false)
         .map_err(|e| e.to_string())?;
     spawn_topology_poke(Some(repo));
     let _ = app.emit("sidebar-changed", ());
     Ok(ws)
+}
+
+#[tauri::command]
+pub fn list_repo_branches(repo: String) -> Result<Vec<BranchInfo>, String> {
+    let store = WorkspaceStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
+    store.list_branch_info(&repo).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

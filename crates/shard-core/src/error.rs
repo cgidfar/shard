@@ -14,6 +14,9 @@ pub enum ShardError {
     #[error("workspace already exists: {0}")]
     WorkspaceAlreadyExists(String),
 
+    #[error("branch '{branch}' is already checked out in workspace '{workspace}'")]
+    BranchAlreadyCheckedOut { branch: String, workspace: String },
+
     #[error("session not found: {0}")]
     SessionNotFound(String),
 

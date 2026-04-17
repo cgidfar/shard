@@ -35,6 +35,14 @@ export interface Workspace {
   status: WorkspaceStatus | null;
 }
 
+export interface BranchInfo {
+  name: string;
+  is_head: boolean;
+  checked_out_by: string | null;
+}
+
+export type WorkspaceMode = "new_branch" | "existing_branch";
+
 export type Harness = "claude-code" | "codex";
 
 export interface Session {
@@ -84,18 +92,24 @@ export function listWorkspaces(repo: string): Promise<Workspace[]> {
 
 export function createWorkspace(
   repo: string,
-  name?: string,
-  branch?: string
+  name: string | undefined,
+  mode: WorkspaceMode,
+  branch: string | undefined,
 ): Promise<Workspace> {
   return invoke("create_workspace", {
     repo,
     name: name ?? null,
+    mode,
     branch: branch ?? null,
   });
 }
 
 export function removeWorkspace(repo: string, name: string): Promise<void> {
   return invoke("remove_workspace", { repo, name });
+}
+
+export function listRepoBranches(repo: string): Promise<BranchInfo[]> {
+  return invoke("list_repo_branches", { repo });
 }
 
 // --- Session ---

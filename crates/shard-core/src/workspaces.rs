@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::params;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::db;
 use crate::git;
@@ -18,6 +18,31 @@ pub struct Workspace {
     pub created_at: u64,
 }
 
+/// How a workspace obtains its branch.
+///
+/// `NewBranch` creates a fresh branch based on `branch` (the base) and checks
+/// it out in a new worktree. `ExistingBranch` checks out an existing branch
+/// in a new worktree; it will fail with `ShardError::BranchAlreadyCheckedOut`
+/// if the branch is already HEAD of another live worktree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceMode {
+    NewBranch,
+    ExistingBranch,
+}
+
+/// A branch in the repo source, enriched with worktree occupancy info.
+///
+/// Surfaces to the frontend so the new-workspace wizard can pick a base
+/// branch (mode = NewBranch) or pick an existing branch to check out
+/// (mode = ExistingBranch) and warn when that branch is already claimed.
+#[derive(Debug, Clone, Serialize)]
+pub struct BranchInfo {
+    pub name: String,
+    pub is_head: bool,
+    pub checked_out_by: Option<String>,
+}
+
 pub struct WorkspaceStore {
     paths: ShardPaths,
 }
@@ -29,15 +54,21 @@ impl WorkspaceStore {
 
     /// Create a new workspace for a repo.
     ///
-    /// If `is_base` is true, the workspace points to the original checkout
-    /// (no git worktree created). Otherwise a git worktree is created.
+    /// `is_base` means the workspace points to the original checkout
+    /// (no git worktree created, `branch` is ignored). Otherwise a git
+    /// worktree is created.
     ///
-    /// If a custom name is given AND it differs from the branch, a new git branch
-    /// is created with that name (based on the source branch).
+    /// For non-base workspaces, `mode` picks the branch semantics:
+    /// - `NewBranch`: `branch` is the base to fork from (defaults to HEAD).
+    ///   The workspace name becomes the new branch name.
+    /// - `ExistingBranch`: `branch` is the existing branch to check out.
+    ///   Fails with `BranchAlreadyCheckedOut` if that branch is already
+    ///   HEAD of another live worktree.
     pub fn create(
         &self,
         repo_alias: &str,
         name: Option<&str>,
+        mode: WorkspaceMode,
         branch: Option<&str>,
         is_base: bool,
     ) -> Result<Workspace> {
@@ -49,23 +80,47 @@ impl WorkspaceStore {
             repo.local_path.as_deref(),
         );
 
-        // Determine base branch
-        let base_branch = match branch {
-            Some(b) => b.to_string(),
-            None => git::default_branch(&source_dir)?,
+        let default_branch =
+            || git::default_branch(&source_dir);
+
+        let (branch_for_db, base_branch, new_branch) = if is_base {
+            // is_base ignores mode; branch_for_db = current HEAD.
+            let head = default_branch()?;
+            (head.clone(), head, None)
+        } else {
+            match mode {
+                WorkspaceMode::NewBranch => {
+                    let base = match branch {
+                        Some(b) => b.to_string(),
+                        None => default_branch()?,
+                    };
+                    let ws_name = match name {
+                        Some(n) => n.to_string(),
+                        None => base.clone(),
+                    };
+                    // If the requested name matches the base, reuse it
+                    // (no new branch) — preserves prior behavior where
+                    // "new workspace on <branch>" meant "check out <branch>".
+                    if ws_name == base {
+                        (base.clone(), base, None)
+                    } else {
+                        (ws_name.clone(), base, Some(ws_name))
+                    }
+                }
+                WorkspaceMode::ExistingBranch => {
+                    let target = branch.ok_or_else(|| {
+                        ShardError::Other(
+                            "existing_branch mode requires a branch name".into(),
+                        )
+                    })?;
+                    (target.to_string(), target.to_string(), None)
+                }
+            }
         };
 
-        // Determine workspace name
         let ws_name = match name {
             Some(n) => n.to_string(),
-            None => base_branch.clone(),
-        };
-
-        // If the workspace name differs from the branch, create a new branch.
-        let (branch_for_db, new_branch) = if ws_name != base_branch {
-            (ws_name.clone(), Some(ws_name.clone()))
-        } else {
-            (base_branch.clone(), None)
+            None => branch_for_db.clone(),
         };
 
         // Check for duplicates in DB
@@ -79,6 +134,24 @@ impl WorkspaceStore {
         )?;
         if exists {
             return Err(ShardError::WorkspaceAlreadyExists(ws_name));
+        }
+
+        // Pre-flight: any path that checks out an existing branch (either
+        // ExistingBranch mode, or NewBranch where name matches an existing
+        // branch) must not collide with another live worktree. Git would
+        // reject the `worktree add` with a generic error; we front-run it
+        // to surface the owning workspace name.
+        if !is_base && new_branch.is_none() {
+            if let Some(owner) = self.worktree_owning_branch(
+                repo_alias,
+                &source_dir,
+                &branch_for_db,
+            )? {
+                return Err(ShardError::BranchAlreadyCheckedOut {
+                    branch: branch_for_db,
+                    workspace: owner,
+                });
+            }
         }
 
         let ws_dir = if is_base {
@@ -129,6 +202,91 @@ impl WorkspaceStore {
             is_base,
             created_at: now,
         })
+    }
+
+    /// List branches in the repo source, marking which is HEAD and which
+    /// are already checked out in a live worktree.
+    ///
+    /// Cross-references `git worktree list --porcelain` with the DB's
+    /// workspace rows so each occupied branch is labeled with the
+    /// workspace name rather than a raw path.
+    pub fn list_branch_info(&self, repo_alias: &str) -> Result<Vec<BranchInfo>> {
+        let repo_store = RepositoryStore::new(ShardPaths::new()?);
+        let repo = repo_store.get(repo_alias)?;
+        let source_dir = self.paths.repo_source_for_repo(
+            repo_alias,
+            repo.local_path.as_deref(),
+        );
+
+        let branches = match git::list_branches(&source_dir) {
+            Ok(b) => b,
+            Err(_) => Vec::new(),
+        };
+        let head = git::default_branch(&source_dir).ok();
+
+        let workspaces = self.list(repo_alias).unwrap_or_default();
+        let path_to_workspace: std::collections::HashMap<String, String> = workspaces
+            .iter()
+            .map(|ws| (normalize_worktree_path(std::path::Path::new(&ws.path)), ws.name.clone()))
+            .collect();
+
+        let mut branch_to_workspace: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        if let Ok(entries) = git::worktree_list_porcelain(&source_dir) {
+            for entry in entries {
+                if entry.prunable || entry.detached {
+                    continue;
+                }
+                let (Some(branch), key) = (entry.branch.clone(), normalize_worktree_path(&entry.path))
+                else {
+                    continue;
+                };
+                let label = path_to_workspace
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| external_worktree_label(&entry.path));
+                branch_to_workspace.insert(branch, label);
+            }
+        }
+
+        Ok(branches
+            .into_iter()
+            .map(|name| {
+                let is_head = head.as_deref() == Some(name.as_str());
+                let checked_out_by = branch_to_workspace.get(&name).cloned();
+                BranchInfo {
+                    name,
+                    is_head,
+                    checked_out_by,
+                }
+            })
+            .collect())
+    }
+
+    /// If `branch` is currently HEAD of a live (non-detached, non-prunable)
+    /// worktree, return a label identifying it — the Shard workspace name
+    /// if the worktree is managed, otherwise a descriptive marker so the
+    /// caller can still refuse to duplicate the checkout.
+    fn worktree_owning_branch(
+        &self,
+        repo_alias: &str,
+        source_dir: &std::path::Path,
+        branch: &str,
+    ) -> Result<Option<String>> {
+        let entries = git::worktree_list_porcelain(source_dir)?;
+        let match_entry = entries
+            .iter()
+            .find(|e| !e.prunable && !e.detached && e.branch.as_deref() == Some(branch));
+        let Some(entry) = match_entry else {
+            return Ok(None);
+        };
+        let key = normalize_worktree_path(&entry.path);
+        let workspaces = self.list(repo_alias).unwrap_or_default();
+        let managed = workspaces
+            .into_iter()
+            .find(|ws| normalize_worktree_path(std::path::Path::new(&ws.path)) == key)
+            .map(|ws| ws.name);
+        Ok(Some(managed.unwrap_or_else(|| external_worktree_label(&entry.path))))
     }
 
     /// List all workspaces for a repo.
@@ -255,6 +413,18 @@ fn is_registered_worktree(repo_dir: &std::path::Path, ws_dir: &std::path::Path) 
     Ok(entries
         .iter()
         .any(|entry| normalize_worktree_path(&entry.path) == ws_key))
+}
+
+fn external_worktree_label(path: &std::path::Path) -> String {
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    if name.is_empty() {
+        "(external worktree)".into()
+    } else {
+        format!("(external: {name})")
+    }
 }
 
 fn normalize_worktree_path(path: &std::path::Path) -> String {

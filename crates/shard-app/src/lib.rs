@@ -144,6 +144,7 @@ pub fn run() {
             commands::workspace::list_workspaces,
             commands::workspace::create_workspace,
             commands::workspace::remove_workspace,
+            commands::workspace::list_repo_branches,
             commands::session::list_sessions,
             commands::session::create_session,
             commands::session::stop_session,

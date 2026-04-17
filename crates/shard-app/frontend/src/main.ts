@@ -4,6 +4,7 @@ import { TitleBar, type Breadcrumb } from "./components/TitleBar";
 import { Sidebar } from "./components/Sidebar";
 import { TerminalPane } from "./components/TerminalPane";
 import { AddShardDialog } from "./components/AddShardDialog";
+import { AddWorkspaceDialog } from "./components/AddWorkspaceDialog";
 import { addRepo, createSession, createWorkspace, listRepos, stopSession, removeSession, removeWorkspace, syncRepo, removeRepo, type WorkspaceStatus } from "./lib/api";
 import { contextMenu, type MenuItemDef } from "./lib/ContextMenu";
 import { labelFromCommand } from "./lib/titleFormat";
@@ -56,6 +57,7 @@ sidebarResizerEl.addEventListener("mousedown", (e) => {
 });
 
 const dialog = new AddShardDialog();
+const workspaceDialog = new AddWorkspaceDialog();
 
 let currentBreadcrumb: Breadcrumb | null = null;
 
@@ -153,10 +155,14 @@ async function doCreateSession(repo: string, workspace: string) {
 }
 
 async function doCreateWorkspace(repo: string) {
-  const name = prompt("Workspace name (branch will be created):");
-  if (!name || !name.trim()) return;
-  await createWorkspace(repo, name.trim());
-  sidebar.refresh();
+  const result = await workspaceDialog.open(repo);
+  if (!result) return;
+  try {
+    await createWorkspace(repo, result.name, result.mode, result.branch);
+    sidebar.refresh();
+  } catch (err) {
+    alert(`Failed to create workspace: ${err}`);
+  }
 }
 
 async function updateEmptyState() {

@@ -23,7 +23,13 @@ pub fn add_repo(app: tauri::AppHandle, url: String, alias: Option<String>) -> Re
     let source_dir = paths.repo_source_for_repo(&repo.alias, repo.local_path.as_deref());
     match shard_core::git::default_branch(&source_dir) {
         Ok(branch) => {
-            if let Err(e) = ws_store.create(&repo.alias, Some(&branch), Some(&branch), is_local) {
+            if let Err(e) = ws_store.create(
+                &repo.alias,
+                Some(&branch),
+                shard_core::workspaces::WorkspaceMode::NewBranch,
+                Some(&branch),
+                is_local,
+            ) {
                 tracing::warn!("auto-create default workspace failed: {e}");
             }
         }

@@ -826,8 +826,13 @@ input {
   gap: var(--space-2);
 }
 
-.dialog-input {
+.dialog-input-row .dialog-input {
   flex: 1;
+  width: auto;
+}
+
+.dialog-input {
+  width: 100%;
   height: 36px;
   padding: 0 var(--space-3);
   background: var(--bg-secondary);
@@ -883,6 +888,19 @@ input {
   margin-top: var(--space-1);
 }
 
+.dialog-hint--warn {
+  color: var(--warning);
+}
+
+select.dialog-input {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: var(--space-6);
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'><path fill='none' stroke='%239296a0' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round' d='M3 4.5l3 3 3-3'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right var(--space-3) center;
+}
+
 .dialog-footer {
   display: flex;
   align-items: center;
@@ -931,6 +949,16 @@ input {
 
 .dialog-btn-primary:active {
   transform: translateY(1px);
+}
+
+.dialog-btn-primary:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.dialog-btn-primary:disabled:hover {
+  background: var(--accent);
+  transform: none;
 }
 
 /* ── Scrollbar ── */
