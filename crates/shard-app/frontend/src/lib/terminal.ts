@@ -69,6 +69,46 @@ export function createTerminalSession(
     return true;
   });
 
+  // Route wheel scrolling through scrollLines() rather than xterm's pixel-based
+  // viewport.scrollTop update. The default path accumulates sub-pixel drift
+  // (xtermjs/xterm.js#4959) that eventually pushes the last row out of view;
+  // scrollLines snaps scrollTop to ydisp*rowHeight exactly.
+  let wheelPartialScroll = 0;
+  terminal.attachCustomWheelEventHandler((ev: WheelEvent) => {
+    if (ev.deltaY === 0 || ev.shiftKey) return true;
+    // Alt-screen apps (less, vim) expect wheel→arrow translation from xterm.
+    if (terminal.buffer.active.type === "alternate") return true;
+
+    const opts = terminal.options;
+    const scrollSensitivity = opts.scrollSensitivity ?? 1;
+    const fastSensitivity = opts.fastScrollSensitivity ?? 5;
+    const fastMod = opts.fastScrollModifier;
+    const isFast =
+      (fastMod === "alt" && ev.altKey) ||
+      (fastMod === "ctrl" && ev.ctrlKey) ||
+      (fastMod === "shift" && ev.shiftKey);
+    let amount = ev.deltaY * scrollSensitivity * (isFast ? fastSensitivity : 1);
+
+    if (ev.deltaMode === WheelEvent.DOM_DELTA_PIXEL) {
+      const rowHeight = (terminal as unknown as { _core?: any })._core
+        ?._renderService?.dimensions?.css?.cell?.height;
+      if (!rowHeight) return true;
+      amount /= rowHeight;
+      wheelPartialScroll += amount;
+      amount = Math.floor(Math.abs(wheelPartialScroll)) * Math.sign(wheelPartialScroll);
+      wheelPartialScroll %= 1;
+    } else if (ev.deltaMode === WheelEvent.DOM_DELTA_PAGE) {
+      amount *= terminal.rows;
+    }
+
+    const lines = Math.trunc(amount);
+    if (lines !== 0) {
+      ev.preventDefault();
+      terminal.scrollLines(lines);
+    }
+    return false;
+  });
+
   terminal.open(container);
 
   // Load WebGL addon for GPU-accelerated rendering
