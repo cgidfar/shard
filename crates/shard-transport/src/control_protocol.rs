@@ -98,6 +98,24 @@ pub enum ControlFrame {
     /// the daemon does not reply.
     TopologyChanged { repo_alias: Option<String> },
 
+    // --- Workspace Lifecycle (Phase 1 of daemon-broker migration) ---
+    /// Client → Daemon: atomically remove a workspace. The daemon stops
+    /// any bound sessions (graceful → force), drops watchers, runs
+    /// `git worktree remove`, deletes the DB row, and broadcasts
+    /// `WorkspaceRemoved`. Replaces the old split path (Tauri backend +
+    /// CLI calling `WorkspaceStore::remove` directly then firing a
+    /// topology poke) which caused SHA-55.
+    RemoveWorkspace { repo: String, name: String },
+
+    /// Daemon → Client: remove succeeded.
+    RemoveWorkspaceAck,
+
+    /// Daemon → Subscribers: a workspace has been removed. Emitted once
+    /// per successful `RemoveWorkspace`, after all side effects have
+    /// landed. Subscribers should drop any cached state for this
+    /// `(repo, name)` and refresh their sidebar / tree.
+    WorkspaceRemoved { repo: String, name: String },
+
     // --- Errors ---
     /// Daemon → Client: request failed.
     Error { message: String },
@@ -131,6 +149,9 @@ const TYPE_STATE_SNAPSHOT: u8 = 0x8D;
 const TYPE_TOPOLOGY_CHANGED: u8 = 0x8E;
 const TYPE_ERROR: u8 = 0x8F;
 const TYPE_SESSIONS_CHANGED: u8 = 0x90;
+const TYPE_REMOVE_WORKSPACE: u8 = 0x91;
+const TYPE_REMOVE_WORKSPACE_ACK: u8 = 0x92;
+const TYPE_WORKSPACE_REMOVED: u8 = 0x93;
 
 /// Write a control frame to an async writer.
 pub async fn write_control_frame<W: AsyncWrite + Unpin>(
@@ -239,6 +260,17 @@ pub async fn write_control_frame<W: AsyncWrite + Unpin>(
         ControlFrame::SessionsChanged { repo } => {
             write_str(&mut payload, repo);
             TYPE_SESSIONS_CHANGED
+        }
+        ControlFrame::RemoveWorkspace { repo, name } => {
+            write_str(&mut payload, repo);
+            write_str(&mut payload, name);
+            TYPE_REMOVE_WORKSPACE
+        }
+        ControlFrame::RemoveWorkspaceAck => TYPE_REMOVE_WORKSPACE_ACK,
+        ControlFrame::WorkspaceRemoved { repo, name } => {
+            write_str(&mut payload, repo);
+            write_str(&mut payload, name);
+            TYPE_WORKSPACE_REMOVED
         }
         ControlFrame::Error { message } => {
             write_str(&mut payload, message);
@@ -431,6 +463,17 @@ pub async fn read_control_frame<R: AsyncRead + Unpin>(
         TYPE_SESSIONS_CHANGED => {
             let (repo, _) = read_str(payload)?;
             ControlFrame::SessionsChanged { repo }
+        }
+        TYPE_REMOVE_WORKSPACE => {
+            let (repo, n) = read_str(payload)?;
+            let (name, _) = read_str(&payload[n..])?;
+            ControlFrame::RemoveWorkspace { repo, name }
+        }
+        TYPE_REMOVE_WORKSPACE_ACK => ControlFrame::RemoveWorkspaceAck,
+        TYPE_WORKSPACE_REMOVED => {
+            let (repo, n) = read_str(payload)?;
+            let (name, _) = read_str(&payload[n..])?;
+            ControlFrame::WorkspaceRemoved { repo, name }
         }
         TYPE_ERROR => {
             let (message, _) = read_str(payload)?;
@@ -729,6 +772,32 @@ mod tests {
     async fn roundtrip_sessions_changed() {
         let f = ControlFrame::SessionsChanged {
             repo: "my-repo".to_string(),
+        };
+        assert_eq!(roundtrip(f.clone()).await, f);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_remove_workspace() {
+        let f = ControlFrame::RemoveWorkspace {
+            repo: "my-repo".to_string(),
+            name: "feature-a".to_string(),
+        };
+        assert_eq!(roundtrip(f.clone()).await, f);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_remove_workspace_ack() {
+        assert_eq!(
+            roundtrip(ControlFrame::RemoveWorkspaceAck).await,
+            ControlFrame::RemoveWorkspaceAck
+        );
+    }
+
+    #[tokio::test]
+    async fn roundtrip_workspace_removed() {
+        let f = ControlFrame::WorkspaceRemoved {
+            repo: "my-repo".to_string(),
+            name: "feature-a".to_string(),
         };
         assert_eq!(roundtrip(f.clone()).await, f);
     }

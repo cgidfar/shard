@@ -197,7 +197,7 @@ impl RepositoryStore {
             let local_path = std::path::Path::new(repo.local_path.as_ref().unwrap());
 
             // Remove non-base worktrees via git worktree remove
-            let ws_store = crate::workspaces::WorkspaceStore::new(ShardPaths::new()?);
+            let ws_store = crate::workspaces::WorkspaceStore::new(self.paths.clone());
             if let Ok(workspaces) = ws_store.list(alias) {
                 for ws in workspaces {
                     if !ws.is_base {

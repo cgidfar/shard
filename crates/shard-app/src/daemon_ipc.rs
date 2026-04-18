@@ -1,9 +1,14 @@
 //! App-side helpers for talking to the daemon over the control pipe.
 //!
-//! Two consumers live here:
+//! Three consumers live here:
 //!   - `spawn_topology_poke` — fire-and-forget notification sent from Tauri
 //!     commands after a repo/workspace mutation commits, so the daemon can
 //!     reload its in-memory topology.
+//!   - **Mutation RPC helpers** (`remove_workspace`, …) — request/response
+//!     wrappers that hide the connect/handshake/extract-ack boilerplate.
+//!     Tauri command handlers become thin translators: one-line RPC call,
+//!     one-line event emit. The shape is copied per-batch as the migration
+//!     progresses.
 //!   - `run_state_subscriber` — long-lived background task that subscribes
 //!     to daemon state updates and re-emits them as Tauri events. Handles
 //!     reconnect-with-backoff on daemon drop so the UI never wedges.
@@ -39,6 +44,40 @@ async fn send_topology_poke(alias: Option<String>) -> std::io::Result<()> {
     conn.send(&ControlFrame::TopologyChanged { repo_alias: alias })
         .await?;
     Ok(())
+}
+
+// ── Mutation RPCs ───────────────────────────────────────────────────────────
+//
+// Shape copied by every future mutation-RPC helper:
+//   1. `connect` + `handshake` — surface any transport failure as an error
+//      string the frontend can render.
+//   2. `request_typed` — one closure extracts the success variant, the
+//      helper folds `ControlFrame::Error { message }` into `Err`.
+//   3. Return plain `Result<T, String>` so Tauri commands don't need to
+//      translate between `DaemonError` / `io::Error` / etc.
+
+/// Ask the daemon to remove a workspace. See
+/// `crates/shard-cli/src/cmd/daemon.rs::handle_remove_workspace` for the
+/// atomic workflow (SHA-55 fix).
+pub async fn remove_workspace(repo: &str, name: &str) -> Result<(), String> {
+    let mut conn = daemon_client::connect()
+        .await
+        .map_err(|e| format!("daemon connect failed: {e}"))?;
+    conn.handshake()
+        .await
+        .map_err(|e| format!("daemon handshake failed: {e}"))?;
+    conn.request_typed(
+        &ControlFrame::RemoveWorkspace {
+            repo: repo.to_string(),
+            name: name.to_string(),
+        },
+        |f| match f {
+            ControlFrame::RemoveWorkspaceAck => Ok(()),
+            other => Err(other),
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 // ── State subscriber ────────────────────────────────────────────────────────

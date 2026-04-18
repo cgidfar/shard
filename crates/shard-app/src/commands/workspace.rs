@@ -3,7 +3,7 @@ use shard_core::workspaces::{BranchInfo, Workspace, WorkspaceMode, WorkspaceStor
 use shard_core::ShardPaths;
 use tauri::{Emitter, Manager};
 
-use crate::daemon_ipc::spawn_topology_poke;
+use crate::daemon_ipc::{self, spawn_topology_poke};
 use crate::state::AppState;
 
 /// Workspace payload surfaced to the frontend. Carries both the persisted
@@ -68,10 +68,12 @@ pub fn list_repo_branches(repo: String) -> Result<Vec<BranchInfo>, String> {
 }
 
 #[tauri::command]
-pub fn remove_workspace(app: tauri::AppHandle, repo: String, name: String) -> Result<(), String> {
-    let store = WorkspaceStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
-    store.remove(&repo, &name).map_err(|e| e.to_string())?;
-    spawn_topology_poke(Some(repo));
+pub async fn remove_workspace(
+    app: tauri::AppHandle,
+    repo: String,
+    name: String,
+) -> Result<(), String> {
+    daemon_ipc::remove_workspace(&repo, &name).await?;
     let _ = app.emit("sidebar-changed", ());
     Ok(())
 }

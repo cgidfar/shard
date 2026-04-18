@@ -1,3 +1,5 @@
+use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::params;
@@ -8,6 +10,47 @@ use crate::git;
 use crate::paths::ShardPaths;
 use crate::repos::RepositoryStore;
 use crate::{Result, ShardError};
+
+/// Narrow abstraction over the git operations the daemon's workspace-remove
+/// workflow needs. Lets integration tests inject failures at specific steps
+/// (e.g., force `worktree_remove` to fail so the `broken` state transition
+/// is exercised).
+///
+/// Production uses [`RealGitOps`]; tests plug in a stub.
+pub trait WorkspaceGitOps: Send + Sync {
+    fn worktree_remove(&self, repo_dir: &Path, worktree_path: &Path) -> Result<()>;
+    fn worktree_prune(&self, repo_dir: &Path) -> Result<()>;
+    fn worktree_list_porcelain(
+        &self,
+        repo_dir: &Path,
+    ) -> Result<Vec<git::WorktreeEntry>>;
+}
+
+/// Production git-ops implementation — delegates straight to
+/// [`crate::git`].
+pub struct RealGitOps;
+
+impl WorkspaceGitOps for RealGitOps {
+    fn worktree_remove(&self, repo_dir: &Path, worktree_path: &Path) -> Result<()> {
+        git::worktree_remove(repo_dir, worktree_path)
+    }
+
+    fn worktree_prune(&self, repo_dir: &Path) -> Result<()> {
+        git::worktree_prune(repo_dir)
+    }
+
+    fn worktree_list_porcelain(
+        &self,
+        repo_dir: &Path,
+    ) -> Result<Vec<git::WorktreeEntry>> {
+        git::worktree_list_porcelain(repo_dir)
+    }
+}
+
+/// Convenience constructor for the default git-ops impl.
+pub fn default_git_ops() -> Arc<dyn WorkspaceGitOps> {
+    Arc::new(RealGitOps)
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Workspace {
@@ -72,7 +115,7 @@ impl WorkspaceStore {
         branch: Option<&str>,
         is_base: bool,
     ) -> Result<Workspace> {
-        let repo_store = RepositoryStore::new(ShardPaths::new()?);
+        let repo_store = RepositoryStore::new(self.paths.clone());
         let repo = repo_store.get(repo_alias)?;
 
         let source_dir = self.paths.repo_source_for_repo(
@@ -211,7 +254,7 @@ impl WorkspaceStore {
     /// workspace rows so each occupied branch is labeled with the
     /// workspace name rather than a raw path.
     pub fn list_branch_info(&self, repo_alias: &str) -> Result<Vec<BranchInfo>> {
-        let repo_store = RepositoryStore::new(ShardPaths::new()?);
+        let repo_store = RepositoryStore::new(self.paths.clone());
         let repo = repo_store.get(repo_alias)?;
         let source_dir = self.paths.repo_source_for_repo(
             repo_alias,
@@ -292,7 +335,7 @@ impl WorkspaceStore {
     /// List all workspaces for a repo.
     pub fn list(&self, repo_alias: &str) -> Result<Vec<Workspace>> {
         // Verify the repo exists
-        let repo_store = RepositoryStore::new(ShardPaths::new()?);
+        let repo_store = RepositoryStore::new(self.paths.clone());
         let _repo = repo_store.get(repo_alias)?;
 
         let repo_db_path = self.paths.repo_db(repo_alias);
@@ -363,7 +406,7 @@ impl WorkspaceStore {
         let ws = self.get(repo_alias, ws_name)?;
 
         if !ws.is_base {
-            let repo_store = RepositoryStore::new(ShardPaths::new()?);
+            let repo_store = RepositoryStore::new(self.paths.clone());
             let repo = repo_store.get(repo_alias)?;
             let source_dir = self.paths.repo_source_for_repo(
                 repo_alias,
@@ -405,6 +448,70 @@ impl WorkspaceStore {
 
         Ok(())
     }
+
+    /// Delete the DB row for a workspace. Does NOT touch the filesystem or
+    /// run any git commands. Used by the daemon's `RemoveWorkspace`
+    /// workflow after the filesystem side (via [`remove_worktree_fs`]) has
+    /// already succeeded.
+    pub fn delete_row(&self, repo_alias: &str, ws_name: &str) -> Result<()> {
+        let repo_db_path = self.paths.repo_db(repo_alias);
+        let conn = db::open_connection(&repo_db_path)?;
+        conn.execute(
+            "DELETE FROM workspaces WHERE name = ?1",
+            params![ws_name],
+        )?;
+        Ok(())
+    }
+}
+
+/// Run the filesystem side of a workspace remove through the given
+/// [`WorkspaceGitOps`]: `git worktree remove --force` with a prune + manual
+/// `remove_dir_all` fallback for broken rows. Mirrors the logic embedded
+/// in [`WorkspaceStore::remove`] but decoupled from the DB step so the
+/// daemon can interleave state-machine transitions between them.
+///
+/// Returns `Ok(())` if the workspace directory and git admin entry are
+/// gone after this call. Errors are recoverable — the caller should mark
+/// the workspace `broken` and preserve the DB row.
+pub fn remove_worktree_fs(
+    git_ops: &dyn WorkspaceGitOps,
+    source_dir: &Path,
+    ws_dir: &Path,
+) -> Result<()> {
+    if ws_dir.exists() {
+        if let Err(remove_err) = git_ops.worktree_remove(source_dir, ws_dir) {
+            // Only fall back to manual deletion when git no longer
+            // recognizes this path as a registered worktree. Any other
+            // failure must preserve the directory — a transient git
+            // error shouldn't blow away local state.
+            let registered = git_ops
+                .worktree_list_porcelain(source_dir)
+                .map(|entries| {
+                    let key = normalize_worktree_path(ws_dir);
+                    entries
+                        .iter()
+                        .any(|e| normalize_worktree_path(&e.path) == key)
+                })
+                .unwrap_or(true);
+
+            if registered {
+                return Err(remove_err);
+            }
+
+            git_ops.worktree_prune(source_dir)?;
+            std::fs::remove_dir_all(ws_dir).map_err(|e| {
+                ShardError::Other(format!(
+                    "failed to remove worktree directory {}: {}",
+                    ws_dir.display(),
+                    e
+                ))
+            })?;
+        }
+    } else {
+        // Directory already gone — prune any stale admin entry.
+        let _ = git_ops.worktree_prune(source_dir);
+    }
+    Ok(())
 }
 
 fn is_registered_worktree(repo_dir: &std::path::Path, ws_dir: &std::path::Path) -> Result<bool> {

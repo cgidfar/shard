@@ -45,9 +45,42 @@ pub fn run(command: WorkspaceCommands) -> shard_core::Result<()> {
         WorkspaceCommands::Remove { target } => {
             let (repo, ws_name) = parse_target(&target)
                 .map_err(|e| shard_core::ShardError::Other(e))?;
-            store.remove(repo, ws_name)?;
+            remove_via_daemon(repo, ws_name)?;
             println!("Removed workspace '{}:{}'", repo, ws_name);
         }
     }
     Ok(())
+}
+
+/// Route `workspace remove` through the daemon so the lifecycle gate,
+/// session stop, and watcher drop land in the correct order (fixes SHA-55).
+/// Falls back to an error if the daemon isn't running — CLI removes of live
+/// workspaces have always required a daemon to stop any bound sessions.
+fn remove_via_daemon(repo: &str, ws_name: &str) -> shard_core::Result<()> {
+    use shard_transport::control_protocol::ControlFrame;
+    use shard_transport::daemon_client;
+
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| shard_core::ShardError::Other(format!("tokio: {e}")))?;
+
+    rt.block_on(async {
+        let mut conn = daemon_client::connect()
+            .await
+            .map_err(|e| shard_core::ShardError::Other(format!("daemon not running: {e}")))?;
+        conn.handshake()
+            .await
+            .map_err(|e| shard_core::ShardError::Other(format!("daemon handshake: {e}")))?;
+        conn.request_typed(
+            &ControlFrame::RemoveWorkspace {
+                repo: repo.to_string(),
+                name: ws_name.to_string(),
+            },
+            |f| match f {
+                ControlFrame::RemoveWorkspaceAck => Ok(()),
+                other => Err(other),
+            },
+        )
+        .await
+        .map_err(|e| shard_core::ShardError::Other(e.to_string()))
+    })
 }
