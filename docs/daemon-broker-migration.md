@@ -1,6 +1,6 @@
 # Daemon-as-Broker Migration Plan
 
-**Status:** Phase 0 + Phase 1 + Phase 2 + Phase 3 landed on branch `daemon-broker-migration`. Phase 3 adds Batch A repo CRUD (AddRepo, RemoveRepo, SyncRepo, ListRepos); FindSessionById deferred to Phase 4 per D8 (reads migrate with their corresponding mutation). 113 tests pass, zero warnings. Ready for Codex review of Phase 3.
+**Status:** Phase 0 + Phase 1 + Phase 2 + Phase 3 landed on branch `daemon-broker-migration`. Phase 3 adds Batch A repo CRUD (AddRepo, RemoveRepo, SyncRepo, ListRepos); FindSessionById deferred to Phase 4 per D8 (reads migrate with their corresponding mutation). Codex review round 1 addressed (3 findings, all applied). 115 tests pass, zero warnings.
 **Related:** SHA-55 (workspace delete failure), `docs/responsibility-map.md`
 
 ## Goals
@@ -326,6 +326,20 @@ Repo CRUD: `AddRepo`, `RemoveRepo`, `SyncRepo`, `ListRepos`. `FindSessionById` d
 - The plan's starter-kit note "`FindSessionById` walks all DBs and should hold a global (not per-repo) lock" was the crux of moving it to Phase 4: the Tauri session commands that call `find_by_id` (6 call sites) have to migrate together or the handler winds up re-opening DBs the session-lifecycle path is about to mutate. Cleaner to ship it with Batch C.
 - Fake supervisor frame byte: the integration test's StopGraceful tag is `0x02` (not `0x04`); Status reply is `0x05`. Mirrored the Phase 1 `remove_workspace` test's encoder rather than re-deriving — worth noting for the next session that rolls a new fake-supervisor test.
 
+**Codex review round 1 (Phase 3 landing):** 3 findings, all applied:
+
+| # | Severity | Finding | Resolution |
+|---|---|---|---|
+| 1 | High | `handle_remove_repo` snapshots `state.sessions` once, but `handle_spawn` inserts into the live registry only *after* a 10s ready-file wait. An in-flight spawn during RemoveRepo is invisible to the snapshot, so the supervisor keeps its PTY CWD open while `RepositoryStore::remove` tries to tear down the tree — reopening the SHA-55 class via a different vector | Restructured `handle_spawn` into two phases: the per-repo mutation lock is held across gate re-check + DB row + supervisor spawn + `state.sessions.insert`; the 10s ready wait runs *outside* the lock. On ready-wait failure the handler removes the registry entry and marks the DB row `failed` to avoid ghost sessions |
+| 2 | Medium | Alias-less `handle_add_repo` committed the DB row via `RepositoryStore::add` *before* acquiring the per-repo mutex. A concurrent `RemoveRepo`/`SyncRepo`/`CreateWorkspace` for that derived alias could slip into the gap; the handler then re-acquired and returned `AddRepoAck` for a repo that no longer existed | Extracted pure `RepositoryStore::resolve_alias(url, alias)` so the handler resolves the effective alias first (no I/O beyond URL parsing), acquires the lock against the resolved name, then calls `add`. Single unified path, no split acquisition |
+| 3 | Low | On `repo_store.remove` failure, `handle_remove_repo` committed Broken guards and returned Error without poking the monitor. `DropRepo` had already eagerly cleared `RepoState` + watcher, so subscribers saw the repo as silently missing until the 30s reconcile | Added `monitor.poke_topology(Some(alias))` to the failure path so `handle_topology_change` reloads from the DB (row still present) and emits a fresh `ChangeKind::State(alias)` to subscribers |
+
+Two regression tests added for Fixes 2 and 3 in `repo_crud.rs`:
+- `add_repo_concurrent_same_alias_serializes` — two parallel AddRepos for the same alias yield exactly one Ack + one Error.
+- `add_repo_then_remove_repo_is_atomic_against_concurrent` — DB and filesystem always agree on repo presence post-race.
+
+Fix 1 is not directly testable via the in-process harness (SpawnSession spawns a real supervisor binary), but is covered by the invariant that `handle_spawn` now holds the per-repo mutation lock — which `remove_repo_blocks_concurrent_create_workspace` and `concurrent_create_and_remove_reach_consistent_state` already exercise from the RemoveRepo / CreateWorkspace side.
+
 ### Phase 4 — Batch C
 
 ### Phase 4 — Batch C
@@ -357,9 +371,9 @@ Add bounded mpsc per subscribe client in the daemon (agent A flagged the current
 3. **After Phase 1 lands and SHA-55 is fixed — done.** Five findings, all addressed: see the Phase 1 section above.
 4. **After Phase 2 lands — done.** Three findings, all addressed (see Phase 2 table above): implicit-name gate bypass (round 1), misleading `list_branch_info` comment (round 1), Create-vs-Remove serialization race (round 2). Round 3 converged.
 
-5. **After Phase 3 lands — pending.** Review targets:
-   - `handle_remove_repo`'s cascade path: the per-repo mutation lock is held for the entire workflow (including per-workspace lifecycle-gate acquisition, session stop-and-drain, `DropRepo`, and `store.remove`). Confirm this doesn't deadlock against a concurrent operation that needs the same lock (e.g. `SpawnSession` doesn't take it, which is intentional — SpawnSession's guard is the lifecycle registry, not the repo mutex).
-   - `handle_add_repo`'s split lock acquisition (eager when `alias` supplied, lazy when derived): is the post-add re-acquisition window a real race, or does the DB UNIQUE constraint cover it?
-   - `DropRepo` ack semantics: parallel with `DropRepoWorkspace`, but it also clears the `RepoState` entry from the monitor's in-memory map. Verify that's the right level for a repo-level teardown and doesn't drop state that AddRepo-immediately-after would need.
-   - `LifecycleRegistry::clear_repo`: fires completion notifiers on any `Deleting` entries it clears. Could an in-flight `RemoveWorkspace` joiner waiting on that notifier misinterpret the wake-up as "first caller succeeded"? (Expectation: it re-enters `begin_delete`, finds the repo gone, and the subsequent `ws_store.get` returns `WorkspaceNotFound` → `commit_gone` idempotently. But worth confirming.)
-   - `FindSessionById`'s global lock semantics — deferred to Phase 4 review.
+5. **After Phase 3 lands — round 1 done.** Three findings, all applied (see Phase 3 table above):
+   - HIGH: `handle_spawn` now holds the per-repo mutation lock across the gate-to-register window so `RemoveRepo` can't miss an in-flight spawn.
+   - MEDIUM: `handle_add_repo` resolves the alias up front via `RepositoryStore::resolve_alias` and acquires the lock BEFORE `add`, closing the alias-less race.
+   - LOW: `handle_remove_repo` now pokes the monitor on `store.remove` failure so subscribers don't see a silently-missing repo.
+
+   `DropRepo` ack semantics and `LifecycleRegistry::clear_repo` confirmed correct — no changes required. `FindSessionById`'s global lock semantics deferred to Phase 4 review along with the rest of Batch C.

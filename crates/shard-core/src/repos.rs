@@ -35,18 +35,32 @@ impl RepositoryStore {
         Ok(conn)
     }
 
+    /// Resolve the effective alias for `(url, alias)` WITHOUT committing
+    /// anything. Pure except for URL parsing — the daemon uses this to
+    /// acquire the per-repo mutation lock BEFORE the DB write, so that
+    /// a concurrent `RemoveRepo`/`SyncRepo` for the same derived alias
+    /// can't slip between `add` and the handler's post-add work
+    /// (Codex Phase 3 finding).
+    ///
+    /// Mirror of the alias-resolution branch at the top of `add` —
+    /// kept narrow so the two can't diverge.
+    pub fn resolve_alias(url: &str, alias: Option<&str>) -> Result<String> {
+        match alias {
+            Some(a) => Ok(a.to_string()),
+            None => git::default_alias(url).ok_or_else(|| {
+                ShardError::Other(format!(
+                    "cannot derive alias from '{url}', please provide --alias"
+                ))
+            }),
+        }
+    }
+
     /// Add a new repository by URL or local path.
     ///
     /// If alias is None, one is auto-derived from the URL.
     /// Clones the repo as a bare repository and initializes its repo.db.
     pub fn add(&self, url: &str, alias: Option<&str>) -> Result<Repository> {
-        let alias = match alias {
-            Some(a) => a.to_string(),
-            None => git::default_alias(url)
-                .ok_or_else(|| ShardError::Other(
-                    format!("cannot derive alias from '{url}', please provide --alias")
-                ))?,
-        };
+        let alias = Self::resolve_alias(url, alias)?;
 
         let conn = self.open_index()?;
 

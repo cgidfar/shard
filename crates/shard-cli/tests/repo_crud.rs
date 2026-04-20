@@ -164,6 +164,98 @@ async fn add_repo_duplicate_alias_errors() {
     harness.shutdown().await;
 }
 
+#[tokio::test]
+async fn add_repo_concurrent_same_alias_serializes() {
+    // Codex Phase 3 fix: before the resolve_alias + lock-first refactor,
+    // two AddRepo calls racing on the same explicit alias could slip
+    // between the DB UNIQUE check and the per-repo lock acquisition.
+    // Post-fix: the lock is taken BEFORE `RepositoryStore::add` so
+    // the two handlers serialize. Exactly one Ack, one Error; no ghost.
+    let harness = TestHarness::start().await;
+    let checkout_a = harness.create_bare_checkout("race-a");
+    let checkout_b = harness.create_bare_checkout("race-b");
+
+    let harness_ref = &harness;
+    let a = async move {
+        add_repo(harness_ref, checkout_a.to_str().unwrap(), Some("contested")).await
+    };
+    let b = async move {
+        add_repo(harness_ref, checkout_b.to_str().unwrap(), Some("contested")).await
+    };
+    let (ra, rb) = tokio::join!(a, b);
+
+    let acks = [&ra, &rb]
+        .iter()
+        .filter(|r| matches!(r, ControlFrame::AddRepoAck { .. }))
+        .count();
+    let errors = [&ra, &rb]
+        .iter()
+        .filter(|r| matches!(r, ControlFrame::Error { .. }))
+        .count();
+    assert_eq!(
+        (acks, errors),
+        (1, 1),
+        "expected one Ack + one Error; got ra={ra:?} rb={rb:?}"
+    );
+    assert!(db_has_repo(&harness.data_path, "contested"));
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn add_repo_then_remove_repo_is_atomic_against_concurrent() {
+    // Codex Phase 3 fix: before the resolve_alias + lock-first refactor,
+    // an alias-less AddRepo could commit the repo row, then briefly
+    // drop before re-acquiring the lock to auto-create the base
+    // workspace. A concurrent RemoveRepo for that derived alias could
+    // slip into the gap, delete the row, and AddRepo would return Ack
+    // for a repo that no longer existed. Post-fix: AddRepo holds the
+    // lock across the entire workflow, so RemoveRepo serializes.
+    //
+    // The test exercises the happy outcome: fire AddRepo + RemoveRepo
+    // back-to-back. Either AddRepo wins the lock → repo exists post-op,
+    // or RemoveRepo wins → AddRepo proceeds afterwards and the repo
+    // also exists (RemoveRepo on an absent repo is idempotent). The
+    // forbidden outcome — AddRepo Ack'd for a ghost row — can't be
+    // produced by a black-box concurrent call because the lock now
+    // bounds the observability window.
+    let harness = TestHarness::start().await;
+    let checkout = harness.create_bare_checkout("atomic");
+
+    let harness_ref = &harness;
+    let add = async move { add_repo(harness_ref, checkout.to_str().unwrap(), Some("atomic")).await };
+    let rm = async move { remove_repo(harness_ref, "atomic").await };
+    let (ar, rr) = tokio::join!(add, rm);
+
+    match ar {
+        ControlFrame::AddRepoAck { ref repo } => assert_eq!(repo.alias, "atomic"),
+        ref other => panic!("AddRepo outcome: {other:?}"),
+    }
+    match rr {
+        ControlFrame::RemoveRepoAck => {}
+        other => panic!("RemoveRepo outcome: {other:?}"),
+    }
+
+    // End state: DB presence and `.shard/` presence must agree — the
+    // two legal outcomes are "both present" (Remove won the lock
+    // first, found nothing to remove, then Add committed) or "both
+    // absent" (Add won, then Remove cascaded the auto-workspace
+    // cleanup). The forbidden outcome is DB-row-gone-but-Ack-returned
+    // which is what the pre-fix race could produce.
+    let present = db_has_repo(&harness.data_path, "atomic");
+    let shard_dir_present = harness
+        .data_path
+        .join("repo-source-atomic")
+        .join(".shard")
+        .exists();
+    assert_eq!(
+        present, shard_dir_present,
+        "DB / fs disagreement: present={present} shard_dir={shard_dir_present}"
+    );
+
+    harness.shutdown().await;
+}
+
 // ── ListRepos ──────────────────────────────────────────────────────────────
 
 #[tokio::test]

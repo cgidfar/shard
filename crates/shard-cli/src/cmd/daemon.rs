@@ -1642,6 +1642,21 @@ async fn dispatch_request(state: &Arc<DaemonState>, frame: ControlFrame) -> Cont
 }
 
 /// Handle SpawnSession: create DB record, spawn supervisor, assign to job, wait for ready.
+///
+/// **Locking model (Codex Phase 3 finding):** the per-repo mutation lock
+/// is held across the gate re-check, DB row creation, supervisor spawn,
+/// and live-registry insert. Releasing the lock only after `state.sessions`
+/// is populated closes the window where `RemoveRepo` could snapshot
+/// `state.sessions`, miss an in-flight spawn, and then tear down the
+/// repo while the supervisor is still coming up. The 10s ready-file
+/// wait happens *outside* the lock so a slow supervisor startup doesn't
+/// block unrelated AddRepo/RemoveRepo/SyncRepo traffic.
+///
+/// On ready-wait failure the handler cleans up the live-registry entry
+/// and marks the DB row `failed` so the session doesn't linger as a
+/// ghost. Force-kill against the dead / stuck PID is handled by the
+/// 5s fast-tick + Job Object on daemon exit; explicit kill here would
+/// be redundant and could fight a supervisor that's almost-ready.
 async fn handle_spawn(
     state: &Arc<DaemonState>,
     repo: String,
@@ -1649,127 +1664,164 @@ async fn handle_spawn(
     command: Vec<String>,
     harness: Option<String>,
 ) -> ControlFrame {
-    // Gate check per D5: reject spawn when the target workspace is being
-    // deleted or is in Broken state. This closes the race where a new
-    // session could land after RemoveWorkspace acquired `Deleting` but
-    // before it snapshotted the bound-session list.
-    if let Err(e) = state.lifecycle.check_can_mutate(&repo, &workspace) {
-        return ControlFrame::Error {
-            message: e.to_string(),
-        };
-    }
-
-    let harness_parsed = harness.as_deref().and_then(|h| h.parse().ok());
     let session_store = SessionStore::new(state.paths.clone());
+    let harness_parsed = harness.as_deref().and_then(|h| h.parse().ok());
 
-    // Derive transport addr and create DB record
-    let session = match session_store.create(&repo, &workspace, &command, "", harness_parsed) {
-        Ok(s) => s,
-        Err(e) => {
-            return ControlFrame::Error {
-                message: format!("failed to create session record: {e}"),
-            }
+    // ── Phase 1: under the per-repo mutation lock ─────────────────────────
+    //
+    // Everything a concurrent RemoveRepo/RemoveWorkspace needs to see
+    // happens inside this block. On success it returns the session
+    // metadata; on any failure it returns an Error frame directly.
+    let spawn_result: Result<(String, u32, String), ControlFrame> = async {
+        let repo_lock = state.acquire_repo_mutation_lock(&repo).await;
+        let _guard = repo_lock.lock().await;
+
+        // Gate check under the lock. Keep this here (not before the
+        // lock) so a RemoveWorkspace that flipped the workspace to
+        // Deleting between our arrival and the lock acquisition is
+        // still caught.
+        if let Err(e) = state.lifecycle.check_can_mutate(&repo, &workspace) {
+            return Err(ControlFrame::Error {
+                message: e.to_string(),
+            });
         }
-    };
 
-    let transport_addr = shard_transport::transport_windows::session_pipe_name(&session.id);
-
-    // Update transport addr in DB
-    if let Err(e) = session_store.update_transport_addr(&repo, &session.id, &transport_addr) {
-        return ControlFrame::Error {
-            message: format!("failed to update transport addr: {e}"),
+        // Derive transport addr and create DB record.
+        let session = match session_store.create(&repo, &workspace, &command, "", harness_parsed)
+        {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(ControlFrame::Error {
+                    message: format!("failed to create session record: {e}"),
+                })
+            }
         };
-    }
 
-    // Build supervisor args
-    let mut args: Vec<String> = vec![
-        "session".to_string(),
-        "serve".to_string(),
-        "--repo".to_string(),
-        repo.clone(),
-        "--workspace".to_string(),
-        workspace.clone(),
-        "--session-id".to_string(),
-        session.id.clone(),
-        "--transport-addr".to_string(),
-        transport_addr.clone(),
-        "--".to_string(),
-    ];
-    args.extend(command);
+        let transport_addr = shard_transport::transport_windows::session_pipe_name(&session.id);
 
-    // Spawn supervisor and assign to job
-    let (pid, handle) = match spawn_detached_with_handle(&state.exe_path, &args) {
-        Ok(result) => result,
-        Err(e) => {
-            return ControlFrame::Error {
-                message: format!("failed to spawn supervisor: {e}"),
-            }
+        if let Err(e) = session_store.update_transport_addr(&repo, &session.id, &transport_addr) {
+            return Err(ControlFrame::Error {
+                message: format!("failed to update transport addr: {e}"),
+            });
         }
+
+        // Build supervisor args.
+        let mut args: Vec<String> = vec![
+            "session".to_string(),
+            "serve".to_string(),
+            "--repo".to_string(),
+            repo.clone(),
+            "--workspace".to_string(),
+            workspace.clone(),
+            "--session-id".to_string(),
+            session.id.clone(),
+            "--transport-addr".to_string(),
+            transport_addr.clone(),
+            "--".to_string(),
+        ];
+        args.extend(command.clone());
+
+        // Spawn supervisor + assign to Job Object.
+        let (pid, handle) = match spawn_detached_with_handle(&state.exe_path, &args) {
+            Ok(result) => result,
+            Err(e) => {
+                // DB row exists but no supervisor — mark it failed so
+                // orphan adoption on next daemon start doesn't trip.
+                let _ = session_store.update_status(&repo, &session.id, "failed", None);
+                return Err(ControlFrame::Error {
+                    message: format!("failed to spawn supervisor: {e}"),
+                });
+            }
+        };
+
+        if let Err(e) = state.job_guard.assign_process(handle) {
+            warn!("Failed to assign supervisor pid={pid} to job: {e}");
+            // Non-fatal — supervisor still works, just won't be killed
+            // on daemon crash.
+        }
+
+        let creation_time = get_process_creation_time(handle).unwrap_or(0);
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+        }
+
+        let _ = session_store.set_supervisor_pid(&repo, &session.id, pid);
+
+        // Register BEFORE releasing the lock so RemoveRepo's snapshot
+        // of state.sessions always sees an in-flight spawn on this
+        // repo. Registered state is authoritative from this point
+        // even though the supervisor hasn't written the ready file
+        // yet — fast-tick will prune the entry if the process dies.
+        {
+            let mut sessions = state.sessions.lock().await;
+            sessions.insert(
+                session.id.clone(),
+                LiveSession {
+                    session_id: session.id.clone(),
+                    supervisor_pid: pid,
+                    transport_addr: transport_addr.clone(),
+                    repo: repo.clone(),
+                    workspace: workspace.clone(),
+                    creation_time,
+                },
+            );
+        }
+
+        Ok((session.id, pid, transport_addr))
+    }
+    .await;
+
+    let (session_id, pid, transport_addr) = match spawn_result {
+        Ok(v) => v,
+        Err(frame) => return frame,
     };
 
-    // Assign to daemon's Job Object
-    if let Err(e) = state.job_guard.assign_process(handle) {
-        warn!("Failed to assign supervisor pid={pid} to job: {e}");
-        // Non-fatal — supervisor still works, just won't be killed on daemon crash
-    }
-
-    // Get creation time for PID reuse detection
-    let creation_time = get_process_creation_time(handle).unwrap_or(0);
-
-    // Close the handle now that we've assigned it
-    unsafe {
-        windows_sys::Win32::Foundation::CloseHandle(handle);
-    }
-
-    // Update DB with supervisor PID
-    let _ = session_store.set_supervisor_pid(&repo, &session.id, pid);
-
-    // Wait for ready file
-    let ready_path = state.paths.session_dir(&repo, &session.id).join("ready");
+    // ── Phase 2: ready-file wait outside the lock ─────────────────────────
+    //
+    // The supervisor writes `ready` after binding its pipe. Releasing
+    // the repo mutex here means concurrent AddRepo/SyncRepo on unrelated
+    // operations don't block on slow supervisor startup; a concurrent
+    // RemoveRepo will still see our session in state.sessions and stop
+    // it correctly (graceful via the pipe once it's bound, otherwise
+    // force-kill against the recorded PID+creation_time).
+    let ready_path = state.paths.session_dir(&repo, &session_id).join("ready");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
+    let ready_err: Option<String> = loop {
         if ready_path.exists() {
-            break;
+            break None;
         }
         if tokio::time::Instant::now() >= deadline {
-            return ControlFrame::Error {
-                message: format!("supervisor did not become ready within 10s (pid={pid})"),
-            };
+            break Some(format!(
+                "supervisor did not become ready within 10s (pid={pid})"
+            ));
         }
         if !PlatformProcessControl::is_alive(pid) {
-            return ControlFrame::Error {
-                message: "supervisor died before becoming ready".to_string(),
-            };
+            break Some("supervisor died before becoming ready".to_string());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    };
 
-    // Register in live sessions
-    {
-        let mut sessions = state.sessions.lock().await;
-        sessions.insert(
-            session.id.clone(),
-            LiveSession {
-                session_id: session.id.clone(),
-                supervisor_pid: pid,
-                transport_addr: transport_addr.clone(),
-                repo: repo.clone(),
-                workspace: workspace.clone(),
-                creation_time,
-            },
-        );
+    if let Some(message) = ready_err {
+        // Roll back state.sessions + mark the DB row failed so the
+        // ghost doesn't linger.
+        {
+            let mut sessions = state.sessions.lock().await;
+            sessions.remove(&session_id);
+        }
+        let _ = session_store.update_status(&repo, &session_id, "failed", None);
+        return ControlFrame::Error { message };
     }
 
     info!(
         "Spawned session {} [{}:{}] pid={}",
-        &session.id[..8],
+        &session_id[..8.min(session_id.len())],
         repo,
         workspace,
         pid
     );
 
     ControlFrame::SpawnAck {
-        session_id: session.id,
+        session_id,
         supervisor_pid: pid,
         transport_addr,
     }
@@ -2191,49 +2243,40 @@ async fn handle_list_branch_info(state: &Arc<DaemonState>, repo: String) -> Cont
 /// reference for local paths) and auto-creates a base workspace on the
 /// detected default branch.
 ///
-/// Holds the per-repo mutation lock keyed by the resolved alias so a
-/// concurrent `AddRepo` for the same alias can't race the duplicate
-/// check. We can't know the alias before calling `RepositoryStore::add`
-/// if the caller didn't supply one, so the lock is acquired up-front
-/// by the explicit alias when present; otherwise we trust the DB
-/// unique constraint to surface the duplicate — a rare path, and the
-/// single-user model makes two-concurrent-AddRepo essentially
-/// theoretical.
+/// Resolves the effective alias via `RepositoryStore::resolve_alias`
+/// up front (side-effect-free), then takes the per-repo mutation lock
+/// BEFORE `add` runs. This closes the Codex Phase 3 race where an
+/// alias-less AddRepo could commit the DB row and release briefly
+/// before re-acquiring the lock; a concurrent `RemoveRepo` for that
+/// derived alias would slip into the gap and leave AddRepo returning
+/// an `Ack` for a row that no longer existed.
 async fn handle_add_repo(
     state: &Arc<DaemonState>,
     url: String,
     alias: Option<String>,
 ) -> ControlFrame {
-    let repo_store = RepositoryStore::new(state.paths.clone());
-
-    // If the caller supplied an alias, we can take the per-repo mutex
-    // up-front. Otherwise defer acquisition until after `add` derives
-    // the alias so we don't hold two locks.
-    let explicit_lock = if let Some(alias) = alias.as_deref() {
-        let lock = state.acquire_repo_mutation_lock(alias).await;
-        Some(lock.lock_owned().await)
-    } else {
-        None
+    let resolved_alias = match RepositoryStore::resolve_alias(&url, alias.as_deref()) {
+        Ok(a) => a,
+        Err(e) => {
+            return ControlFrame::Error {
+                message: format!("resolve alias failed: {e}"),
+            }
+        }
     };
 
-    let repo = match repo_store.add(&url, alias.as_deref()) {
+    // Acquire the per-repo mutation lock keyed by the resolved alias —
+    // held across the DB write and the auto-workspace step so no other
+    // handler can observe (or teardown) the row mid-flight.
+    let repo_lock = state.acquire_repo_mutation_lock(&resolved_alias).await;
+    let _guard = repo_lock.lock().await;
+
+    let repo_store = RepositoryStore::new(state.paths.clone());
+    let repo = match repo_store.add(&url, Some(&resolved_alias)) {
         Ok(r) => r,
         Err(e) => {
             return ControlFrame::Error {
                 message: format!("add repo failed: {e}"),
             }
-        }
-    };
-
-    // Now that the alias is known, re-acquire the lock if we didn't
-    // have one. This is technically racy vs. an RPC that raced to add
-    // the same derived alias, but the DB unique constraint caught the
-    // collision above; by the time we're here, the row is ours.
-    let _post_lock = match explicit_lock {
-        Some(g) => Some(g),
-        None => {
-            let lock = state.acquire_repo_mutation_lock(&repo.alias).await;
-            Some(lock.lock_owned().await)
         }
     };
 
@@ -2426,6 +2469,16 @@ async fn handle_remove_repo(state: &Arc<DaemonState>, alias: String) -> ControlF
         warn!("RemoveRepo: store.remove failed for {alias}: {e}");
         for g in guards {
             g.commit_broken();
+        }
+        // We already dropped the monitor's watcher + RepoState entry
+        // in step 3. The DB row is still present, so subscribers must
+        // see the repo as still-existing-but-broken rather than
+        // silently missing until the 30s reconcile. Poke the monitor
+        // to reload from the DB; `handle_topology_change` will fetch
+        // the row, rebuild the watcher, and emit a fresh
+        // `ChangeKind::State(alias)`.
+        if let Some(monitor) = state.monitor.get() {
+            monitor.poke_topology(Some(alias.clone()));
         }
         return ControlFrame::Error {
             message: format!("repo remove failed: {e}"),
