@@ -1776,6 +1776,13 @@ async fn handle_spawn(
         Err(frame) => return frame,
     };
 
+    // Capture the creation_time we registered so the timeout path can
+    // force-kill safely via the PID-reuse guard.
+    let creation_time: u64 = {
+        let sessions = state.sessions.lock().await;
+        sessions.get(&session_id).map(|s| s.creation_time).unwrap_or(0)
+    };
+
     // ── Phase 2: ready-file wait outside the lock ─────────────────────────
     //
     // The supervisor writes `ready` after binding its pipe. Releasing
@@ -1784,26 +1791,59 @@ async fn handle_spawn(
     // RemoveRepo will still see our session in state.sessions and stop
     // it correctly (graceful via the pipe once it's bound, otherwise
     // force-kill against the recorded PID+creation_time).
+    enum ReadyOutcome {
+        Ok,
+        /// Process is still alive but didn't write the ready file in time.
+        /// Force-kill required so it doesn't zombie on and later flip the
+        /// DB row back to `running` after we've already marked it failed
+        /// (Codex Phase 3 round-2 finding).
+        Timeout,
+        /// Process died before the ready file appeared. No kill needed.
+        Died,
+    }
+
     let ready_path = state.paths.session_dir(&repo, &session_id).join("ready");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let ready_err: Option<String> = loop {
+    let outcome = loop {
         if ready_path.exists() {
-            break None;
+            break ReadyOutcome::Ok;
         }
         if tokio::time::Instant::now() >= deadline {
-            break Some(format!(
-                "supervisor did not become ready within 10s (pid={pid})"
-            ));
+            break ReadyOutcome::Timeout;
         }
         if !PlatformProcessControl::is_alive(pid) {
-            break Some("supervisor died before becoming ready".to_string());
+            break ReadyOutcome::Died;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
 
-    if let Some(message) = ready_err {
-        // Roll back state.sessions + mark the DB row failed so the
-        // ghost doesn't linger.
+    if let ReadyOutcome::Ok = outcome {
+        // fallthrough — success path below
+    } else {
+        // Failure path. Order matters:
+        //   1. Force-kill the PID (Timeout only — `Died` means no
+        //      process). The creation_time guard refuses if the PID
+        //      has been recycled.
+        //   2. Remove the registry entry so StopSession / RemoveRepo
+        //      no longer see it.
+        //   3. Mark the DB row failed so orphan adoption on next
+        //      daemon start doesn't try to re-adopt a ghost.
+        let message = match outcome {
+            ReadyOutcome::Timeout => {
+                if let Err(e) = shard_supervisor::process_windows::force_kill_pid_checked(
+                    pid,
+                    creation_time,
+                ) {
+                    warn!(
+                        "handle_spawn: ready-timeout force-kill failed for pid={pid}: {e}"
+                    );
+                }
+                format!("supervisor did not become ready within 10s (pid={pid})")
+            }
+            ReadyOutcome::Died => "supervisor died before becoming ready".to_string(),
+            ReadyOutcome::Ok => unreachable!(),
+        };
+
         {
             let mut sessions = state.sessions.lock().await;
             sessions.remove(&session_id);

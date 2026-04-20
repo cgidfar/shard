@@ -1,6 +1,6 @@
 # Daemon-as-Broker Migration Plan
 
-**Status:** Phase 0 + Phase 1 + Phase 2 + Phase 3 landed on branch `daemon-broker-migration`. Phase 3 adds Batch A repo CRUD (AddRepo, RemoveRepo, SyncRepo, ListRepos); FindSessionById deferred to Phase 4 per D8 (reads migrate with their corresponding mutation). Codex review round 1 addressed (3 findings, all applied). 115 tests pass, zero warnings.
+**Status:** Phase 0 + Phase 1 + Phase 2 + Phase 3 landed on branch `daemon-broker-migration`. Phase 3 adds Batch A repo CRUD (AddRepo, RemoveRepo, SyncRepo, ListRepos); FindSessionById deferred to Phase 4 per D8 (reads migrate with their corresponding mutation). Codex-reviewed across three rounds (3 round-1 + 2 round-2 findings, all applied; round 3 converged). 115 tests pass, zero warnings.
 **Related:** SHA-55 (workspace delete failure), `docs/responsibility-map.md`
 
 ## Goals
@@ -339,6 +339,15 @@ Two regression tests added for Fixes 2 and 3 in `repo_crud.rs`:
 - `add_repo_then_remove_repo_is_atomic_against_concurrent` — DB and filesystem always agree on repo presence post-race.
 
 Fix 1 is not directly testable via the in-process harness (SpawnSession spawns a real supervisor binary), but is covered by the invariant that `handle_spawn` now holds the per-repo mutation lock — which `remove_repo_blocks_concurrent_create_workspace` and `concurrent_create_and_remove_reach_consistent_state` already exercise from the RemoveRepo / CreateWorkspace side.
+
+**Codex review round 2 (Phase 3 polish):** 2 findings, both applied:
+
+| # | Severity | Finding | Resolution |
+|---|---|---|---|
+| 1 | High | Round-1 Fix 1's ready-timeout path removed the live-registry entry and marked the DB row failed, but did **not** kill the supervisor. A slow-to-start supervisor could still bind its pipe and flip the DB row back to `running` after we marked it `failed`, leaving a zombie session that `StopSession`/`RemoveRepo` couldn't find (both key off the live map) and that daemon shutdown would leak because graceful shutdown strips `KILL_ON_JOB_CLOSE` | Introduced a three-variant `ReadyOutcome` enum. `Timeout` now calls `shard_supervisor::process_windows::force_kill_pid_checked(pid, creation_time)` before unregistering. The creation_time guard refuses to kill a recycled PID. `Died` skips the kill (no process left). Both paths still unregister and mark the DB row failed |
+| 2 | Low | `add_repo_then_remove_repo_is_atomic_against_concurrent` used `Some("atomic")` so it never exercised the alias-derivation path that Fix 2 was supposed to address | Renamed `add_repo_alias_less_then_remove_is_atomic` and switched the call to `alias: None`. The derived alias is computed from the checkout's trailing path component (matching `git::default_alias` for local paths) |
+
+**Codex review round 3:** converged — no new findings.
 
 ### Phase 4 — Batch C
 

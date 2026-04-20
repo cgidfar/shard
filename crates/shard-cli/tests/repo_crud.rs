@@ -203,32 +203,40 @@ async fn add_repo_concurrent_same_alias_serializes() {
 }
 
 #[tokio::test]
-async fn add_repo_then_remove_repo_is_atomic_against_concurrent() {
+async fn add_repo_alias_less_then_remove_is_atomic() {
     // Codex Phase 3 fix: before the resolve_alias + lock-first refactor,
-    // an alias-less AddRepo could commit the repo row, then briefly
-    // drop before re-acquiring the lock to auto-create the base
-    // workspace. A concurrent RemoveRepo for that derived alias could
-    // slip into the gap, delete the row, and AddRepo would return Ack
-    // for a repo that no longer existed. Post-fix: AddRepo holds the
-    // lock across the entire workflow, so RemoveRepo serializes.
+    // an alias-less AddRepo committed the repo row BEFORE acquiring
+    // the per-repo mutex. A concurrent RemoveRepo for the DERIVED alias
+    // could slip in, delete the row, and AddRepo would return Ack for
+    // a ghost. Post-fix: the handler resolves the alias up front and
+    // takes the lock before `add`, so the two serialize.
     //
-    // The test exercises the happy outcome: fire AddRepo + RemoveRepo
-    // back-to-back. Either AddRepo wins the lock → repo exists post-op,
-    // or RemoveRepo wins → AddRepo proceeds afterwards and the repo
-    // also exists (RemoveRepo on an absent repo is idempotent). The
-    // forbidden outcome — AddRepo Ack'd for a ghost row — can't be
-    // produced by a black-box concurrent call because the lock now
-    // bounds the observability window.
+    // Black-box assertion: whichever ordering wins, the DB row and the
+    // filesystem `.shard/` directory must agree on presence. Pre-fix,
+    // the forbidden outcome would produce AddRepoAck with the alias
+    // populated but no matching DB row. We drive through the derived
+    // alias path (alias: None) — which is the path that was broken.
     let harness = TestHarness::start().await;
-    let checkout = harness.create_bare_checkout("atomic");
+    let checkout = harness.create_bare_checkout("derived-atomic");
+    // `git::default_alias` for a local path falls through to
+    // `path.file_name()` — here the trailing directory component.
+    let derived_alias = checkout
+        .file_name()
+        .and_then(|f| f.to_str())
+        .expect("checkout path has trailing component")
+        .to_string();
+    let shard_dir = checkout.join(".shard");
+    let checkout_str = checkout.to_str().unwrap().to_string();
 
     let harness_ref = &harness;
-    let add = async move { add_repo(harness_ref, checkout.to_str().unwrap(), Some("atomic")).await };
-    let rm = async move { remove_repo(harness_ref, "atomic").await };
+    let derived_for_rm = derived_alias.clone();
+    let add = async move { add_repo(harness_ref, &checkout_str, None).await };
+    let rm = async move { remove_repo(harness_ref, &derived_for_rm).await };
     let (ar, rr) = tokio::join!(add, rm);
 
+    // RemoveRepo is idempotent on absent repos, so both outcomes are Ack.
     match ar {
-        ControlFrame::AddRepoAck { ref repo } => assert_eq!(repo.alias, "atomic"),
+        ControlFrame::AddRepoAck { ref repo } => assert_eq!(repo.alias, derived_alias),
         ref other => panic!("AddRepo outcome: {other:?}"),
     }
     match rr {
@@ -236,18 +244,8 @@ async fn add_repo_then_remove_repo_is_atomic_against_concurrent() {
         other => panic!("RemoveRepo outcome: {other:?}"),
     }
 
-    // End state: DB presence and `.shard/` presence must agree — the
-    // two legal outcomes are "both present" (Remove won the lock
-    // first, found nothing to remove, then Add committed) or "both
-    // absent" (Add won, then Remove cascaded the auto-workspace
-    // cleanup). The forbidden outcome is DB-row-gone-but-Ack-returned
-    // which is what the pre-fix race could produce.
-    let present = db_has_repo(&harness.data_path, "atomic");
-    let shard_dir_present = harness
-        .data_path
-        .join("repo-source-atomic")
-        .join(".shard")
-        .exists();
+    let present = db_has_repo(&harness.data_path, &derived_alias);
+    let shard_dir_present = shard_dir.exists();
     assert_eq!(
         present, shard_dir_present,
         "DB / fs disagreement: present={present} shard_dir={shard_dir_present}"
