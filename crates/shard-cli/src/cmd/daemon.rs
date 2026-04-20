@@ -834,8 +834,37 @@ pub struct DaemonState {
     /// an `Arc` so `DeleteGuard`s can outlive the handler frame.
     #[doc(hidden)]
     pub lifecycle: Arc<crate::cmd::lifecycle::LifecycleRegistry>,
+    /// Per-repo mutation mutex. Serializes `CreateWorkspace` and
+    /// `RemoveWorkspace` against each other on the same repo so their
+    /// critical sections cannot interleave (Codex round-2 finding). The
+    /// lifecycle gate alone isn't enough because
+    /// `begin_delete`/`check_can_mutate` are independent atomic steps
+    /// around a non-atomic DB-plus-git workflow — a Remove for an
+    /// as-yet-absent name can still Ack while a concurrent Create is
+    /// partway through committing the row.
+    ///
+    /// Per-repo (not per-workspace) is intentional: in a single-user
+    /// app, coarse-grained blocking is cheap and keeps the state
+    /// machine simple. If concurrent mutations on different workspaces
+    /// of the same repo become a measured bottleneck, narrow later.
+    repo_mutation_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Git operations used by mutation handlers (test seam).
     pub(crate) git_ops: Arc<dyn WorkspaceGitOps>,
+}
+
+impl DaemonState {
+    /// Return (creating if absent) the per-repo mutation lock. Held by
+    /// `handle_create_workspace` and `handle_remove_workspace` across their
+    /// critical sections.
+    pub(crate) async fn acquire_repo_mutation_lock(
+        self: &Arc<Self>,
+        repo: &str,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.repo_mutation_locks.lock().await;
+        map.entry(repo.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
 }
 
 pub fn run(command: DaemonCommands) -> shard_core::Result<()> {
@@ -876,6 +905,7 @@ pub fn build_headless_state(
         tray_proxy: None,
         monitor: std::sync::OnceLock::new(),
         lifecycle: Arc::new(crate::cmd::lifecycle::LifecycleRegistry::new()),
+        repo_mutation_locks: tokio::sync::Mutex::new(HashMap::new()),
         git_ops: config.git_ops,
     }))
 }
@@ -1027,6 +1057,7 @@ fn run_daemon() -> shard_core::Result<()> {
         tray_proxy: Some(tray_proxy),
         monitor: std::sync::OnceLock::new(),
         lifecycle: Arc::new(crate::cmd::lifecycle::LifecycleRegistry::new()),
+        repo_mutation_locks: tokio::sync::Mutex::new(HashMap::new()),
         git_ops: default_git_ops(),
     });
 
@@ -1533,7 +1564,10 @@ async fn dispatch_request(state: &Arc<DaemonState>, frame: ControlFrame) -> Cont
         .load(std::sync::atomic::Ordering::Acquire)
         && matches!(
             frame,
-            ControlFrame::SpawnSession { .. } | ControlFrame::StopSession { .. }
+            ControlFrame::SpawnSession { .. }
+                | ControlFrame::StopSession { .. }
+                | ControlFrame::CreateWorkspace { .. }
+                | ControlFrame::RemoveWorkspace { .. }
         )
     {
         return ControlFrame::Error {
@@ -1558,6 +1592,17 @@ async fn dispatch_request(state: &Arc<DaemonState>, frame: ControlFrame) -> Cont
         ControlFrame::RemoveWorkspace { repo, name } => {
             handle_remove_workspace(state, repo, name).await
         }
+
+        ControlFrame::CreateWorkspace {
+            repo,
+            name,
+            mode,
+            branch,
+        } => handle_create_workspace(state, repo, name, mode, branch).await,
+
+        ControlFrame::ListWorkspaces { repo } => handle_list_workspaces(state, repo).await,
+
+        ControlFrame::ListBranchInfo { repo } => handle_list_branch_info(state, repo).await,
 
         ControlFrame::ListSessions => {
             let sessions = state.sessions.lock().await;
@@ -1807,6 +1852,13 @@ async fn handle_remove_workspace(
 ) -> ControlFrame {
     use crate::cmd::lifecycle::BeginDelete;
 
+    // Serialize against concurrent `CreateWorkspace` on this repo (Codex
+    // round-2 finding). The lifecycle gate alone can't prevent the race
+    // where an absent name triggers `commit_gone` while a Create is
+    // partway through committing the same name to the DB.
+    let repo_lock = state.acquire_repo_mutation_lock(&repo).await;
+    let _guard = repo_lock.lock().await;
+
     // 1. Lifecycle gate. `begin_delete` is atomic over absent/Active/Broken
     //    → Deleting. If another delete is already in flight, wait on its
     //    completion notifier and then re-loop: if the first caller
@@ -1980,6 +2032,148 @@ async fn handle_remove_workspace(
 
     info!("RemoveWorkspace: {}:{} removed", repo, name);
     ControlFrame::RemoveWorkspaceAck
+}
+
+/// Handle `CreateWorkspace` (Phase 2 of the daemon-broker migration).
+///
+/// Mirrors the D5 pattern but is far simpler than remove because create has
+/// no cleanup steps to serialize. Resolves the effective workspace name
+/// up-front via `WorkspaceStore::resolve_workspace_name` so the lifecycle
+/// gate check applies uniformly — otherwise an implicit name (e.g. from
+/// `WorkspaceMode::NewBranch` + no explicit `name`) that happens to match
+/// a workspace currently in `Deleting`/`Broken` would bypass the gate and
+/// fail deep inside `create` with a generic DB error.
+async fn handle_create_workspace(
+    state: &Arc<DaemonState>,
+    repo: String,
+    name: Option<String>,
+    mode: shard_core::workspaces::WorkspaceMode,
+    branch: Option<String>,
+) -> ControlFrame {
+    // Serialize against concurrent `RemoveWorkspace` on this repo so the
+    // two handlers' critical sections can't interleave. Without this, a
+    // Remove of an as-yet-absent name could slip in between our gate
+    // check and the DB INSERT and return a vacuous Ack to its caller.
+    let repo_lock = state.acquire_repo_mutation_lock(&repo).await;
+    let _guard = repo_lock.lock().await;
+
+    let ws_store = WorkspaceStore::new(state.paths.clone());
+
+    // Resolve the effective name before any side effects so the gate check
+    // covers both explicit and implicit-name callers. Resolution mirrors
+    // the logic in `WorkspaceStore::create` — if the two diverge we'll
+    // gate-check one name and write a different one, so the helper is
+    // deliberately narrow.
+    let resolved_name = match ws_store.resolve_workspace_name(
+        &repo,
+        name.as_deref(),
+        mode,
+        branch.as_deref(),
+    ) {
+        Ok(n) => n,
+        Err(e) => {
+            return ControlFrame::Error {
+                message: format!("resolve workspace name failed: {e}"),
+            }
+        }
+    };
+
+    // Pre-mutation gate check — mirrors `handle_spawn`. Rejects
+    // `Deleting`/`Broken` targets regardless of whether the caller
+    // spelled the name or let it default.
+    if let Err(e) = state.lifecycle.check_can_mutate(&repo, &resolved_name) {
+        return ControlFrame::Error {
+            message: e.to_string(),
+        };
+    }
+
+    let ws = match ws_store.create(&repo, name.as_deref(), mode, branch.as_deref(), false) {
+        Ok(w) => w,
+        Err(e) => {
+            return ControlFrame::Error {
+                message: format!("create workspace failed: {e}"),
+            }
+        }
+    };
+
+    // Register the resolved name in the lifecycle map so subsequent
+    // `RemoveWorkspace` / `SpawnSession` calls see a concrete `Active`
+    // entry rather than falling through the "absent" branch. See plan
+    // starter-kit note for Phase 2.
+    state.lifecycle.register_active(&repo, &ws.name);
+
+    // Poke the monitor so the repo's next StateSnapshot includes the new
+    // workspace. Subscribers pick this up through the existing
+    // `ChangeKind::State(repo)` path — no new fine-grained event needed
+    // per D10.
+    if let Some(monitor) = state.monitor.get() {
+        monitor.poke_topology(Some(repo.clone()));
+    }
+
+    info!(
+        "CreateWorkspace: {}:{} on branch '{}'",
+        repo, ws.name, ws.branch
+    );
+    ControlFrame::CreateWorkspaceAck { workspace: ws }
+}
+
+/// Handle `ListWorkspaces` — enriched list of workspaces for a repo.
+///
+/// Reads the DB through `WorkspaceStore::list`, then joins each row against
+/// the monitor's cached `RepoState` so the caller gets both halves in one
+/// round trip. `status` is `None` when the monitor has not yet produced a
+/// snapshot (e.g. immediately after `AddRepo`) or when a workspace is newer
+/// than the last monitor tick.
+async fn handle_list_workspaces(state: &Arc<DaemonState>, repo: String) -> ControlFrame {
+    let ws_store = WorkspaceStore::new(state.paths.clone());
+    let workspaces = match ws_store.list(&repo) {
+        Ok(w) => w,
+        Err(e) => {
+            return ControlFrame::Error {
+                message: format!("list workspaces failed: {e}"),
+            }
+        }
+    };
+
+    let repo_state = match state.monitor.get() {
+        Some(monitor) => monitor.get(&repo).await,
+        None => None,
+    };
+
+    let items = workspaces
+        .into_iter()
+        .map(|ws| {
+            let status = repo_state
+                .as_ref()
+                .and_then(|s| s.workspaces.get(&ws.name).cloned());
+            shard_core::workspaces::WorkspaceWithStatus {
+                workspace: ws,
+                status,
+            }
+        })
+        .collect();
+
+    ControlFrame::WorkspaceList { items }
+}
+
+/// Handle `ListBranchInfo` — branch/worktree occupancy for a repo.
+///
+/// On-demand git read (`git branch`, `git worktree list --porcelain`)
+/// cross-referenced with the DB's workspace rows. Routed through the
+/// daemon so all callers agree on a single serialization point; not
+/// cached against the monitor's snapshot because the monitor walks the
+/// worktree list on its own cadence for a different purpose and callers
+/// of this RPC want fresh data (e.g. the new-workspace wizard picking a
+/// branch). Per D4: this is a "live view" read that migrates alongside
+/// its corresponding mutation in the same batch.
+async fn handle_list_branch_info(state: &Arc<DaemonState>, repo: String) -> ControlFrame {
+    let ws_store = WorkspaceStore::new(state.paths.clone());
+    match ws_store.list_branch_info(&repo) {
+        Ok(branches) => ControlFrame::BranchInfoList { branches },
+        Err(e) => ControlFrame::Error {
+            message: format!("list branch info failed: {e}"),
+        },
+    }
 }
 
 /// Adopt orphaned supervisors from a previous daemon instance.

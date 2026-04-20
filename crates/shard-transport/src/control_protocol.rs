@@ -4,10 +4,14 @@
 //! Type bytes are in the `0x80+` range to avoid collision with session frame types.
 
 use shard_core::state::{RepoState, WorkspaceHealth, WorkspaceStatus};
+use shard_core::workspaces::{BranchInfo, Workspace, WorkspaceMode, WorkspaceWithStatus};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current control protocol version. Bumped on breaking wire changes.
-pub const PROTOCOL_VERSION: u16 = 3;
+///
+/// v4 adds `CreateWorkspace`/`ListWorkspaces`/`ListBranchInfo` (type bytes
+/// 0x94–0x99) for Phase 2 of the daemon-broker migration.
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Well-known named pipe address for the daemon control channel.
 #[cfg(windows)]
@@ -116,6 +120,39 @@ pub enum ControlFrame {
     /// `(repo, name)` and refresh their sidebar / tree.
     WorkspaceRemoved { repo: String, name: String },
 
+    // --- Workspace Create + Reads (Phase 2 of daemon-broker migration) ---
+    /// Client → Daemon: create a new workspace under `repo`. Always
+    /// `is_base=false`; base workspaces are only created during
+    /// `AddRepo`. On success the daemon registers the workspace in the
+    /// lifecycle map (Active) and fires a topology poke so subscribers
+    /// see the new row in the next StateSnapshot.
+    CreateWorkspace {
+        repo: String,
+        name: Option<String>,
+        mode: WorkspaceMode,
+        branch: Option<String>,
+    },
+
+    /// Daemon → Client: create succeeded; returns the persisted row.
+    CreateWorkspaceAck { workspace: Workspace },
+
+    /// Client → Daemon: list workspaces for `repo` enriched with the
+    /// monitor's live `WorkspaceStatus` snapshot. Routed through the
+    /// daemon so readers and the event stream see a consistent view.
+    ListWorkspaces { repo: String },
+
+    /// Daemon → Client: enriched workspace list for a repo.
+    WorkspaceList { items: Vec<WorkspaceWithStatus> },
+
+    /// Client → Daemon: list branch-occupancy info for `repo`. Git-backed;
+    /// routed through the daemon because the monitor already walks the
+    /// worktree list on its tick and we want readers to agree with the
+    /// monitor's view.
+    ListBranchInfo { repo: String },
+
+    /// Daemon → Client: branches + occupancy.
+    BranchInfoList { branches: Vec<BranchInfo> },
+
     // --- Errors ---
     /// Daemon → Client: request failed.
     Error { message: String },
@@ -152,6 +189,16 @@ const TYPE_SESSIONS_CHANGED: u8 = 0x90;
 const TYPE_REMOVE_WORKSPACE: u8 = 0x91;
 const TYPE_REMOVE_WORKSPACE_ACK: u8 = 0x92;
 const TYPE_WORKSPACE_REMOVED: u8 = 0x93;
+const TYPE_CREATE_WORKSPACE: u8 = 0x94;
+const TYPE_CREATE_WORKSPACE_ACK: u8 = 0x95;
+const TYPE_LIST_WORKSPACES: u8 = 0x96;
+const TYPE_WORKSPACE_LIST: u8 = 0x97;
+const TYPE_LIST_BRANCH_INFO: u8 = 0x98;
+const TYPE_BRANCH_INFO_LIST: u8 = 0x99;
+
+// WorkspaceMode wire tag
+const MODE_NEW_BRANCH: u8 = 0;
+const MODE_EXISTING_BRANCH: u8 = 1;
 
 /// Write a control frame to an async writer.
 pub async fn write_control_frame<W: AsyncWrite + Unpin>(
@@ -271,6 +318,53 @@ pub async fn write_control_frame<W: AsyncWrite + Unpin>(
             write_str(&mut payload, repo);
             write_str(&mut payload, name);
             TYPE_WORKSPACE_REMOVED
+        }
+        ControlFrame::CreateWorkspace {
+            repo,
+            name,
+            mode,
+            branch,
+        } => {
+            write_str(&mut payload, repo);
+            write_opt_str(&mut payload, name.as_deref());
+            payload.push(mode_to_byte(*mode));
+            write_opt_str(&mut payload, branch.as_deref());
+            TYPE_CREATE_WORKSPACE
+        }
+        ControlFrame::CreateWorkspaceAck { workspace } => {
+            write_workspace(&mut payload, workspace);
+            TYPE_CREATE_WORKSPACE_ACK
+        }
+        ControlFrame::ListWorkspaces { repo } => {
+            write_str(&mut payload, repo);
+            TYPE_LIST_WORKSPACES
+        }
+        ControlFrame::WorkspaceList { items } => {
+            payload.extend_from_slice(&(items.len() as u32).to_be_bytes());
+            for item in items {
+                write_workspace(&mut payload, &item.workspace);
+                match &item.status {
+                    Some(status) => {
+                        payload.push(1);
+                        write_workspace_status(&mut payload, status);
+                    }
+                    None => payload.push(0),
+                }
+            }
+            TYPE_WORKSPACE_LIST
+        }
+        ControlFrame::ListBranchInfo { repo } => {
+            write_str(&mut payload, repo);
+            TYPE_LIST_BRANCH_INFO
+        }
+        ControlFrame::BranchInfoList { branches } => {
+            payload.extend_from_slice(&(branches.len() as u32).to_be_bytes());
+            for b in branches {
+                write_str(&mut payload, &b.name);
+                payload.push(if b.is_head { 1 } else { 0 });
+                write_opt_str(&mut payload, b.checked_out_by.as_deref());
+            }
+            TYPE_BRANCH_INFO_LIST
         }
         ControlFrame::Error { message } => {
             write_str(&mut payload, message);
@@ -475,6 +569,78 @@ pub async fn read_control_frame<R: AsyncRead + Unpin>(
             let (name, _) = read_str(&payload[n..])?;
             ControlFrame::WorkspaceRemoved { repo, name }
         }
+        TYPE_CREATE_WORKSPACE => {
+            let mut offset = 0;
+            let (repo, n) = read_str(&payload[offset..])?;
+            offset += n;
+            let (name, n) = read_opt_str(&payload[offset..])?;
+            offset += n;
+            ensure_len(&payload[offset..], 1, "CreateWorkspace mode")?;
+            let mode = mode_from_byte(payload[offset])?;
+            offset += 1;
+            let (branch, _) = read_opt_str(&payload[offset..])?;
+            ControlFrame::CreateWorkspace {
+                repo,
+                name,
+                mode,
+                branch,
+            }
+        }
+        TYPE_CREATE_WORKSPACE_ACK => {
+            let (workspace, _) = read_workspace(payload)?;
+            ControlFrame::CreateWorkspaceAck { workspace }
+        }
+        TYPE_LIST_WORKSPACES => {
+            let (repo, _) = read_str(payload)?;
+            ControlFrame::ListWorkspaces { repo }
+        }
+        TYPE_WORKSPACE_LIST => {
+            ensure_len(payload, 4, "WorkspaceList count")?;
+            let count = u32::from_be_bytes(payload[..4].try_into().unwrap()) as usize;
+            let mut offset = 4;
+            let mut items = Vec::with_capacity(count);
+            for _ in 0..count {
+                let (workspace, n) = read_workspace(&payload[offset..])?;
+                offset += n;
+                ensure_len(&payload[offset..], 1, "WorkspaceList status tag")?;
+                let status = if payload[offset] == 1 {
+                    offset += 1;
+                    let (s, n) = read_workspace_status(&payload[offset..])?;
+                    offset += n;
+                    Some(s)
+                } else {
+                    offset += 1;
+                    None
+                };
+                items.push(WorkspaceWithStatus { workspace, status });
+            }
+            ControlFrame::WorkspaceList { items }
+        }
+        TYPE_LIST_BRANCH_INFO => {
+            let (repo, _) = read_str(payload)?;
+            ControlFrame::ListBranchInfo { repo }
+        }
+        TYPE_BRANCH_INFO_LIST => {
+            ensure_len(payload, 4, "BranchInfoList count")?;
+            let count = u32::from_be_bytes(payload[..4].try_into().unwrap()) as usize;
+            let mut offset = 4;
+            let mut branches = Vec::with_capacity(count);
+            for _ in 0..count {
+                let (name, n) = read_str(&payload[offset..])?;
+                offset += n;
+                ensure_len(&payload[offset..], 1, "BranchInfo is_head")?;
+                let is_head = payload[offset] == 1;
+                offset += 1;
+                let (checked_out_by, n) = read_opt_str(&payload[offset..])?;
+                offset += n;
+                branches.push(BranchInfo {
+                    name,
+                    is_head,
+                    checked_out_by,
+                });
+            }
+            ControlFrame::BranchInfoList { branches }
+        }
         TYPE_ERROR => {
             let (message, _) = read_str(payload)?;
             ControlFrame::Error { message }
@@ -567,6 +733,85 @@ fn read_workspace_status(buf: &[u8]) -> std::io::Result<(WorkspaceStatus, usize)
             head_sha: sha,
             detached,
             health,
+        },
+        offset,
+    ))
+}
+
+// --- Workspace + BranchInfo + WorkspaceMode wire encoding ---
+//
+// Layout for Workspace:
+//   [name str][branch str][path str][is_base u8][created_at u64]
+//
+// Option<String> is encoded with a 1-byte tag (0 = None, 1 = Some) followed by
+// a length-prefixed string in the Some case.
+
+fn mode_to_byte(mode: WorkspaceMode) -> u8 {
+    match mode {
+        WorkspaceMode::NewBranch => MODE_NEW_BRANCH,
+        WorkspaceMode::ExistingBranch => MODE_EXISTING_BRANCH,
+    }
+}
+
+fn mode_from_byte(byte: u8) -> std::io::Result<WorkspaceMode> {
+    match byte {
+        MODE_NEW_BRANCH => Ok(WorkspaceMode::NewBranch),
+        MODE_EXISTING_BRANCH => Ok(WorkspaceMode::ExistingBranch),
+        other => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unknown WorkspaceMode byte: {other}"),
+        )),
+    }
+}
+
+fn write_opt_str(buf: &mut Vec<u8>, s: Option<&str>) {
+    match s {
+        Some(value) => {
+            buf.push(1);
+            write_str(buf, value);
+        }
+        None => buf.push(0),
+    }
+}
+
+fn read_opt_str(buf: &[u8]) -> std::io::Result<(Option<String>, usize)> {
+    ensure_len(buf, 1, "Option<String> tag")?;
+    if buf[0] == 1 {
+        let (s, n) = read_str(&buf[1..])?;
+        Ok((Some(s), 1 + n))
+    } else {
+        Ok((None, 1))
+    }
+}
+
+fn write_workspace(buf: &mut Vec<u8>, ws: &Workspace) {
+    write_str(buf, &ws.name);
+    write_str(buf, &ws.branch);
+    write_str(buf, &ws.path);
+    buf.push(if ws.is_base { 1 } else { 0 });
+    buf.extend_from_slice(&ws.created_at.to_be_bytes());
+}
+
+fn read_workspace(buf: &[u8]) -> std::io::Result<(Workspace, usize)> {
+    let mut offset = 0;
+    let (name, n) = read_str(&buf[offset..])?;
+    offset += n;
+    let (branch, n) = read_str(&buf[offset..])?;
+    offset += n;
+    let (path, n) = read_str(&buf[offset..])?;
+    offset += n;
+    ensure_len(&buf[offset..], 9, "Workspace is_base + created_at")?;
+    let is_base = buf[offset] == 1;
+    offset += 1;
+    let created_at = u64::from_be_bytes(buf[offset..offset + 8].try_into().unwrap());
+    offset += 8;
+    Ok((
+        Workspace {
+            name,
+            branch,
+            path,
+            is_base,
+            created_at,
         },
         offset,
     ))
@@ -844,5 +1089,140 @@ mod tests {
         let state = RepoState::new("empty-repo");
         let frame = ControlFrame::StateSnapshot { state };
         assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    fn sample_workspace(name: &str, is_base: bool) -> Workspace {
+        Workspace {
+            name: name.to_string(),
+            branch: format!("branch-{name}"),
+            path: format!(r"C:\tmp\{name}"),
+            is_base,
+            created_at: 1_700_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn roundtrip_create_workspace_full() {
+        let frame = ControlFrame::CreateWorkspace {
+            repo: "demo".to_string(),
+            name: Some("feature".to_string()),
+            mode: WorkspaceMode::ExistingBranch,
+            branch: Some("main".to_string()),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_create_workspace_minimal() {
+        let frame = ControlFrame::CreateWorkspace {
+            repo: "demo".to_string(),
+            name: None,
+            mode: WorkspaceMode::NewBranch,
+            branch: None,
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_create_workspace_ack() {
+        let frame = ControlFrame::CreateWorkspaceAck {
+            workspace: sample_workspace("feature-a", false),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_create_workspace_ack_base() {
+        let frame = ControlFrame::CreateWorkspaceAck {
+            workspace: sample_workspace("base", true),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_list_workspaces() {
+        let frame = ControlFrame::ListWorkspaces {
+            repo: "demo".to_string(),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_workspace_list_full() {
+        let frame = ControlFrame::WorkspaceList {
+            items: vec![
+                WorkspaceWithStatus {
+                    workspace: sample_workspace("main", true),
+                    status: Some(WorkspaceStatus {
+                        current_branch: Some("main".to_string()),
+                        head_sha: Some("a".repeat(40)),
+                        detached: false,
+                        health: WorkspaceHealth::Healthy,
+                    }),
+                },
+                WorkspaceWithStatus {
+                    workspace: sample_workspace("feature", false),
+                    status: None,
+                },
+            ],
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_workspace_list_empty() {
+        let frame = ControlFrame::WorkspaceList { items: vec![] };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_list_branch_info() {
+        let frame = ControlFrame::ListBranchInfo {
+            repo: "demo".to_string(),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_branch_info_list() {
+        let frame = ControlFrame::BranchInfoList {
+            branches: vec![
+                BranchInfo {
+                    name: "main".to_string(),
+                    is_head: true,
+                    checked_out_by: None,
+                },
+                BranchInfo {
+                    name: "feature".to_string(),
+                    is_head: false,
+                    checked_out_by: Some("feature-workspace".to_string()),
+                },
+            ],
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_branch_info_list_empty() {
+        let frame = ControlFrame::BranchInfoList { branches: vec![] };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn mode_byte_rejects_unknown() {
+        let mut bytes = Vec::new();
+        write_str(&mut bytes, "demo");
+        bytes.push(0); // name tag: None
+        bytes.push(0x7f); // invalid mode
+        bytes.push(0); // branch tag: None
+
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&((1 + bytes.len()) as u32).to_be_bytes());
+        framed.push(TYPE_CREATE_WORKSPACE);
+        framed.extend_from_slice(&bytes);
+
+        let mut cursor = std::io::Cursor::new(framed);
+        let err = read_control_frame(&mut cursor).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

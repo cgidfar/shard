@@ -1,6 +1,6 @@
 # Daemon-as-Broker Migration Plan
 
-**Status:** Phase 0 + Phase 1 landed on branch `daemon-broker-migration`. Codex-reviewed; five findings applied. 71 tests pass, zero warnings. Ready for Phase 2.
+**Status:** Phase 0 + Phase 1 + Phase 2 landed on branch `daemon-broker-migration`. Codex-reviewed across three rounds (Phase 2: 2 round-1 + 1 round-2 findings, all applied; round 3 converged). 94 tests pass, zero warnings. Ready for Phase 3.
 **Related:** SHA-55 (workspace delete failure), `docs/responsibility-map.md`
 
 ## Goals
@@ -242,20 +242,53 @@ Each phase is a self-contained PR. All tests pass at the end of each phase; none
 - Coverage for `state.monitor.get() == None` — the handler's `if let Some(monitor) = state.monitor.get()` is a defensive no-op. Exercising it would require restructuring the `OnceLock` into a `RwLock` just for tests; the production control loop always initializes the monitor before accepting the first client. Noted as a known gap in the handler doc comment.
 - Subscribe-client backpressure (Risk 2) — adding `WorkspaceRemoved` didn't materially change the risk profile; `run_subscribe_loop` already handles `broadcast::RecvError::Lagged` with a resync. Defer to Phase 6 per the original plan.
 
-### Phase 2 — Rest of Batch B
+### Phase 2 — Rest of Batch B ✅ LANDED
 
-`CreateWorkspace`, `ListWorkspaces`, `ListBranchInfo`. Follows the Phase 1 template.
+`CreateWorkspace`, `ListWorkspaces`, `ListBranchInfo`. Follows the Phase 1 template plus a new per-repo mutation mutex from the Codex round-2 finding.
 
-**Phase 2 starter kit — things a next session should know:**
+1. ✅ `ControlFrame::CreateWorkspace { repo, name, mode, branch }` / `CreateWorkspaceAck { workspace }`, `ListWorkspaces { repo }` / `WorkspaceList { items }`, `ListBranchInfo { repo }` / `BranchInfoList { branches }` (type bytes `0x94–0x99`). `PROTOCOL_VERSION` bumped 3 → 4. Wire encoders added: `write_opt_str`, `write_workspace`, `mode_to_byte`; plus 14 new roundtrip tests.
+2. ✅ `WorkspaceWithStatus` moved from `shard-app/src/commands/workspace.rs` to `shard-core/src/workspaces.rs` (with `PartialEq/Eq` derives on `Workspace` / `BranchInfo`) so the enriched shape can cross the wire without a duplicate type.
+3. ✅ `daemon.rs::handle_create_workspace` runs the D5 workflow: resolve effective name via the new `WorkspaceStore::resolve_workspace_name` helper, `check_can_mutate` against the resolved name, `ws_store.create`, `register_active`, `poke_topology` (reuses `ChangeKind::State(repo)` per D10). `handle_list_workspaces` joins DB + monitor-cached `RepoState`. `handle_list_branch_info` delegates to `WorkspaceStore::list_branch_info` (on-demand git, deliberately not monitor-cached; the wizard wants fresh data).
+4. ✅ `DaemonState::repo_mutation_locks` + `acquire_repo_mutation_lock` — per-repo `Arc<tokio::sync::Mutex<()>>` held across both `handle_create_workspace` and `handle_remove_workspace` critical sections. Closes the Codex round-2 race where a concurrent `RemoveWorkspace` on an as-yet-absent name could ack during a `CreateWorkspace` committing the same row.
+5. ✅ Tauri commands (`shard-app/src/commands/workspace.rs`) now 4-line translators over `daemon_ipc::create_workspace` / `list_workspaces` / `list_branch_info`. The local `WorkspaceWithStatus` struct was removed in favor of the shard-core one (JSON shape preserved via `#[serde(flatten)]`).
+6. ✅ CLI (`shard-cli/src/cmd/workspace.rs`) routes create/list through the daemon via a shared `run_daemon_rpc` helper — collapses the connect/handshake boilerplate across three call sites. `workspace info` stays direct (D4: immutable lookup).
 
-- **Template to clone per RPC:** `daemon_ipc.rs::remove_workspace` + `commands/workspace.rs::remove_workspace` (shard-app) and `cmd/workspace.rs::remove_via_daemon` (shard-cli). Both are ~4-line translators over `DaemonConnection::request_typed`. This shape should be copied verbatim.
-- **`CreateWorkspace` needs to register with the lifecycle gate** after successful creation (`state.lifecycle.register_active(repo, name)`). Otherwise subsequent `RemoveWorkspace` on the newly-created workspace falls through the "absent" branch of `begin_delete` — works, but cedes the pre-mutation guarantees from `check_can_mutate`.
-- **`CreateWorkspace` should also consult `check_can_mutate`** — refuse creation if the target name is in `Deleting` or `Broken`. Mirror the pattern added to `handle_spawn` in Phase 1.
-- **Reads (ListWorkspaces, ListBranchInfo):** per D4 these migrate alongside the mutation. No lifecycle gate needed for reads, just straightforward `request_typed` + new wire frames. `ListWorkspaces` should return `Vec<WorkspaceWithStatus>` enriched from the monitor's `RepoState` snapshot — the Tauri backend currently does this enrichment locally (`crates/shard-app/src/commands/workspace.rs::list_workspaces`); move that into the daemon handler.
-- **Test-harness helpers to add:** `setup_base_workspace`, plus a `fake_supervisor` utility if more tests need live sessions (the current `spawn_fake_supervisor` in `remove_workspace.rs` is a good starting point to extract).
-- **Unused-but-waiting:** `MonitorHandle::broadcast` is currently only consumed by `RemoveWorkspace`. `CreateWorkspace` will need a parallel `WorkspaceCreated` or `TopologyChanged` path; simplest is reusing the existing coarse `ChangeKind::State(repo)` emit post-create (fires a fresh `StateSnapshot` to subscribers which already contains the new workspace).
-- **`WorkspaceStore::remove` legacy path is still compiled and unused by the daemon now** — kept because it may be called from older code. Safe to delete once all batches migrate, but not in scope for Phase 2.
-- **Shared mutation-handler helper (deferred Phase 0 item):** after Phase 2 lands two or three mutation handlers, the shape of the shared plumbing (lock-store-broadcast) will be obvious. Extract then, not before.
+**Test plan — 12 Phase 2 integration tests (exceeds the 5 originally planned):**
+
+- ✅ `create_workspace_happy_path` — creates, returns populated `Workspace`, registers Active.
+- ✅ `create_workspace_blocked_during_delete` + `create_workspace_blocked_on_broken_name` — gate rejects Deleting / Broken targets.
+- ✅ `create_workspace_blocked_with_implicit_name` — regression guard for the Codex round-1 race where implicit-name callers bypassed the gate.
+- ✅ `create_workspace_duplicate_name_errors` — DB unique-constraint surfaces via `Error { message }`.
+- ✅ `create_after_delete_succeeds` — lifecycle entry cleared on `commit_gone`; proves workspace names recycle (via `ExistingBranch` on the preserved git branch, since Remove intentionally leaves the branch object — that's pre-existing behavior, not Phase 2 scope).
+- ✅ `list_workspaces_returns_created_entries` / `list_workspaces_empty_repo_returns_empty` / `list_workspaces_unknown_repo_errors` — list surface.
+- ✅ `list_branch_info_reflects_head_and_new_branches` — branch enumeration with `checked_out_by` occupancy.
+- ✅ `concurrent_creates_on_same_repo_both_succeed` — per-repo mutex deadlock guard.
+- ✅ `concurrent_create_and_remove_reach_consistent_state` — asserts DB and filesystem agree post-race (no orphan rows or dirs).
+
+**Codex review rounds (Phase 2 landing):**
+
+| Round | Severity | Finding | Resolution |
+|-------|---|---|---|
+| 1 | Medium | `handle_create_workspace` skipped `check_can_mutate` when `name: None`; the effective name is resolved by `WorkspaceStore::create` from HEAD/branch so implicit-name callers bypassed the gate | Extracted pure `WorkspaceStore::resolve_workspace_name` (side-effect-free except for a `git symbolic-ref` lookup); handler now resolves the name first and gate-checks against the resolved form unconditionally |
+| 1 | Low | `handle_list_branch_info` comment claimed "monitor-aware" but the code does on-demand git | Rewrote the comment — the RPC is on-demand git routed through the daemon for serialization; the wizard wants fresh data so caching against the monitor's tick would be wrong |
+| 2 | Medium | `CreateWorkspace` vs `RemoveWorkspace` on the same repo could interleave: Create's gate check sees absent, then Remove's `begin_delete` also sees absent, commits Gone, acks; Create continues and commits the row. Remove's ack is misleading | Added per-repo mutation mutex (`DaemonState::repo_mutation_locks` + `acquire_repo_mutation_lock`); both handlers hold the guard across their critical section. Per-repo (not per-workspace) for simplicity; single-user app means the coarser grain costs nothing |
+| 3 | — | None | Converged |
+
+**Phase 2 discoveries the plan didn't anticipate:**
+
+- `WorkspaceWithStatus` needed to move to `shard-core` so both the daemon and the Tauri backend could share the type. The frontend JSON shape is preserved via `#[serde(flatten)]` on the embedded `Workspace` field — no TypeScript changes required.
+- The plan's "`CreateWorkspace` should consult `check_can_mutate`" wording hid a subtle gap: the resolved workspace name is only visible after `WorkspaceStore::create` computes it, so the handler needed its own name-resolution step to gate-check uniformly. Factored `resolve_workspace_name` to avoid logic duplication with `create`.
+- The per-repo mutation mutex fills a gap the lifecycle gate alone couldn't close: `begin_delete` + `check_can_mutate` are independently atomic, but the DB-plus-git workflow between them isn't, so concurrent operations on an absent name could both see "nothing to block" and both proceed. The mutex linearizes Create and Remove on the same repo.
+- The `create_after_delete_succeeds` scenario exposed a pre-existing quirk: `WorkspaceStore::remove` (now routed through `RemoveWorkspace`) intentionally leaves the git branch object behind when the worktree is removed. Re-creating under the same name therefore requires `WorkspaceMode::ExistingBranch` to re-use the dangling branch. This is a separate UX concern worth a Linear issue if it surfaces in user testing; not in Phase 2 scope.
+
+**Phase 3 starter kit — things a next session should know:**
+
+- **Template is now stable:** `daemon_ipc.rs::create_workspace` (shard-app), `cmd/workspace.rs::create_via_daemon` (shard-cli), and the paired `handle_create_workspace` in `daemon.rs` are the reference shapes. Copy verbatim for Batch A.
+- **Repo-scoped mutations share `acquire_repo_mutation_lock`** — `RemoveRepo` will need it held across workspace-by-workspace teardown. For `AddRepo`, the "repo" doesn't exist yet so the lock just serializes duplicate-alias races.
+- **`FindSessionById` walks all DBs** and should hold a global (not per-repo) lock; defer that detail until the handler is written.
+- **`poke_topology(None)` still exists** for full-reload needs that `AddRepo`/`RemoveRepo` might use — check if a scoped alternative is cleaner before reusing it.
+- **`spawn_topology_poke` is still consumed by `commands/repo.rs`** — the remaining holdout. Remove it alongside Phase 3's repo migration.
+- **Protocol version v4 is live** — older clients hard-fail the handshake (per D7). If you bump to v5, coordinate the shard-app rebuild and any running CLI tooling.
 
 ### Phase 3 — Batch A
 
@@ -288,4 +321,6 @@ Add bounded mpsc per subscribe client in the daemon (agent A flagged the current
 1. **After this doc stabilizes (done).** Review of D1–D11 revealed: D5 "atomic" was under-specified (concurrent handlers + `StopSession` not waiting for exit), actor pattern in D9 confirmed correct (ack semantics added), missing per-object lifecycle state machine (now D12), manual-only Phase 1 test plan was insufficient. All incorporated above.
 2. **After Phase 0 lands — done as part of the Phase 1 landing review (combined).** `MonitorCommand` ordering confirmed correct; `stop_session_and_wait` with `force_kill_pid_checked` fallback validated; `LifecycleRegistry` simplified (no `NotFound` variant — atomic insert-on-absent).
 3. **After Phase 1 lands and SHA-55 is fixed — done.** Five findings, all addressed: see the Phase 1 section above.
-4. **After Phase 2 lands** — review the `CreateWorkspace` gate interaction and the list-read consistency with `StateSnapshot`.
+4. **After Phase 2 lands — done.** Three findings, all addressed (see Phase 2 table above): implicit-name gate bypass (round 1), misleading `list_branch_info` comment (round 1), Create-vs-Remove serialization race (round 2). Round 3 converged.
+
+5. **After Phase 3 lands** — review the `RemoveRepo` cascade path: does it correctly hold the per-repo mutation lock while iterating per-workspace cleanup, or does it need to drop + re-acquire? Plus `FindSessionById`'s global lock semantics.

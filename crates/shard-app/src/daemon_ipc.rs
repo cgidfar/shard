@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use shard_core::state::RepoState;
+use shard_core::workspaces::{BranchInfo, Workspace, WorkspaceMode, WorkspaceWithStatus};
 use shard_transport::control_protocol::ControlFrame;
 use shard_transport::daemon_client;
 use tauri::{AppHandle, Emitter, Manager};
@@ -73,6 +74,82 @@ pub async fn remove_workspace(repo: &str, name: &str) -> Result<(), String> {
         },
         |f| match f {
             ControlFrame::RemoveWorkspaceAck => Ok(()),
+            other => Err(other),
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Create a workspace via the daemon RPC. See
+/// `crates/shard-cli/src/cmd/daemon.rs::handle_create_workspace` for the
+/// gate / register / poke sequence.
+pub async fn create_workspace(
+    repo: &str,
+    name: Option<String>,
+    mode: WorkspaceMode,
+    branch: Option<String>,
+) -> Result<Workspace, String> {
+    let mut conn = daemon_client::connect()
+        .await
+        .map_err(|e| format!("daemon connect failed: {e}"))?;
+    conn.handshake()
+        .await
+        .map_err(|e| format!("daemon handshake failed: {e}"))?;
+    conn.request_typed(
+        &ControlFrame::CreateWorkspace {
+            repo: repo.to_string(),
+            name,
+            mode,
+            branch,
+        },
+        |f| match f {
+            ControlFrame::CreateWorkspaceAck { workspace } => Ok(workspace),
+            other => Err(other),
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// List workspaces for `repo`, enriched with live `WorkspaceStatus` from the
+/// daemon monitor. The daemon joins DB + monitor snapshot server-side so
+/// the caller sees a consistent view.
+pub async fn list_workspaces(repo: &str) -> Result<Vec<WorkspaceWithStatus>, String> {
+    let mut conn = daemon_client::connect()
+        .await
+        .map_err(|e| format!("daemon connect failed: {e}"))?;
+    conn.handshake()
+        .await
+        .map_err(|e| format!("daemon handshake failed: {e}"))?;
+    conn.request_typed(
+        &ControlFrame::ListWorkspaces {
+            repo: repo.to_string(),
+        },
+        |f| match f {
+            ControlFrame::WorkspaceList { items } => Ok(items),
+            other => Err(other),
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Enumerate branches + current worktree occupancy for `repo`. Drives the
+/// new-workspace wizard's branch picker.
+pub async fn list_branch_info(repo: &str) -> Result<Vec<BranchInfo>, String> {
+    let mut conn = daemon_client::connect()
+        .await
+        .map_err(|e| format!("daemon connect failed: {e}"))?;
+    conn.handshake()
+        .await
+        .map_err(|e| format!("daemon handshake failed: {e}"))?;
+    conn.request_typed(
+        &ControlFrame::ListBranchInfo {
+            repo: repo.to_string(),
+        },
+        |f| match f {
+            ControlFrame::BranchInfoList { branches } => Ok(branches),
             other => Err(other),
         },
     )

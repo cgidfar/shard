@@ -52,7 +52,7 @@ pub fn default_git_ops() -> Arc<dyn WorkspaceGitOps> {
     Arc::new(RealGitOps)
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Workspace {
     pub name: String,
     pub branch: String,
@@ -79,11 +79,28 @@ pub enum WorkspaceMode {
 /// Surfaces to the frontend so the new-workspace wizard can pick a base
 /// branch (mode = NewBranch) or pick an existing branch to check out
 /// (mode = ExistingBranch) and warn when that branch is already claimed.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BranchInfo {
     pub name: String,
     pub is_head: bool,
     pub checked_out_by: Option<String>,
+}
+
+/// A workspace persisted row enriched with live derived status from the
+/// daemon's monitor. Returned by `ControlFrame::ListWorkspaces` so callers
+/// get both halves in one round trip instead of joining them client-side.
+///
+/// Kept in `shard-core` (not `shard-app`) so both the Tauri backend and
+/// `shardctl` can render the same shape.
+///
+/// `status` is `None` when the daemon has no snapshot for this repo yet
+/// (e.g. right after `AddRepo`, before the monitor's first tick). The
+/// frontend must handle this as "unknown", not "unhealthy".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkspaceWithStatus {
+    #[serde(flatten)]
+    pub workspace: Workspace,
+    pub status: Option<crate::state::WorkspaceStatus>,
 }
 
 pub struct WorkspaceStore {
@@ -93,6 +110,51 @@ pub struct WorkspaceStore {
 impl WorkspaceStore {
     pub fn new(paths: ShardPaths) -> Self {
         Self { paths }
+    }
+
+    /// Resolve the effective workspace name from `(name, mode, branch)`
+    /// WITHOUT touching disk or the DB. Side-effect-free except for the
+    /// git `default_branch` lookup (a plumbing `git symbolic-ref` — no
+    /// fetch, no commit).
+    ///
+    /// Separated from `create` so the daemon's mutation handler can
+    /// gate-check the resolved name against the lifecycle registry
+    /// before any work is committed. Mirrors the exact resolution logic
+    /// in `create` — if it drifts, the gate check stops matching what
+    /// `create` writes to the DB.
+    ///
+    /// Only models the non-base path. `is_base=true` workspaces are
+    /// only created during `AddRepo`, which has its own handler in
+    /// Phase 3.
+    pub fn resolve_workspace_name(
+        &self,
+        repo_alias: &str,
+        name: Option<&str>,
+        mode: WorkspaceMode,
+        branch: Option<&str>,
+    ) -> Result<String> {
+        let repo_store = RepositoryStore::new(self.paths.clone());
+        let repo = repo_store.get(repo_alias)?;
+        let source_dir = self
+            .paths
+            .repo_source_for_repo(repo_alias, repo.local_path.as_deref());
+
+        let branch_for_db = match mode {
+            WorkspaceMode::NewBranch => match branch {
+                Some(b) => b.to_string(),
+                None => git::default_branch(&source_dir)?,
+            },
+            WorkspaceMode::ExistingBranch => branch
+                .ok_or_else(|| {
+                    ShardError::Other("existing_branch mode requires a branch name".into())
+                })?
+                .to_string(),
+        };
+
+        Ok(match name {
+            Some(n) => n.to_string(),
+            None => branch_for_db,
+        })
     }
 
     /// Create a new workspace for a repo.
