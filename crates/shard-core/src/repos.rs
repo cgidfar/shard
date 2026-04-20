@@ -8,7 +8,7 @@ use crate::git;
 use crate::paths::ShardPaths;
 use crate::{Result, ShardError};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Repository {
     pub id: String,
     pub url: String,

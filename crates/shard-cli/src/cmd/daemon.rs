@@ -1568,6 +1568,9 @@ async fn dispatch_request(state: &Arc<DaemonState>, frame: ControlFrame) -> Cont
                 | ControlFrame::StopSession { .. }
                 | ControlFrame::CreateWorkspace { .. }
                 | ControlFrame::RemoveWorkspace { .. }
+                | ControlFrame::AddRepo { .. }
+                | ControlFrame::RemoveRepo { .. }
+                | ControlFrame::SyncRepo { .. }
         )
     {
         return ControlFrame::Error {
@@ -1603,6 +1606,14 @@ async fn dispatch_request(state: &Arc<DaemonState>, frame: ControlFrame) -> Cont
         ControlFrame::ListWorkspaces { repo } => handle_list_workspaces(state, repo).await,
 
         ControlFrame::ListBranchInfo { repo } => handle_list_branch_info(state, repo).await,
+
+        ControlFrame::AddRepo { url, alias } => handle_add_repo(state, url, alias).await,
+
+        ControlFrame::RemoveRepo { alias } => handle_remove_repo(state, alias).await,
+
+        ControlFrame::SyncRepo { alias } => handle_sync_repo(state, alias).await,
+
+        ControlFrame::ListRepos => handle_list_repos(state).await,
 
         ControlFrame::ListSessions => {
             let sessions = state.sessions.lock().await;
@@ -2172,6 +2183,298 @@ async fn handle_list_branch_info(state: &Arc<DaemonState>, repo: String) -> Cont
         Ok(branches) => ControlFrame::BranchInfoList { branches },
         Err(e) => ControlFrame::Error {
             message: format!("list branch info failed: {e}"),
+        },
+    }
+}
+
+/// Handle `AddRepo` — registers a repo (bare clone for URLs, direct
+/// reference for local paths) and auto-creates a base workspace on the
+/// detected default branch.
+///
+/// Holds the per-repo mutation lock keyed by the resolved alias so a
+/// concurrent `AddRepo` for the same alias can't race the duplicate
+/// check. We can't know the alias before calling `RepositoryStore::add`
+/// if the caller didn't supply one, so the lock is acquired up-front
+/// by the explicit alias when present; otherwise we trust the DB
+/// unique constraint to surface the duplicate — a rare path, and the
+/// single-user model makes two-concurrent-AddRepo essentially
+/// theoretical.
+async fn handle_add_repo(
+    state: &Arc<DaemonState>,
+    url: String,
+    alias: Option<String>,
+) -> ControlFrame {
+    let repo_store = RepositoryStore::new(state.paths.clone());
+
+    // If the caller supplied an alias, we can take the per-repo mutex
+    // up-front. Otherwise defer acquisition until after `add` derives
+    // the alias so we don't hold two locks.
+    let explicit_lock = if let Some(alias) = alias.as_deref() {
+        let lock = state.acquire_repo_mutation_lock(alias).await;
+        Some(lock.lock_owned().await)
+    } else {
+        None
+    };
+
+    let repo = match repo_store.add(&url, alias.as_deref()) {
+        Ok(r) => r,
+        Err(e) => {
+            return ControlFrame::Error {
+                message: format!("add repo failed: {e}"),
+            }
+        }
+    };
+
+    // Now that the alias is known, re-acquire the lock if we didn't
+    // have one. This is technically racy vs. an RPC that raced to add
+    // the same derived alias, but the DB unique constraint caught the
+    // collision above; by the time we're here, the row is ours.
+    let _post_lock = match explicit_lock {
+        Some(g) => Some(g),
+        None => {
+            let lock = state.acquire_repo_mutation_lock(&repo.alias).await;
+            Some(lock.lock_owned().await)
+        }
+    };
+
+    // Auto-create the base workspace on the detected default branch.
+    // Mirrors the old direct-path behaviour in `commands/repo.rs` /
+    // `cmd/repo.rs`. Failures here are logged but don't abort AddRepo
+    // — the repo row is usable without the base workspace; the user
+    // can create one manually via CreateWorkspace.
+    let ws_store = WorkspaceStore::new(state.paths.clone());
+    let source_dir = state
+        .paths
+        .repo_source_for_repo(&repo.alias, repo.local_path.as_deref());
+    let is_local = repo.local_path.is_some();
+    match shard_core::git::default_branch(&source_dir) {
+        Ok(branch) => match ws_store.create(
+            &repo.alias,
+            Some(&branch),
+            shard_core::workspaces::WorkspaceMode::NewBranch,
+            Some(&branch),
+            is_local,
+        ) {
+            Ok(ws) => {
+                state.lifecycle.register_active(&repo.alias, &ws.name);
+            }
+            Err(e) => warn!(
+                "AddRepo: could not auto-create default workspace for {}: {e}",
+                repo.alias
+            ),
+        },
+        Err(e) => warn!(
+            "AddRepo: could not detect default branch for {}: {e}",
+            repo.alias
+        ),
+    }
+
+    // Let the monitor pick up the new repo so StateSnapshot subscribers
+    // see a row on the next tick.
+    if let Some(monitor) = state.monitor.get() {
+        monitor.poke_topology(Some(repo.alias.clone()));
+    }
+
+    info!(
+        "AddRepo: {} (url='{}', local={})",
+        repo.alias, repo.url, is_local
+    );
+    ControlFrame::AddRepoAck { repo }
+}
+
+/// Handle `RemoveRepo` — full repo teardown.
+///
+/// Serialization model:
+/// 1. Acquire the per-repo mutation lock (blocks concurrent
+///    `CreateWorkspace` / `RemoveWorkspace` / `AddRepo` with the same
+///    alias).
+/// 2. Mark every workspace under this repo `Deleting` via the
+///    lifecycle registry so concurrent `SpawnSession` fails fast.
+/// 3. Stop and drain every bound session with the same 5s / force-kill
+///    budget used by `RemoveWorkspace`.
+/// 4. Drop the monitor's watcher for this repo (releases all
+///    `ReadDirectoryChangesW` handles) and wait for the ack.
+/// 5. Call `RepositoryStore::remove` — handles git worktree removal,
+///    `.shard/` cleanup, and DB deletion.
+/// 6. `lifecycle.clear_repo` — drop every stale `Deleting`/`Active`
+///    entry for this repo so AddRepo-then-RemoveRepo-then-AddRepo
+///    under the same alias doesn't carry phantom state.
+/// 7. `poke_topology(Some(alias))` — the monitor sees the repo is
+///    gone from the DB and drops its state entry.
+///
+/// If any step after lifecycle-transition fails, we leave each
+/// workspace in `Deleting` (no rollback to Active — the repo is partly
+/// torn down and a retry via `RemoveRepo` is the sanctioned path).
+async fn handle_remove_repo(state: &Arc<DaemonState>, alias: String) -> ControlFrame {
+    let repo_lock = state.acquire_repo_mutation_lock(&alias).await;
+    let _guard = repo_lock.lock().await;
+
+    // Confirm the repo exists before doing any work.
+    let repo_store = RepositoryStore::new(state.paths.clone());
+    match repo_store.get(&alias) {
+        Ok(_) => {}
+        Err(shard_core::ShardError::RepoNotFound(_)) => {
+            // Idempotent: already gone.
+            return ControlFrame::RemoveRepoAck;
+        }
+        Err(e) => {
+            return ControlFrame::Error {
+                message: format!("repo lookup failed: {e}"),
+            }
+        }
+    }
+
+    // 1. Lifecycle-gate every workspace. We hold the per-repo mutex so
+    //    no new workspaces can land while we iterate. `begin_delete`
+    //    against an Active or absent entry transitions to Deleting and
+    //    returns a DeleteGuard. Against an AlreadyDeleting entry we
+    //    wait and retry (the peer is from the same repo; under the
+    //    mutex it must have started before we acquired it).
+    let ws_store = WorkspaceStore::new(state.paths.clone());
+    let workspaces = match ws_store.list(&alias) {
+        Ok(w) => w,
+        Err(e) => {
+            return ControlFrame::Error {
+                message: format!("list workspaces during repo remove: {e}"),
+            }
+        }
+    };
+
+    let mut guards: Vec<crate::cmd::lifecycle::DeleteGuard> = Vec::new();
+    for ws in &workspaces {
+        loop {
+            match state.lifecycle.begin_delete(&alias, &ws.name) {
+                crate::cmd::lifecycle::BeginDelete::Started(g) => {
+                    guards.push(g);
+                    break;
+                }
+                crate::cmd::lifecycle::BeginDelete::AlreadyDeleting(notifier) => {
+                    notifier.notified().await;
+                }
+            }
+        }
+    }
+
+    // 2. Stop every session bound to this repo. Snapshot the relevant
+    //    entries up front so we can release the sessions lock before
+    //    the potentially long per-session stop-and-wait.
+    let bound_sessions: Vec<(String, String, u32, u64)> = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .values()
+            .filter(|s| s.repo == alias)
+            .map(|s| {
+                (
+                    s.session_id.clone(),
+                    s.transport_addr.clone(),
+                    s.supervisor_pid,
+                    s.creation_time,
+                )
+            })
+            .collect()
+    };
+
+    for (session_id, transport_addr, pid, creation_time) in &bound_sessions {
+        match stop_session_and_wait(
+            transport_addr,
+            *pid,
+            *creation_time,
+            Duration::from_secs(5),
+        )
+        .await
+        {
+            Ok(_) => {
+                let mut sessions = state.sessions.lock().await;
+                sessions.remove(session_id);
+            }
+            Err(e) => {
+                warn!(
+                    "RemoveRepo: failed to stop session {} ({e}); aborting",
+                    &session_id[..8.min(session_id.len())]
+                );
+                // Leave lifecycle entries in Deleting — a retried
+                // RemoveRepo can pick up where we left off. The
+                // guards drop without commit and roll back to Active
+                // here, which is the right thing: the repo is still
+                // intact on disk.
+                for g in guards {
+                    g.rollback();
+                }
+                return ControlFrame::Error {
+                    message: format!(
+                        "failed to stop bound session {}: {e}",
+                        &session_id[..8.min(session_id.len())]
+                    ),
+                };
+            }
+        }
+    }
+
+    // 3. Drop the monitor's watcher for this repo — releases every
+    //    ReadDirectoryChangesW handle before we invoke
+    //    RemoveDirectoryW. Non-fatal on error: reconcile will clean up
+    //    stale RepoState entries if the ack path falters.
+    if let Some(monitor) = state.monitor.get() {
+        if let Err(e) = monitor.drop_repo(&alias).await {
+            warn!("RemoveRepo: monitor drop failed ({e}); proceeding");
+        }
+    }
+
+    // 4. Filesystem + DB via the existing store. Preserves the local
+    //    vs. remote asymmetry (local checkouts are never deleted).
+    if let Err(e) = repo_store.remove(&alias) {
+        warn!("RemoveRepo: store.remove failed for {alias}: {e}");
+        for g in guards {
+            g.commit_broken();
+        }
+        return ControlFrame::Error {
+            message: format!("repo remove failed: {e}"),
+        };
+    }
+
+    // 5. Commit every lifecycle guard and mop up any strays from before
+    //    our snapshot (e.g. a Broken entry from a previous failed
+    //    RemoveWorkspace on a workspace whose row no longer existed).
+    for g in guards {
+        g.commit_gone();
+    }
+    let _cleared = state.lifecycle.clear_repo(&alias);
+
+    // 6. Poke the monitor so the repo drops out of the RepoState map
+    //    and the next StateSnapshot reflects the removal.
+    if let Some(monitor) = state.monitor.get() {
+        monitor.poke_topology(Some(alias.clone()));
+    }
+
+    info!("RemoveRepo: {} removed", alias);
+    ControlFrame::RemoveRepoAck
+}
+
+/// Handle `SyncRepo` — `git fetch --all --prune`. No DB mutation, no
+/// watcher coordination. Takes the per-repo mutation lock anyway so a
+/// concurrent RemoveRepo can't pull the repo out from under us.
+async fn handle_sync_repo(state: &Arc<DaemonState>, alias: String) -> ControlFrame {
+    let repo_lock = state.acquire_repo_mutation_lock(&alias).await;
+    let _guard = repo_lock.lock().await;
+
+    let repo_store = RepositoryStore::new(state.paths.clone());
+    match repo_store.sync(&alias) {
+        Ok(()) => ControlFrame::SyncRepoAck,
+        Err(e) => ControlFrame::Error {
+            message: format!("sync repo failed: {e}"),
+        },
+    }
+}
+
+/// Handle `ListRepos` — delegates to `RepositoryStore::list` under no
+/// lock (read-only path, per D4 live-view read routed through the
+/// daemon for topology-event consistency).
+async fn handle_list_repos(state: &Arc<DaemonState>) -> ControlFrame {
+    let repo_store = RepositoryStore::new(state.paths.clone());
+    match repo_store.list() {
+        Ok(repos) => ControlFrame::RepoList { repos },
+        Err(e) => ControlFrame::Error {
+            message: format!("list repos failed: {e}"),
         },
     }
 }

@@ -130,16 +130,7 @@ impl TestHarness {
     pub fn setup_local_repo(&self, alias: &str) -> (String, PathBuf) {
         use shard_core::repos::RepositoryStore;
 
-        let repo_path = self.data_path.join(format!("repo-source-{alias}"));
-        std::fs::create_dir_all(&repo_path).expect("create repo dir");
-
-        // Initialize as a git repo and make one commit so worktree add works.
-        run_git(&["init", "-b", "main"], &repo_path);
-        run_git(&["config", "user.name", "test"], &repo_path);
-        run_git(&["config", "user.email", "test@example.com"], &repo_path);
-        std::fs::write(repo_path.join("README.md"), "test\n").expect("write readme");
-        run_git(&["add", "."], &repo_path);
-        run_git(&["commit", "-m", "initial"], &repo_path);
+        let repo_path = self.create_bare_checkout(alias);
 
         let repo_store = RepositoryStore::new(
             shard_core::paths::ShardPaths::from_data_dir(self.data_path.clone()),
@@ -149,6 +140,23 @@ impl TestHarness {
             .expect("register repo");
 
         (alias.to_string(), repo_path)
+    }
+
+    /// Create a standalone git checkout on disk without registering it
+    /// with the daemon. Used by Phase 3 tests that drive `AddRepo` over
+    /// the wire — they need a valid git repo to point the RPC at.
+    pub fn create_bare_checkout(&self, alias: &str) -> PathBuf {
+        let repo_path = self.data_path.join(format!("repo-source-{alias}"));
+        std::fs::create_dir_all(&repo_path).expect("create repo dir");
+
+        run_git(&["init", "-b", "main"], &repo_path);
+        run_git(&["config", "user.name", "test"], &repo_path);
+        run_git(&["config", "user.email", "test@example.com"], &repo_path);
+        std::fs::write(repo_path.join("README.md"), "test\n").expect("write readme");
+        run_git(&["add", "."], &repo_path);
+        run_git(&["commit", "-m", "initial"], &repo_path);
+
+        repo_path
     }
 
     /// Create a fresh workspace in `repo` named `ws_name`. Returns its

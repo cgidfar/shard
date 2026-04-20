@@ -91,6 +91,34 @@ impl LifecycleRegistry {
             .or_insert(WorkspaceLifecycle::Active);
     }
 
+    /// Drop every entry belonging to `repo`, firing each `Deleting`
+    /// entry's completion notifier so any joiners unblock. Used by
+    /// `RemoveRepo` after the on-disk teardown commits — by that
+    /// point every workspace under the repo is gone, so any surviving
+    /// lifecycle records are stale.
+    ///
+    /// Returns the list of `(repo, name)` entries that were cleared,
+    /// for logging / telemetry.
+    #[allow(dead_code)] // consumed by Phase 3
+    pub fn clear_repo(&self, repo: &str) -> Vec<(String, String)> {
+        let mut map = self.states.lock().expect("lifecycle mutex poisoned");
+        let keys_to_remove: Vec<(String, String)> = map
+            .keys()
+            .filter(|(r, _)| r == repo)
+            .cloned()
+            .collect();
+        let mut removed = Vec::with_capacity(keys_to_remove.len());
+        for key in keys_to_remove {
+            if let Some(state) = map.remove(&key) {
+                if let WorkspaceLifecycle::Deleting { completion } = state {
+                    completion.notify_waiters();
+                }
+                removed.push(key);
+            }
+        }
+        removed
+    }
+
     /// Pre-mutation guard: fail fast if the target is currently unreachable
     /// (being deleted or in broken state). Called from `SpawnSession` and
     /// `CreateWorkspace` before any work begins.

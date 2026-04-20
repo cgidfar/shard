@@ -1,14 +1,11 @@
 //! App-side helpers for talking to the daemon over the control pipe.
 //!
-//! Three consumers live here:
-//!   - `spawn_topology_poke` — fire-and-forget notification sent from Tauri
-//!     commands after a repo/workspace mutation commits, so the daemon can
-//!     reload its in-memory topology.
-//!   - **Mutation RPC helpers** (`remove_workspace`, …) — request/response
-//!     wrappers that hide the connect/handshake/extract-ack boilerplate.
-//!     Tauri command handlers become thin translators: one-line RPC call,
-//!     one-line event emit. The shape is copied per-batch as the migration
-//!     progresses.
+//! Two consumers live here:
+//!   - **Mutation RPC helpers** (`remove_workspace`, `add_repo`, …) —
+//!     request/response wrappers that hide the connect/handshake/extract-ack
+//!     boilerplate. Tauri command handlers become thin translators:
+//!     one-line RPC call, one-line event emit. The shape is copied
+//!     per-batch as the migration progresses.
 //!   - `run_state_subscriber` — long-lived background task that subscribes
 //!     to daemon state updates and re-emits them as Tauri events. Handles
 //!     reconnect-with-backoff on daemon drop so the UI never wedges.
@@ -16,6 +13,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use shard_core::repos::Repository;
 use shard_core::state::RepoState;
 use shard_core::workspaces::{BranchInfo, Workspace, WorkspaceMode, WorkspaceWithStatus};
 use shard_transport::control_protocol::ControlFrame;
@@ -24,28 +22,6 @@ use tauri::{AppHandle, Emitter, Manager};
 use tracing::{debug, info, warn};
 
 use crate::state::AppState;
-
-// ── Topology pokes ──────────────────────────────────────────────────────────
-
-/// Fire-and-forget notification to the daemon that the repo/workspace
-/// topology has just changed. `None` requests a full reload; `Some(alias)`
-/// scopes the reload to one repo. Poke failures are logged, never
-/// propagated — the UI must never block on daemon health.
-pub fn spawn_topology_poke(alias: Option<String>) {
-    tauri::async_runtime::spawn(async move {
-        if let Err(e) = send_topology_poke(alias.clone()).await {
-            debug!("topology poke (alias={:?}) failed: {e}", alias);
-        }
-    });
-}
-
-async fn send_topology_poke(alias: Option<String>) -> std::io::Result<()> {
-    let mut conn = daemon_client::connect().await?;
-    conn.handshake().await?;
-    conn.send(&ControlFrame::TopologyChanged { repo_alias: alias })
-        .await?;
-    Ok(())
-}
 
 // ── Mutation RPCs ───────────────────────────────────────────────────────────
 //
@@ -150,6 +126,95 @@ pub async fn list_branch_info(repo: &str) -> Result<Vec<BranchInfo>, String> {
         },
         |f| match f {
             ControlFrame::BranchInfoList { branches } => Ok(branches),
+            other => Err(other),
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Register a repo via the daemon RPC. The daemon clones (remote) or
+/// references (local) the repo, auto-creates the base workspace, and
+/// returns the persisted row. See
+/// `crates/shard-cli/src/cmd/daemon.rs::handle_add_repo`.
+pub async fn add_repo(url: &str, alias: Option<String>) -> Result<Repository, String> {
+    let mut conn = daemon_client::connect()
+        .await
+        .map_err(|e| format!("daemon connect failed: {e}"))?;
+    conn.handshake()
+        .await
+        .map_err(|e| format!("daemon handshake failed: {e}"))?;
+    conn.request_typed(
+        &ControlFrame::AddRepo {
+            url: url.to_string(),
+            alias,
+        },
+        |f| match f {
+            ControlFrame::AddRepoAck { repo } => Ok(repo),
+            other => Err(other),
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Tear down a repo via the daemon RPC. The daemon stops all bound
+/// sessions, drops the watcher, removes worktrees + DB rows, and (for
+/// remote repos) the bare clone. Local checkouts are preserved.
+pub async fn remove_repo(alias: &str) -> Result<(), String> {
+    let mut conn = daemon_client::connect()
+        .await
+        .map_err(|e| format!("daemon connect failed: {e}"))?;
+    conn.handshake()
+        .await
+        .map_err(|e| format!("daemon handshake failed: {e}"))?;
+    conn.request_typed(
+        &ControlFrame::RemoveRepo {
+            alias: alias.to_string(),
+        },
+        |f| match f {
+            ControlFrame::RemoveRepoAck => Ok(()),
+            other => Err(other),
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// `git fetch --all --prune` against a repo's source. No DB mutation.
+pub async fn sync_repo(alias: &str) -> Result<(), String> {
+    let mut conn = daemon_client::connect()
+        .await
+        .map_err(|e| format!("daemon connect failed: {e}"))?;
+    conn.handshake()
+        .await
+        .map_err(|e| format!("daemon handshake failed: {e}"))?;
+    conn.request_typed(
+        &ControlFrame::SyncRepo {
+            alias: alias.to_string(),
+        },
+        |f| match f {
+            ControlFrame::SyncRepoAck => Ok(()),
+            other => Err(other),
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// List registered repositories via the daemon so readers agree with the
+/// event stream.
+pub async fn list_repos() -> Result<Vec<Repository>, String> {
+    let mut conn = daemon_client::connect()
+        .await
+        .map_err(|e| format!("daemon connect failed: {e}"))?;
+    conn.handshake()
+        .await
+        .map_err(|e| format!("daemon handshake failed: {e}"))?;
+    conn.request_typed(
+        &ControlFrame::ListRepos,
+        |f| match f {
+            ControlFrame::RepoList { repos } => Ok(repos),
             other => Err(other),
         },
     )

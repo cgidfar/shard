@@ -109,6 +109,20 @@ pub enum MonitorCommand {
         workspace_name: String,
         ack: oneshot::Sender<()>,
     },
+
+    /// Drop the repo's entire debouncer + RepoState entry, releasing
+    /// every `ReadDirectoryChangesW` handle it owned. Used by
+    /// `RemoveRepo` before tearing down the on-disk repo tree, since
+    /// every workspace under the repo is going away at once.
+    ///
+    /// **Load-bearing ack semantics:** same contract as
+    /// `DropRepoWorkspace` — the ack must fire only after the
+    /// `Debouncer` has been dropped on this task so the mutation
+    /// handler can safely call `RemoveDirectoryW`.
+    DropRepo {
+        alias: String,
+        ack: oneshot::Sender<()>,
+    },
 }
 
 struct MonitorInner {
@@ -177,6 +191,22 @@ impl MonitorHandle {
             .send(MonitorCommand::DropRepoWorkspace {
                 alias: alias.to_string(),
                 workspace_name: workspace_name.to_string(),
+                ack: ack_tx,
+            })
+            .map_err(|_| "monitor task is not running")?;
+        ack_rx.await.map_err(|_| "monitor dropped ack before replying")
+    }
+
+    /// Drop the repo's entire watcher (and its `RepoState` entry) and
+    /// wait for the confirmation ack before returning. Used by
+    /// `RemoveRepo` before the on-disk teardown.
+    #[allow(dead_code)] // consumed by Phase 3
+    pub async fn drop_repo(&self, alias: &str) -> Result<(), &'static str> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.inner
+            .command_tx
+            .send(MonitorCommand::DropRepo {
+                alias: alias.to_string(),
                 ack: ack_tx,
             })
             .map_err(|_| "monitor task is not running")?;
@@ -475,7 +505,30 @@ impl WorkspaceMonitor {
                 self.handle_drop_repo_workspace(alias, workspace_name, ack)
                     .await;
             }
+            MonitorCommand::DropRepo { alias, ack } => {
+                self.handle_drop_repo(alias, ack).await;
+            }
         }
+    }
+
+    /// Drop the repo's debouncer + RepoState entry and ack only after
+    /// the `Debouncer` has been dropped on this task. Mirror of
+    /// `handle_drop_repo_workspace` without the rebuild step — the
+    /// entire repo is going away, so there are no remaining workspaces
+    /// to watch.
+    async fn handle_drop_repo(&mut self, alias: String, ack: oneshot::Sender<()>) {
+        // Drop the old debouncer explicitly — releases every
+        // `ReadDirectoryChangesW` handle it held so the caller's
+        // `RemoveDirectoryW` can proceed.
+        let prev = self.debouncers.remove(&alias);
+        drop(prev);
+        self.watched_paths.remove(&alias);
+
+        // Clear the in-memory RepoState too; if AddRepo is called again
+        // for the same alias it'll be rebuilt on the next topology poke.
+        self.inner.repos.write().await.remove(&alias);
+
+        let _ = ack.send(());
     }
 
     /// Drop the current debouncer for `alias` (releasing all its

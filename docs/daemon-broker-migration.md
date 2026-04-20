@@ -1,6 +1,6 @@
 # Daemon-as-Broker Migration Plan
 
-**Status:** Phase 0 + Phase 1 + Phase 2 landed on branch `daemon-broker-migration`. Codex-reviewed across three rounds (Phase 2: 2 round-1 + 1 round-2 findings, all applied; round 3 converged). 94 tests pass, zero warnings. Ready for Phase 3.
+**Status:** Phase 0 + Phase 1 + Phase 2 + Phase 3 landed on branch `daemon-broker-migration`. Phase 3 adds Batch A repo CRUD (AddRepo, RemoveRepo, SyncRepo, ListRepos); FindSessionById deferred to Phase 4 per D8 (reads migrate with their corresponding mutation). 113 tests pass, zero warnings. Ready for Codex review of Phase 3.
 **Related:** SHA-55 (workspace delete failure), `docs/responsibility-map.md`
 
 ## Goals
@@ -287,16 +287,50 @@ Each phase is a self-contained PR. All tests pass at the end of each phase; none
 - **Repo-scoped mutations share `acquire_repo_mutation_lock`** — `RemoveRepo` will need it held across workspace-by-workspace teardown. For `AddRepo`, the "repo" doesn't exist yet so the lock just serializes duplicate-alias races.
 - **`FindSessionById` walks all DBs** and should hold a global (not per-repo) lock; defer that detail until the handler is written.
 - **`poke_topology(None)` still exists** for full-reload needs that `AddRepo`/`RemoveRepo` might use — check if a scoped alternative is cleaner before reusing it.
-- **`spawn_topology_poke` is still consumed by `commands/repo.rs`** — the remaining holdout. Remove it alongside Phase 3's repo migration.
-- **Protocol version v4 is live** — older clients hard-fail the handshake (per D7). If you bump to v5, coordinate the shard-app rebuild and any running CLI tooling.
+- **`spawn_topology_poke` is gone** — Phase 3 deleted it once `commands/repo.rs` stopped calling it. The daemon owns all topology pokes now. Don't reintroduce a client-side poke helper; use an RPC.
+- **Protocol version v5 is live** (bumped in Phase 3) — older clients hard-fail the handshake (per D7). If you bump to v6, coordinate the shard-app rebuild and any running CLI tooling.
 
-### Phase 3 — Batch A
+### Phase 3 — Batch A ✅ LANDED
 
-Repo CRUD. Independent of workspaces in wire shape but `RemoveRepo` internally calls the workspace remove path.
+Repo CRUD: `AddRepo`, `RemoveRepo`, `SyncRepo`, `ListRepos`. `FindSessionById` deferred to Phase 4 per D8 — its natural callers are all session-facing, and migrating the read without its corresponding mutation would split the source of truth mid-batch.
+
+1. ✅ `ControlFrame::AddRepo { url, alias }` / `AddRepoAck { repo }`, `RemoveRepo { alias }` / `RemoveRepoAck`, `SyncRepo { alias }` / `SyncRepoAck`, `ListRepos` / `RepoList { repos }` (type bytes `0x9A–0xA1`). `PROTOCOL_VERSION` bumped 4 → 5. Added `write_repository` / `read_repository` wire encoders plus 8 roundtrip tests. `Repository` gained `PartialEq + Eq` so the frame enum keeps its existing derives.
+2. ✅ `daemon.rs::handle_add_repo` — auto-creates the default-branch base workspace just like the old direct path. Holds the per-repo mutation lock: eagerly when the caller supplies an alias, after `RepositoryStore::add` derives one otherwise. Auto-workspace failures are logged but don't abort the add.
+3. ✅ `daemon.rs::handle_remove_repo` — the full cascade: per-repo mutation lock → lifecycle-gate every workspace → stop + drain every bound session → `MonitorCommand::DropRepo` (new; drops the whole debouncer at once rather than per-workspace) → `RepositoryStore::remove` → `lifecycle.clear_repo(alias)` → topology poke. Partial-failure policy preserves the original guard semantics: rollback to Active if nothing on disk was touched, commit Broken once store.remove has executed. Idempotent on unknown aliases.
+4. ✅ `daemon.rs::handle_sync_repo` takes the per-repo mutation lock so a concurrent RemoveRepo can't yank the repo out. `handle_list_repos` is lockless (read-only path).
+5. ✅ `MonitorCommand::DropRepo { alias, ack }` added to `workspace_monitor.rs` with ack-after-drop semantics matching `DropRepoWorkspace`. Rebuild step omitted — the entire repo is going away, so there's nothing to re-watch.
+6. ✅ `LifecycleRegistry::clear_repo(alias)` drops every entry belonging to a repo and fires any `Deleting` completion notifiers so joiners unblock. Used by `handle_remove_repo` as belt-and-suspenders against phantom state from a partially-failed prior attempt.
+7. ✅ Tauri `commands/repo.rs` collapsed to thin translators over `daemon_ipc::{add_repo, remove_repo, sync_repo, list_repos}`. `spawn_topology_poke` deleted — it had exactly one consumer left (the old `add_repo`/`remove_repo` path) and the daemon now emits its own topology pokes internally. `daemon_ipc.rs` module doc trimmed accordingly.
+8. ✅ CLI `shard-cli/src/cmd/repo.rs` rewritten to route every subcommand through `run_daemon_rpc` (shape lifted from `cmd/workspace.rs`). Duplicate `ShardPaths::new` + `RepositoryStore::new` wiring removed; CLI no longer touches the stores directly for repo ops.
+9. ✅ Test harness gained `TestHarness::create_bare_checkout` — the existing `setup_local_repo` was too eager (it registered the repo via `RepositoryStore::add`, which prevents tests from exercising `AddRepo` RPC end-to-end). `setup_local_repo` now delegates to `create_bare_checkout` to avoid drift.
+
+**Test plan — 11 Phase 3 integration tests + 8 wire roundtrips (19 new):**
+
+- ✅ `add_repo_happy_path_local` — RPC ack, DB row present, lifecycle entry for base workspace Active.
+- ✅ `add_repo_without_explicit_alias_derives_from_path` — alias derivation via `git::default_alias` survives the daemon hop.
+- ✅ `add_repo_duplicate_alias_errors` — DB unique-constraint surfaces as `Error` frame.
+- ✅ `list_repos_empty_initially` / `list_repos_returns_added_entries` — list round-trip.
+- ✅ `sync_repo_unknown_alias_errors` — unknown alias returns `Error`, not a vacuous Ack.
+- ✅ `remove_repo_happy_path` — row gone, `.shard/` cleaned, **local checkout preserved** (D11).
+- ✅ `remove_repo_cascades_workspaces` — two extra workspaces created via CreateWorkspace RPC are both cleaned on RemoveRepo.
+- ✅ `remove_repo_unknown_alias_is_idempotent` — second RemoveRepo returns Ack.
+- ✅ `remove_repo_stops_live_session` — uses the Phase 1 fake-supervisor pattern (Resume+Stop → Status frame) to prove stop-and-drain fires correctly in the cascade.
+- ✅ `remove_repo_blocks_concurrent_create_workspace` — parallel Create + Remove on the same repo reach a consistent state: either Create wins (workspace exists in cascaded remove) or Remove wins (Create returns Error). The illegal outcome (Create Ack'd + Remove Ack'd + workspace leaked) is precisely what the per-repo mutation lock prevents.
+
+**Phase 3 discoveries the plan didn't anticipate:**
+
+- Per-workspace `DropRepoWorkspace` would have required N round-trips + N watcher rebuilds for an N-workspace repo. Adding `DropRepo` is one command + one rebuild skipped; simpler than iterating through `handle_remove_workspace` per workspace. Same ack-after-drop contract.
+- `AddRepo` can't take the per-repo mutation lock until it knows the alias — when the caller omits `alias`, `git::default_alias` runs inside `RepositoryStore::add`. The handler acquires the lock eagerly when the caller supplies an alias, then re-acquires post-add for the auto-workspace step. A concurrent AddRepo racing the same derived alias is caught by the DB UNIQUE constraint rather than the mutex, but that's an acceptable floor (single-user app, two-concurrent-AddRepo on the same alias is essentially theoretical).
+- `LifecycleRegistry::clear_repo` was not in the plan. The original sketch assumed per-workspace `commit_gone` during the cascade would handle every entry, but there's a subtle gap: a prior failed `RemoveWorkspace` could leave a `Broken` entry for a workspace whose DB row was already gone. That entry would outlive `RemoveRepo` without an explicit sweep. `clear_repo` fires every stale completion notifier (joiners unblock) and returns the cleared keys for telemetry.
+- `spawn_topology_poke` had exactly one live consumer (`commands/repo.rs`). Phase 3 removing that call site let us delete the helper entirely — one fewer fire-and-forget path to reason about. The daemon owns all topology pokes now.
+- The plan's starter-kit note "`FindSessionById` walks all DBs and should hold a global (not per-repo) lock" was the crux of moving it to Phase 4: the Tauri session commands that call `find_by_id` (6 call sites) have to migrate together or the handler winds up re-opening DBs the session-lifecycle path is about to mutate. Cleaner to ship it with Batch C.
+- Fake supervisor frame byte: the integration test's StopGraceful tag is `0x02` (not `0x04`); Status reply is `0x05`. Mirrored the Phase 1 `remove_workspace` test's encoder rather than re-deriving — worth noting for the next session that rolls a new fake-supervisor test.
 
 ### Phase 4 — Batch C
 
-Session lifecycle tail (`RemoveSession`, `RenameSession`, `DetachSession`). `SpawnSession` / `StopSession` / `ListSessions` already exist; `ListSessions` may need a small tweak if Q3 lands on finer events.
+### Phase 4 — Batch C
+
+Session lifecycle tail (`RemoveSession`, `RenameSession`, `DetachSession`) plus `FindSessionById` (carried over from Batch A — its callers are all session-facing, so it migrates with the tail, consistent with D8). `SpawnSession` / `StopSession` / `ListSessions` already exist; `ListSessions` may need a small tweak if Q3 lands on finer events.
 
 ### Phase 5 — Batch D
 
@@ -323,4 +357,9 @@ Add bounded mpsc per subscribe client in the daemon (agent A flagged the current
 3. **After Phase 1 lands and SHA-55 is fixed — done.** Five findings, all addressed: see the Phase 1 section above.
 4. **After Phase 2 lands — done.** Three findings, all addressed (see Phase 2 table above): implicit-name gate bypass (round 1), misleading `list_branch_info` comment (round 1), Create-vs-Remove serialization race (round 2). Round 3 converged.
 
-5. **After Phase 3 lands** — review the `RemoveRepo` cascade path: does it correctly hold the per-repo mutation lock while iterating per-workspace cleanup, or does it need to drop + re-acquire? Plus `FindSessionById`'s global lock semantics.
+5. **After Phase 3 lands — pending.** Review targets:
+   - `handle_remove_repo`'s cascade path: the per-repo mutation lock is held for the entire workflow (including per-workspace lifecycle-gate acquisition, session stop-and-drain, `DropRepo`, and `store.remove`). Confirm this doesn't deadlock against a concurrent operation that needs the same lock (e.g. `SpawnSession` doesn't take it, which is intentional — SpawnSession's guard is the lifecycle registry, not the repo mutex).
+   - `handle_add_repo`'s split lock acquisition (eager when `alias` supplied, lazy when derived): is the post-add re-acquisition window a real race, or does the DB UNIQUE constraint cover it?
+   - `DropRepo` ack semantics: parallel with `DropRepoWorkspace`, but it also clears the `RepoState` entry from the monitor's in-memory map. Verify that's the right level for a repo-level teardown and doesn't drop state that AddRepo-immediately-after would need.
+   - `LifecycleRegistry::clear_repo`: fires completion notifiers on any `Deleting` entries it clears. Could an in-flight `RemoveWorkspace` joiner waiting on that notifier misinterpret the wake-up as "first caller succeeded"? (Expectation: it re-enters `begin_delete`, finds the repo gone, and the subsequent `ws_store.get` returns `WorkspaceNotFound` → `commit_gone` idempotently. But worth confirming.)
+   - `FindSessionById`'s global lock semantics — deferred to Phase 4 review.

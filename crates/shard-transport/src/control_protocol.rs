@@ -3,15 +3,16 @@
 //! Uses the same wire format as the session protocol: `[u32 len][u8 type][payload]`.
 //! Type bytes are in the `0x80+` range to avoid collision with session frame types.
 
+use shard_core::repos::Repository;
 use shard_core::state::{RepoState, WorkspaceHealth, WorkspaceStatus};
 use shard_core::workspaces::{BranchInfo, Workspace, WorkspaceMode, WorkspaceWithStatus};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current control protocol version. Bumped on breaking wire changes.
 ///
-/// v4 adds `CreateWorkspace`/`ListWorkspaces`/`ListBranchInfo` (type bytes
-/// 0x94–0x99) for Phase 2 of the daemon-broker migration.
-pub const PROTOCOL_VERSION: u16 = 4;
+/// v5 adds `AddRepo`/`RemoveRepo`/`SyncRepo`/`ListRepos` (type bytes
+/// 0x9A–0xA1) for Phase 3 of the daemon-broker migration.
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// Well-known named pipe address for the daemon control channel.
 #[cfg(windows)]
@@ -153,6 +154,42 @@ pub enum ControlFrame {
     /// Daemon → Client: branches + occupancy.
     BranchInfoList { branches: Vec<BranchInfo> },
 
+    // --- Repo Lifecycle (Phase 3 of daemon-broker migration) ---
+    /// Client → Daemon: register a new repository by URL or local path.
+    /// Remote URLs are bare-cloned into the data dir; local paths are
+    /// referenced in place. Auto-creates a base workspace for the
+    /// detected default branch.
+    AddRepo {
+        url: String,
+        alias: Option<String>,
+    },
+
+    /// Daemon → Client: add succeeded; returns the persisted row.
+    AddRepoAck { repo: Repository },
+
+    /// Client → Daemon: tear down a repository. Stops every live
+    /// session bound to it, drops the monitor's watcher, removes
+    /// worktrees + `.shard/` for local repos (the original checkout is
+    /// preserved), or the entire repo directory for remote repos, then
+    /// deletes the DB row.
+    RemoveRepo { alias: String },
+
+    /// Daemon → Client: remove succeeded.
+    RemoveRepoAck,
+
+    /// Client → Daemon: `git fetch --all --prune` against the repo's
+    /// source (bare clone or local checkout). No DB mutation.
+    SyncRepo { alias: String },
+
+    /// Daemon → Client: sync completed.
+    SyncRepoAck,
+
+    /// Client → Daemon: list registered repositories.
+    ListRepos,
+
+    /// Daemon → Client: the full repo list, ordered by alias.
+    RepoList { repos: Vec<Repository> },
+
     // --- Errors ---
     /// Daemon → Client: request failed.
     Error { message: String },
@@ -195,6 +232,14 @@ const TYPE_LIST_WORKSPACES: u8 = 0x96;
 const TYPE_WORKSPACE_LIST: u8 = 0x97;
 const TYPE_LIST_BRANCH_INFO: u8 = 0x98;
 const TYPE_BRANCH_INFO_LIST: u8 = 0x99;
+const TYPE_ADD_REPO: u8 = 0x9A;
+const TYPE_ADD_REPO_ACK: u8 = 0x9B;
+const TYPE_REMOVE_REPO: u8 = 0x9C;
+const TYPE_REMOVE_REPO_ACK: u8 = 0x9D;
+const TYPE_SYNC_REPO: u8 = 0x9E;
+const TYPE_SYNC_REPO_ACK: u8 = 0x9F;
+const TYPE_LIST_REPOS: u8 = 0xA0;
+const TYPE_REPO_LIST: u8 = 0xA1;
 
 // WorkspaceMode wire tag
 const MODE_NEW_BRANCH: u8 = 0;
@@ -365,6 +410,33 @@ pub async fn write_control_frame<W: AsyncWrite + Unpin>(
                 write_opt_str(&mut payload, b.checked_out_by.as_deref());
             }
             TYPE_BRANCH_INFO_LIST
+        }
+        ControlFrame::AddRepo { url, alias } => {
+            write_str(&mut payload, url);
+            write_opt_str(&mut payload, alias.as_deref());
+            TYPE_ADD_REPO
+        }
+        ControlFrame::AddRepoAck { repo } => {
+            write_repository(&mut payload, repo);
+            TYPE_ADD_REPO_ACK
+        }
+        ControlFrame::RemoveRepo { alias } => {
+            write_str(&mut payload, alias);
+            TYPE_REMOVE_REPO
+        }
+        ControlFrame::RemoveRepoAck => TYPE_REMOVE_REPO_ACK,
+        ControlFrame::SyncRepo { alias } => {
+            write_str(&mut payload, alias);
+            TYPE_SYNC_REPO
+        }
+        ControlFrame::SyncRepoAck => TYPE_SYNC_REPO_ACK,
+        ControlFrame::ListRepos => TYPE_LIST_REPOS,
+        ControlFrame::RepoList { repos } => {
+            payload.extend_from_slice(&(repos.len() as u32).to_be_bytes());
+            for r in repos {
+                write_repository(&mut payload, r);
+            }
+            TYPE_REPO_LIST
         }
         ControlFrame::Error { message } => {
             write_str(&mut payload, message);
@@ -641,6 +713,38 @@ pub async fn read_control_frame<R: AsyncRead + Unpin>(
             }
             ControlFrame::BranchInfoList { branches }
         }
+        TYPE_ADD_REPO => {
+            let (url, n) = read_str(payload)?;
+            let (alias, _) = read_opt_str(&payload[n..])?;
+            ControlFrame::AddRepo { url, alias }
+        }
+        TYPE_ADD_REPO_ACK => {
+            let (repo, _) = read_repository(payload)?;
+            ControlFrame::AddRepoAck { repo }
+        }
+        TYPE_REMOVE_REPO => {
+            let (alias, _) = read_str(payload)?;
+            ControlFrame::RemoveRepo { alias }
+        }
+        TYPE_REMOVE_REPO_ACK => ControlFrame::RemoveRepoAck,
+        TYPE_SYNC_REPO => {
+            let (alias, _) = read_str(payload)?;
+            ControlFrame::SyncRepo { alias }
+        }
+        TYPE_SYNC_REPO_ACK => ControlFrame::SyncRepoAck,
+        TYPE_LIST_REPOS => ControlFrame::ListRepos,
+        TYPE_REPO_LIST => {
+            ensure_len(payload, 4, "RepoList count")?;
+            let count = u32::from_be_bytes(payload[..4].try_into().unwrap()) as usize;
+            let mut offset = 4;
+            let mut repos = Vec::with_capacity(count);
+            for _ in 0..count {
+                let (repo, n) = read_repository(&payload[offset..])?;
+                offset += n;
+                repos.push(repo);
+            }
+            ControlFrame::RepoList { repos }
+        }
         TYPE_ERROR => {
             let (message, _) = read_str(payload)?;
             ControlFrame::Error { message }
@@ -811,6 +915,57 @@ fn read_workspace(buf: &[u8]) -> std::io::Result<(Workspace, usize)> {
             branch,
             path,
             is_base,
+            created_at,
+        },
+        offset,
+    ))
+}
+
+// --- Repository wire encoding ---
+//
+// Layout:
+//   [id str][url str][alias str][host opt_str][owner opt_str]
+//   [name opt_str][local_path opt_str][created_at u64]
+
+fn write_repository(buf: &mut Vec<u8>, repo: &Repository) {
+    write_str(buf, &repo.id);
+    write_str(buf, &repo.url);
+    write_str(buf, &repo.alias);
+    write_opt_str(buf, repo.host.as_deref());
+    write_opt_str(buf, repo.owner.as_deref());
+    write_opt_str(buf, repo.name.as_deref());
+    write_opt_str(buf, repo.local_path.as_deref());
+    buf.extend_from_slice(&repo.created_at.to_be_bytes());
+}
+
+fn read_repository(buf: &[u8]) -> std::io::Result<(Repository, usize)> {
+    let mut offset = 0;
+    let (id, n) = read_str(&buf[offset..])?;
+    offset += n;
+    let (url, n) = read_str(&buf[offset..])?;
+    offset += n;
+    let (alias, n) = read_str(&buf[offset..])?;
+    offset += n;
+    let (host, n) = read_opt_str(&buf[offset..])?;
+    offset += n;
+    let (owner, n) = read_opt_str(&buf[offset..])?;
+    offset += n;
+    let (name, n) = read_opt_str(&buf[offset..])?;
+    offset += n;
+    let (local_path, n) = read_opt_str(&buf[offset..])?;
+    offset += n;
+    ensure_len(&buf[offset..], 8, "Repository created_at")?;
+    let created_at = u64::from_be_bytes(buf[offset..offset + 8].try_into().unwrap());
+    offset += 8;
+    Ok((
+        Repository {
+            id,
+            url,
+            alias,
+            host,
+            owner,
+            name,
+            local_path,
             created_at,
         },
         offset,
@@ -1205,6 +1360,110 @@ mod tests {
     #[tokio::test]
     async fn roundtrip_branch_info_list_empty() {
         let frame = ControlFrame::BranchInfoList { branches: vec![] };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    fn sample_repository(alias: &str, local: bool) -> Repository {
+        Repository {
+            id: format!("id-{alias}"),
+            url: if local {
+                format!(r"C:\repos\{alias}")
+            } else {
+                format!("https://github.com/demo/{alias}.git")
+            },
+            alias: alias.to_string(),
+            host: if local {
+                None
+            } else {
+                Some("github.com".to_string())
+            },
+            owner: if local { None } else { Some("demo".to_string()) },
+            name: Some(alias.to_string()),
+            local_path: if local {
+                Some(format!(r"C:\repos\{alias}"))
+            } else {
+                None
+            },
+            created_at: 1_700_000_123,
+        }
+    }
+
+    #[tokio::test]
+    async fn roundtrip_add_repo_with_alias() {
+        let frame = ControlFrame::AddRepo {
+            url: "https://github.com/demo/x.git".to_string(),
+            alias: Some("demo".to_string()),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_add_repo_no_alias() {
+        let frame = ControlFrame::AddRepo {
+            url: r"C:\repos\demo".to_string(),
+            alias: None,
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_add_repo_ack_remote() {
+        let frame = ControlFrame::AddRepoAck {
+            repo: sample_repository("demo", false),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_add_repo_ack_local() {
+        let frame = ControlFrame::AddRepoAck {
+            repo: sample_repository("local-demo", true),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_remove_repo_and_ack() {
+        let req = ControlFrame::RemoveRepo {
+            alias: "demo".to_string(),
+        };
+        assert_eq!(roundtrip(req.clone()).await, req);
+        assert_eq!(
+            roundtrip(ControlFrame::RemoveRepoAck).await,
+            ControlFrame::RemoveRepoAck
+        );
+    }
+
+    #[tokio::test]
+    async fn roundtrip_sync_repo_and_ack() {
+        let req = ControlFrame::SyncRepo {
+            alias: "demo".to_string(),
+        };
+        assert_eq!(roundtrip(req.clone()).await, req);
+        assert_eq!(
+            roundtrip(ControlFrame::SyncRepoAck).await,
+            ControlFrame::SyncRepoAck
+        );
+    }
+
+    #[tokio::test]
+    async fn roundtrip_list_repos_and_response() {
+        assert_eq!(
+            roundtrip(ControlFrame::ListRepos).await,
+            ControlFrame::ListRepos
+        );
+        let frame = ControlFrame::RepoList {
+            repos: vec![
+                sample_repository("alpha", false),
+                sample_repository("beta", true),
+            ],
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_repo_list_empty() {
+        let frame = ControlFrame::RepoList { repos: vec![] };
         assert_eq!(roundtrip(frame.clone()).await, frame);
     }
 
