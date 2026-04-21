@@ -8,7 +8,7 @@ use crate::harness::Harness;
 use crate::paths::ShardPaths;
 use crate::{Result, ShardError};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Session {
     pub id: String,
     pub workspace_name: String,
@@ -264,6 +264,12 @@ impl SessionStore {
     }
 
     /// Remove a session record from the DB and clean up its directory.
+    ///
+    /// Order is filesystem-first, DB-second: a leaked file handle (e.g. an
+    /// open log writer the supervisor didn't release) makes `remove_dir_all`
+    /// fail, and we propagate the error rather than ack a half-complete
+    /// removal. Keeping the DB row preserves the retry handle — the next
+    /// `RemoveSession` call sees the same row and can try again.
     pub fn remove(&self, repo_alias: &str, session_id: &str) -> Result<()> {
         let session = self.get(repo_alias, session_id)?;
         if session.status == "running" || session.status == "starting" {
@@ -273,20 +279,29 @@ impl SessionStore {
             )));
         }
 
+        let session_dir = self.paths.session_dir(repo_alias, session_id);
+        if session_dir.exists() {
+            std::fs::remove_dir_all(&session_dir).map_err(|e| {
+                ShardError::Other(format!(
+                    "failed to clean session directory {}: {e}",
+                    session_dir.display()
+                ))
+            })?;
+        }
+
         let repo_db_path = self.paths.repo_db(repo_alias);
         let conn = db::open_connection(&repo_db_path)?;
         conn.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
-
-        // Clean up session directory
-        let session_dir = self.paths.session_dir(repo_alias, session_id);
-        if session_dir.exists() {
-            let _ = std::fs::remove_dir_all(&session_dir);
-        }
 
         Ok(())
     }
 
     /// Rename a session (set or clear its label).
+    ///
+    /// Returns `SessionNotFound` if no row matched — bare `UPDATE` would
+    /// silently no-op, which breaks the RPC contract symmetry with
+    /// `remove`/`get` (callers expect a typed error rather than an Ack
+    /// for a non-existent row).
     pub fn rename(
         &self,
         repo_alias: &str,
@@ -295,10 +310,13 @@ impl SessionStore {
     ) -> Result<()> {
         let repo_db_path = self.paths.repo_db(repo_alias);
         let conn = db::open_connection(&repo_db_path)?;
-        conn.execute(
+        let rows = conn.execute(
             "UPDATE sessions SET label = ?1 WHERE id = ?2",
             params![label, session_id],
         )?;
+        if rows == 0 {
+            return Err(ShardError::SessionNotFound(session_id.to_string()));
+        }
         Ok(())
     }
 }

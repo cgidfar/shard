@@ -10,6 +10,7 @@ use shard_transport::protocol::{self, ActivityState, Frame};
 use shard_transport::transport_windows::NamedPipeTransport;
 use shard_transport::SessionTransport;
 
+use crate::daemon_ipc;
 use crate::state::{AppState, SessionConnection, SessionWriter};
 
 #[derive(Clone, serde::Serialize)]
@@ -271,8 +272,12 @@ pub async fn stop_session(
     force: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    // Resolve the session through the daemon so CLI and GUI agree on
+    // the global session index (Phase 4, D4). The subsequent status
+    // update stays direct — it's a local bookkeeping write that the
+    // supervisor's own exit tick will also perform.
+    let (repo, session) = daemon_ipc::find_session_by_id(&id).await?;
     let session_store = SessionStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
-    let (repo, session) = session_store.find_by_id(&id).map_err(|e| e.to_string())?;
 
     if session.status != "running" && session.status != "starting" {
         return Ok(());
@@ -331,12 +336,9 @@ pub async fn stop_session(
 }
 
 #[tauri::command]
-pub fn remove_session(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    let session_store = SessionStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
-    let (repo, _) = session_store.find_by_id(&id).map_err(|e| e.to_string())?;
-    session_store
-        .remove(&repo, &id)
-        .map_err(|e| e.to_string())?;
+pub async fn remove_session(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let (repo, _) = daemon_ipc::find_session_by_id(&id).await?;
+    daemon_ipc::remove_session(&repo, &id).await?;
     let _ = app.emit("sidebar-changed", ());
     Ok(())
 }
@@ -348,8 +350,7 @@ pub async fn attach_session(
     channel: Channel<Response>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let session_store = SessionStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
-    let (_repo, session) = session_store.find_by_id(&id).map_err(|e| e.to_string())?;
+    let (_repo, session) = daemon_ipc::find_session_by_id(&id).await?;
 
     if session.status != "running" {
         return Err(format!(
@@ -477,16 +478,13 @@ pub async fn resize_session(
 }
 
 #[tauri::command]
-pub fn rename_session(
+pub async fn rename_session(
     app: tauri::AppHandle,
     id: String,
     label: Option<String>,
 ) -> Result<(), String> {
-    let session_store = SessionStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
-    let (repo, _) = session_store.find_by_id(&id).map_err(|e| e.to_string())?;
-    session_store
-        .rename(&repo, &id, label.as_deref())
-        .map_err(|e| e.to_string())?;
+    let (repo, _) = daemon_ipc::find_session_by_id(&id).await?;
+    daemon_ipc::rename_session(&repo, &id, label).await?;
     let _ = app.emit("sidebar-changed", ());
     Ok(())
 }
@@ -504,11 +502,14 @@ pub async fn detach_session(
             conn.abort();
         }
     }
-    // Lock released — safe to do DB I/O without blocking write_to_session/resize_session
+    // Lock released — safe to do IPC without blocking write_to_session/resize_session
 
-    // If session is still running, start a monitor so sidebar keeps getting updates
-    let session_store = SessionStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
-    if let Ok((_repo, session)) = session_store.find_by_id(&id) {
+    // Resolve through the daemon. The detach probe and the monitor-restart
+    // lookup are the same operation: a single FindSessionById tells us both
+    // whether the id is still valid and gives us the transport addr we'd
+    // need to re-monitor. Drop the redundant DetachSession probe — it
+    // returned the same answer find_session_by_id already gives us.
+    if let Ok((_repo, session)) = daemon_ipc::find_session_by_id(&id).await {
         if session.status == "running" {
             let task = start_monitor(app, id.clone(), session.transport_addr);
             let mut conns = state.connections.lock().await;

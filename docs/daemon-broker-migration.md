@@ -1,6 +1,6 @@
 # Daemon-as-Broker Migration Plan
 
-**Status:** Phase 0 + Phase 1 + Phase 2 + Phase 3 landed on branch `daemon-broker-migration`. Phase 3 adds Batch A repo CRUD (AddRepo, RemoveRepo, SyncRepo, ListRepos); FindSessionById deferred to Phase 4 per D8 (reads migrate with their corresponding mutation). Codex-reviewed across three rounds (3 round-1 + 2 round-2 findings, all applied; round 3 converged). 115 tests pass, zero warnings.
+**Status:** Phase 0 + Phase 1 + Phase 2 + Phase 3 + Phase 4 landed on branch `daemon-broker-migration`. Phase 4 adds Batch C session lifecycle tail (RemoveSession, RenameSession, DetachSession, FindSessionById); `SpawnSession` / `StopSession` / `ListSessions` existed from earlier phases. Phase 4 Codex round 1 done — 2 mediums + 1 low applied. 137 tests pass (22 new in Phase 4: 15 session-lifecycle integration + 7 wire roundtrips), zero Phase 4-introduced warnings.
 **Related:** SHA-55 (workspace delete failure), `docs/responsibility-map.md`
 
 ## Goals
@@ -349,11 +349,57 @@ Fix 1 is not directly testable via the in-process harness (SpawnSession spawns a
 
 **Codex review round 3:** converged — no new findings.
 
-### Phase 4 — Batch C
+### Phase 4 — Batch C ✅ LANDED
 
-### Phase 4 — Batch C
+Session lifecycle tail (`RemoveSession`, `RenameSession`, `DetachSession`) plus `FindSessionById` (carried over from Batch A — its callers are all session-facing, so it migrates with the tail, consistent with D8). `SpawnSession` / `StopSession` / `ListSessions` already existed; left unchanged per the plan table.
 
-Session lifecycle tail (`RemoveSession`, `RenameSession`, `DetachSession`) plus `FindSessionById` (carried over from Batch A — its callers are all session-facing, so it migrates with the tail, consistent with D8). `SpawnSession` / `StopSession` / `ListSessions` already exist; `ListSessions` may need a small tweak if Q3 lands on finer events.
+1. ✅ `ControlFrame::RemoveSession { repo, id }` / `RemoveSessionAck`, `RenameSession { repo, id, label }` / `RenameSessionAck`, `DetachSession { id }` / `DetachSessionAck`, `FindSessionById { prefix }` / `FoundSession { repo, session }` (type bytes `0xA2–0xA9`). `PROTOCOL_VERSION` bumped 5 → 6. Added `write_session` / `read_session` wire codec with `write_opt_u32` / `write_opt_i32` / `write_opt_u64` helpers; `Harness` goes over the wire via its `Display` impl and decodes back through `FromStr` (unknown strings degrade to `None`, matching the DB tolerance in `row_to_session`). `Session` gained `PartialEq + Eq`. 7 new roundtrip tests including an unknown-harness-drops regression guard.
+2. ✅ `daemon.rs::handle_remove_session` — two-stage guard: the in-memory live-session registry rejects ids whose supervisor is still bound (covers the gap where the DB row is `stopped` but the supervisor hasn't released its CWD yet); `SessionStore::remove` then enforces the DB-status guard (`running`/`starting` rejected). Broadcasts `ChangeKind::Sessions(repo)` on success so subscribers invalidate their cached list.
+3. ✅ `daemon.rs::handle_rename_session` — pure DB label update under the per-repo mutation lock. Broadcasts `ChangeKind::Sessions(repo)`.
+4. ✅ `daemon.rs::handle_detach_session` — validates the id resolves via `find_by_id` and returns Ack. Terminal I/O stays on the direct Tauri ↔ supervisor pipe (migration non-goal); this RPC is the daemon-visible hook that gives CLI and GUI detach flows an identical round-trip, useful for telemetry and as the seam for future multi-window subscription work.
+5. ✅ `daemon.rs::handle_find_session_by_id` — walks the global index lockless. DB reads under WAL + busy_timeout are safe against concurrent writes, so no global mutex is needed; the plan's "global lock" note reduced to a documented no-op.
+6. ✅ `RemoveSession` / `RenameSession` take the per-repo mutation lock. Serializes against `RemoveRepo` on the same repo so the DB isn't yanked out mid-update. `DetachSession` / `FindSessionById` are lockless reads.
+7. ✅ Tauri `commands/session.rs` rewired — `remove_session`, `rename_session`, `detach_session` now 3-line translators over `daemon_ipc::{find_session_by_id, remove_session, rename_session, detach_session}`. `stop_session` / `attach_session` gained the `daemon_ipc::find_session_by_id` lookup; their local `SessionStore::find_by_id` calls disappeared. `handle_supervisor_frame`'s supervisor-initiated DB update (Status frame reaction) stays direct per D3 — it's part of the supervisor ↔ client pipe, not a client-initiated mutation.
+8. ✅ CLI `shard-cli/src/cmd/session.rs` — `attach`, `stop`, `remove` route their lookups through a shared `find_session_via_daemon` helper (shape lifted from `cmd/repo.rs::run_daemon_rpc`). `remove` additionally sends `RemoveSession` via the daemon; the old `SessionStore::remove` call site is gone.
+9. ✅ Test harness gained `TestHarness::setup_terminal_session(repo, ws, status)` — inserts a DB row via `SessionStore::create` then flips it to a terminal status via `update_status`. Lets Phase 4 tests target rows without spawning a real supervisor.
+
+**Test plan — 14 Phase 4 integration tests + 7 wire roundtrips (21 new):**
+
+- ✅ `remove_session_happy_path` — DB row and session dir both gone after Ack.
+- ✅ `remove_session_refuses_live_registry_entry` — injects an `exited` DB row into the live registry; the handler's in-memory guard blocks the remove with a `still live` error, proving the two-stage guard catches the gap a DB-only check would miss.
+- ✅ `remove_session_refuses_running_status` — DB-status guard rejects `running` directly, no live registry entry required.
+- ✅ `remove_session_unknown_id_errors` — absent id surfaces as `Error`.
+- ✅ `rename_session_sets_and_clears_label` — both set and clear paths round-trip through the DB.
+- ✅ `rename_session_unknown_repo_errors` — missing repo_db → `Error`.
+- ✅ `detach_session_happy_path` — Ack with unchanged DB state (probe semantics).
+- ✅ `detach_session_unknown_id_errors` — absent id → `Error`.
+- ✅ `find_session_by_id_exact_match` / `find_session_by_id_prefix_match` / `find_session_by_id_walks_all_repos` / `find_session_by_id_unknown_errors` — full-id, 8-char prefix, cross-repo walk, and absent-id paths.
+- ✅ `find_then_remove_by_prefix` — end-to-end CLI-equivalent flow: `FindSessionById` returns `(repo, session)`, caller uses the resolved repo + full id for `RemoveSession`.
+- ✅ `remove_session_serializes_against_remove_repo` — parallel `RemoveRepo` + `RemoveSession` on the same repo; both legal outcomes (RemoveRepo wins / RemoveSession wins) are accepted, the illegal "both Ack with leaked DB row" is what the per-repo mutation lock prevents.
+
+**Phase 4 discoveries the plan didn't anticipate:**
+
+- The plan's starter-kit note said `FindSessionById walks all DBs and should hold a global (not per-repo) lock`. In practice, the read is safe lockless under WAL mode — a global lock would serialize the index walk against every other read, which is an anti-pattern for a pure-read path. Documented the "no global lock needed" reasoning in the handler doc comment. Writes that could move a row between repos are already serialized by their per-repo mutation lock, so an index walk can never see an inconsistent half-state.
+- `handle_remove_session` needs **two** guards: the DB-status guard inside `SessionStore::remove` (rejects `running` / `starting`) *and* an in-memory live-registry guard. A supervisor whose fast-tick detection lagged could leave the DB `stopped` while the supervisor's actual CWD is still held — letting `remove_dir_all` succeed in that state would race the supervisor's log writer. The in-memory pre-check closes that window.
+- `DetachSession` is the least load-bearing RPC in the plan. The actual attach/detach connection management is intrinsically Tauri-backend-local (which process abandoned which pipe?), so the daemon RPC is effectively a probe. Kept it per the plan for symmetry with CLI-initiated flows and to have a seam for future multi-window subscription work, but scoped the handler to `find_by_id` + Ack — no daemon state to manage.
+- `Harness` Display/FromStr round-trip means we don't need a `mode_to_byte`-style wire tag for harness. An unknown-harness string on the wire decodes as `None`, matching the DB's `row_to_session` tolerance. Added a regression test (`roundtrip_found_session_unknown_harness_drops`) so a future harness addition that forgets to update `FromStr` doesn't silently corrupt decoded rows.
+- `handle_supervisor_frame` in the Tauri backend still does a direct `SessionStore::find_by_id` + `update_status` when it sees a `Status` frame on the session pipe. This is **not** a migration miss — it's a reaction to a supervisor-initiated signal on the direct pipe (D3: activity + terminal I/O stay direct) and the supervisor writes its own final status from `cmd/session.rs::serve` anyway, so losing daemon availability mid-exit doesn't break status updates.
+
+**Codex review round 1 (Phase 4 landing):** 3 findings, all applied:
+
+| # | Severity | Finding | Resolution |
+|---|---|---|---|
+| 1 | Medium | `handle_spawn` ready-timeout cleanup unconditionally unregisters the live-session entry and marks the DB row `failed`, even when `force_kill_pid_checked` returns Err. A still-alive supervisor invisible to `state.sessions` would let a follow-up `RemoveSession` / `RemoveRepo` race `remove_dir_all` against the supervisor's open handles — reopening the SHA-55 class via the spawn-timeout vector | After force-kill returns Err, the handler re-checks `is_alive(pid)`. If the process is still alive, the live-registry entry is **kept** and the DB row stays `starting` — the handler returns `Error` so the operator can issue an explicit `StopSession`. Only a confirmed-dead supervisor proceeds to unregister + mark `failed` |
+| 2 | Medium | `SessionStore::remove` deletes the DB row first, then swallows `remove_dir_all` errors — a leaked file handle leaves the directory orphaned with no DB row pointing at it for retry, and the RPC acks success | Order swapped: filesystem cleanup runs first and propagates errors. The DB row is only deleted after the directory is gone, so a failed cleanup leaves the row intact for a retry. `RemoveSession` now returns `Error` on cleanup failure rather than a misleading Ack |
+| 3 | Low | `SessionStore::rename` issued a bare `UPDATE ... WHERE id = ?` and ignored the affected rowcount, so renaming an unknown id under a known repo silently returned `RenameSessionAck` — broke contract symmetry with `RemoveSession` | Check `rows_affected() == 1`; return `SessionNotFound` on `0`. New regression test `rename_session_unknown_id_errors` covers the path |
+
+**Phase 4 follow-up cleanup applied alongside the Codex fixes:**
+
+- Tauri `detach_session` no longer calls `daemon_ipc::detach_session` — its result was discarded with `let _ = ...` and the very next line did the same `find_session_by_id` lookup. Collapsed to a single `find_session_by_id` round-trip. The daemon `DetachSession` RPC + handler stay registered (covered by the wire roundtrip test) so the protocol seam for future multi-window subscription work is preserved, but no caller invokes it today. **Open question for Codex round 2:** keep the unused RPC as a forward-compat seam, or elide it and re-add when the multi-window work needs it?
+
+**Deferred:**
+
+- DB-backed session listing (`session.list` per D4) stays direct. The plan's Batch C table explicitly says `ListSessions: existing, no change` — the existing `LiveSessionInfo` frame covers the live-registry view, and the Tauri / CLI DB-backed `list_sessions` functions don't materially change the SHA-55 class risk model. If the UI grows consistency issues between the DB list and the event stream, revisit in Phase 6.
 
 ### Phase 5 — Batch D
 
@@ -386,3 +432,10 @@ Add bounded mpsc per subscribe client in the daemon (agent A flagged the current
    - LOW: `handle_remove_repo` now pokes the monitor on `store.remove` failure so subscribers don't see a silently-missing repo.
 
    `DropRepo` ack semantics and `LifecycleRegistry::clear_repo` confirmed correct — no changes required. `FindSessionById`'s global lock semantics deferred to Phase 4 review along with the rest of Batch C.
+
+6. **After Phase 4 lands — round 1 done.** Three findings, all applied (see Phase 4 table above):
+   - MEDIUM: `handle_spawn` ready-timeout no longer unregisters when force-kill fails — keeps the live-registry entry so RemoveSession/RemoveRepo can still see and stop the supervisor.
+   - MEDIUM: `SessionStore::remove` cleans the directory before deleting the DB row and propagates fs errors — no more silent half-removes.
+   - LOW: `SessionStore::rename` checks rows_affected and returns `SessionNotFound` on a no-op UPDATE.
+
+   `handle_find_session_by_id`'s lockless walk confirmed correct (WAL + busy_timeout + per-repo write lock). Open for round 2: the dead-weight `DetachSession` RPC — keep as a forward-compat seam for multi-window or elide and re-add later? Also out-of-scope but real: Tauri's `stop_session` still bypasses the daemon's `StopSession` RPC; track as a separate follow-up.

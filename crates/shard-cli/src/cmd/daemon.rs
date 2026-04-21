@@ -1571,6 +1571,9 @@ async fn dispatch_request(state: &Arc<DaemonState>, frame: ControlFrame) -> Cont
                 | ControlFrame::AddRepo { .. }
                 | ControlFrame::RemoveRepo { .. }
                 | ControlFrame::SyncRepo { .. }
+                | ControlFrame::RemoveSession { .. }
+                | ControlFrame::RenameSession { .. }
+                | ControlFrame::DetachSession { .. }
         )
     {
         return ControlFrame::Error {
@@ -1614,6 +1617,16 @@ async fn dispatch_request(state: &Arc<DaemonState>, frame: ControlFrame) -> Cont
         ControlFrame::SyncRepo { alias } => handle_sync_repo(state, alias).await,
 
         ControlFrame::ListRepos => handle_list_repos(state).await,
+
+        ControlFrame::RemoveSession { repo, id } => handle_remove_session(state, repo, id).await,
+
+        ControlFrame::RenameSession { repo, id, label } => {
+            handle_rename_session(state, repo, id, label).await
+        }
+
+        ControlFrame::DetachSession { id } => handle_detach_session(state, id).await,
+
+        ControlFrame::FindSessionById { prefix } => handle_find_session_by_id(state, prefix).await,
 
         ControlFrame::ListSessions => {
             let sessions = state.sessions.lock().await;
@@ -1824,11 +1837,18 @@ async fn handle_spawn(
         //   1. Force-kill the PID (Timeout only — `Died` means no
         //      process). The creation_time guard refuses if the PID
         //      has been recycled.
-        //   2. Remove the registry entry so StopSession / RemoveRepo
+        //   2. Confirm the process is actually dead (`!is_alive`).
+        //      If the kill failed and the process is still alive, we
+        //      MUST keep the live-registry entry — a still-bound
+        //      supervisor that's invisible to the registry would let
+        //      RemoveSession / RemoveRepo race remove_dir_all against
+        //      the supervisor's open handles (the SHA-55 class via
+        //      the ready-timeout vector).
+        //   3. Remove the registry entry so StopSession / RemoveRepo
         //      no longer see it.
-        //   3. Mark the DB row failed so orphan adoption on next
+        //   4. Mark the DB row failed so orphan adoption on next
         //      daemon start doesn't try to re-adopt a ghost.
-        let message = match outcome {
+        let kill_failed = match &outcome {
             ReadyOutcome::Timeout => {
                 if let Err(e) = shard_supervisor::process_windows::force_kill_pid_checked(
                     pid,
@@ -1837,7 +1857,34 @@ async fn handle_spawn(
                     warn!(
                         "handle_spawn: ready-timeout force-kill failed for pid={pid}: {e}"
                     );
+                    true
+                } else {
+                    false
                 }
+            }
+            ReadyOutcome::Died => false,
+            ReadyOutcome::Ok => unreachable!(),
+        };
+
+        // Belt-and-suspenders: even if force-kill returned Ok, the
+        // process may not have fully torn down yet. Re-check liveness
+        // before we trust the registry-cleanup path.
+        let still_alive = kill_failed && PlatformProcessControl::is_alive(pid);
+
+        if still_alive {
+            // Don't unregister — leave the entry so subsequent
+            // RemoveSession / RemoveRepo can still see and stop the
+            // live supervisor. The DB row stays `starting` so a later
+            // operator-driven StopSession can transition it cleanly.
+            return ControlFrame::Error {
+                message: format!(
+                    "supervisor did not become ready and force-kill failed (pid={pid}); session left live for retry"
+                ),
+            };
+        }
+
+        let message = match outcome {
+            ReadyOutcome::Timeout => {
                 format!("supervisor did not become ready within 10s (pid={pid})")
             }
             ReadyOutcome::Died => "supervisor died before becoming ready".to_string(),
@@ -2568,6 +2615,141 @@ async fn handle_list_repos(state: &Arc<DaemonState>) -> ControlFrame {
         Ok(repos) => ControlFrame::RepoList { repos },
         Err(e) => ControlFrame::Error {
             message: format!("list repos failed: {e}"),
+        },
+    }
+}
+
+// ── Phase 4: session-lifecycle tail ─────────────────────────────────────────
+//
+// RemoveSession / RenameSession / DetachSession / FindSessionById land here
+// to finish the D5 "daemon owns every mutation" invariant for sessions.
+// `SpawnSession` / `StopSession` / `ListSessions` arrived in earlier phases
+// and are unchanged.
+
+/// Handle `RemoveSession` — drop a terminal-status session row and its
+/// on-disk artefacts.
+///
+/// `SessionStore::remove` guards on `running`/`starting` itself; we re-check
+/// the live registry here so a session whose DB row was flipped stale but
+/// whose supervisor is still in the in-memory map can't slip past the DB
+/// guard. Holds the per-repo mutation lock so concurrent `RemoveRepo`
+/// can't yank the repo DB out while we're mid-delete.
+async fn handle_remove_session(
+    state: &Arc<DaemonState>,
+    repo: String,
+    id: String,
+) -> ControlFrame {
+    let repo_lock = state.acquire_repo_mutation_lock(&repo).await;
+    let _guard = repo_lock.lock().await;
+
+    // Live-registry guard: if we still track a supervisor for this id, the
+    // caller must `StopSession` first. Without this check the DB row could
+    // show `stopped` (e.g. from a prior failed stop path) while the actual
+    // supervisor process is still bound to the workspace CWD, and removing
+    // the session dir would race the supervisor's log writer.
+    {
+        let sessions = state.sessions.lock().await;
+        if sessions.contains_key(&id) {
+            return ControlFrame::Error {
+                message: format!(
+                    "session '{}' is still live — stop it first",
+                    &id[..8.min(id.len())]
+                ),
+            };
+        }
+    }
+
+    let session_store = SessionStore::new(state.paths.clone());
+    match session_store.remove(&repo, &id) {
+        Ok(()) => {
+            info!(
+                "RemoveSession: {}:{}",
+                repo,
+                &id[..8.min(id.len())]
+            );
+            // Broadcast SessionsChanged so subscribers drop the row from
+            // their cached list. Cheap + matches the existing coarse-event
+            // policy (D10).
+            if let Some(monitor) = state.monitor.get() {
+                monitor.broadcast(
+                    crate::cmd::workspace_monitor::ChangeKind::Sessions(repo.clone()),
+                );
+            }
+            ControlFrame::RemoveSessionAck
+        }
+        Err(e) => ControlFrame::Error {
+            message: format!("remove session failed: {e}"),
+        },
+    }
+}
+
+/// Handle `RenameSession` — pure DB label update. No filesystem or
+/// supervisor involvement. Held under the per-repo mutation lock so a
+/// concurrent `RemoveSession` / `RemoveRepo` can't flip the row out from
+/// under the UPDATE.
+async fn handle_rename_session(
+    state: &Arc<DaemonState>,
+    repo: String,
+    id: String,
+    label: Option<String>,
+) -> ControlFrame {
+    let repo_lock = state.acquire_repo_mutation_lock(&repo).await;
+    let _guard = repo_lock.lock().await;
+
+    let session_store = SessionStore::new(state.paths.clone());
+    match session_store.rename(&repo, &id, label.as_deref()) {
+        Ok(()) => {
+            if let Some(monitor) = state.monitor.get() {
+                monitor.broadcast(
+                    crate::cmd::workspace_monitor::ChangeKind::Sessions(repo.clone()),
+                );
+            }
+            ControlFrame::RenameSessionAck
+        }
+        Err(e) => ControlFrame::Error {
+            message: format!("rename session failed: {e}"),
+        },
+    }
+}
+
+/// Handle `DetachSession` — probe that the session still exists.
+///
+/// The actual attach/detach connection lives between the Tauri backend
+/// and the supervisor's session pipe (per migration non-goals: terminal
+/// I/O stays direct). This RPC is a daemon-visible hook so CLI and GUI
+/// detach flows look identical end-to-end — useful for telemetry and as
+/// the seam the future multi-window subscription path will plug into.
+/// Today it just validates the id resolves, so a frontend that calls
+/// detach on a stale id gets a typed error rather than silently losing
+/// state.
+async fn handle_detach_session(state: &Arc<DaemonState>, id: String) -> ControlFrame {
+    let session_store = SessionStore::new(state.paths.clone());
+    match session_store.find_by_id(&id) {
+        Ok(_) => ControlFrame::DetachSessionAck,
+        Err(e) => ControlFrame::Error {
+            message: format!("detach: {e}"),
+        },
+    }
+}
+
+/// Handle `FindSessionById` — walk the global session index and return
+/// the unique match. Read-only, no locks: the index DB and per-repo DBs
+/// are both opened in WAL mode so the walk is safe against concurrent
+/// writes (Session writes are short; reading under WAL never blocks).
+///
+/// Ambiguous or absent ids surface as an `Error` frame carrying the same
+/// message shape `SessionStore::find_by_id` returns — callers can match
+/// on substrings if they need typed handling (see `handle_stop`'s
+/// in-memory prefix-match logic for the pattern).
+async fn handle_find_session_by_id(
+    state: &Arc<DaemonState>,
+    prefix: String,
+) -> ControlFrame {
+    let session_store = SessionStore::new(state.paths.clone());
+    match session_store.find_by_id(&prefix) {
+        Ok((repo, session)) => ControlFrame::FoundSession { repo, session },
+        Err(e) => ControlFrame::Error {
+            message: format!("find session: {e}"),
         },
     }
 }

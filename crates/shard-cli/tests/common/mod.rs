@@ -159,6 +159,40 @@ impl TestHarness {
         repo_path
     }
 
+    /// Insert a fresh session row for `repo:ws_name` and drive it to a
+    /// terminal status so the Phase 4 `RemoveSession` / `RenameSession`
+    /// handlers have a realistic target without the cost of spawning a
+    /// real supervisor. Returns `(session_id, session_dir)`.
+    ///
+    /// `terminal_status` defaults to `"exited"` — any status that
+    /// `SessionStore::remove` accepts (i.e. not `running` / `starting`)
+    /// is fine.
+    pub fn setup_terminal_session(
+        &self,
+        repo: &str,
+        ws_name: &str,
+        terminal_status: &str,
+    ) -> (String, PathBuf) {
+        use shard_core::sessions::SessionStore;
+
+        let paths = shard_core::paths::ShardPaths::from_data_dir(self.data_path.clone());
+        let store = SessionStore::new(paths.clone());
+        let session = store
+            .create(
+                repo,
+                ws_name,
+                &["pwsh".to_string()],
+                "",
+                None,
+            )
+            .expect("create session row");
+        store
+            .update_status(repo, &session.id, terminal_status, Some(0))
+            .expect("flip to terminal status");
+        let session_dir = paths.session_dir(repo, &session.id);
+        (session.id, session_dir)
+    }
+
     /// Create a fresh workspace in `repo` named `ws_name`. Returns its
     /// filesystem path. The workspace is registered in the daemon's
     /// lifecycle registry in `Active` state.

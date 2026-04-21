@@ -203,8 +203,7 @@ fn list(target: Option<String>, json: bool) -> shard_core::Result<()> {
 }
 
 fn attach(id: String) -> shard_core::Result<()> {
-    let session_store = SessionStore::new(ShardPaths::new()?);
-    let (_repo, session) = session_store.find_by_id(&id)?;
+    let (_repo, session) = find_session_via_daemon(&id)?;
 
     if session.status != "running" {
         return Err(shard_core::ShardError::Other(format!(
@@ -221,8 +220,8 @@ fn attach(id: String) -> shard_core::Result<()> {
 }
 
 fn stop(id: String, force: bool) -> shard_core::Result<()> {
+    let (repo, session) = find_session_via_daemon(&id)?;
     let session_store = SessionStore::new(ShardPaths::new()?);
-    let (repo, session) = session_store.find_by_id(&id)?;
 
     if session.status != "running" && session.status != "starting" {
         println!("Session {} is already '{}'", id, session.status);
@@ -313,11 +312,67 @@ fn stop(id: String, force: bool) -> shard_core::Result<()> {
 }
 
 fn remove(id: String) -> shard_core::Result<()> {
-    let session_store = SessionStore::new(ShardPaths::new()?);
-    let (repo, _session) = session_store.find_by_id(&id)?;
-    session_store.remove(&repo, &id)?;
-    println!("Removed session {}", &id[..8]);
+    use shard_transport::control_protocol::ControlFrame;
+
+    let (repo, session) = find_session_via_daemon(&id)?;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        use shard_transport::daemon_client;
+
+        let mut conn = daemon_client::connect()
+            .await
+            .map_err(|e| shard_core::ShardError::Other(format!("daemon not running: {e}")))?;
+        conn.handshake()
+            .await
+            .map_err(|e| shard_core::ShardError::Other(format!("daemon handshake: {e}")))?;
+        conn.request_typed(
+            &ControlFrame::RemoveSession {
+                repo: repo.clone(),
+                id: session.id.clone(),
+            },
+            |f| match f {
+                ControlFrame::RemoveSessionAck => Ok(()),
+                other => Err(other),
+            },
+        )
+        .await
+        .map_err(|e| shard_core::ShardError::Other(e.to_string()))
+    })?;
+
+    println!("Removed session {}", &session.id[..8.min(session.id.len())]);
     Ok(())
+}
+
+/// Resolve a session id (or prefix) through the daemon's global session
+/// index. Same shape CLI repo / workspace subcommands use for their
+/// daemon round-trips (see `cmd/repo.rs::run_daemon_rpc`). Per Phase 4
+/// D4, all session lookups route through the daemon so CLI and GUI
+/// agree on the source of truth.
+fn find_session_via_daemon(id: &str) -> shard_core::Result<(String, shard_core::sessions::Session)> {
+    use shard_transport::control_protocol::ControlFrame;
+    use shard_transport::daemon_client;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let mut conn = daemon_client::connect()
+            .await
+            .map_err(|e| shard_core::ShardError::Other(format!("daemon not running: {e}")))?;
+        conn.handshake()
+            .await
+            .map_err(|e| shard_core::ShardError::Other(format!("daemon handshake: {e}")))?;
+        conn.request_typed(
+            &ControlFrame::FindSessionById {
+                prefix: id.to_string(),
+            },
+            |f| match f {
+                ControlFrame::FoundSession { repo, session } => Ok((repo, session)),
+                other => Err(other),
+            },
+        )
+        .await
+        .map_err(|e| shard_core::ShardError::Other(e.to_string()))
+    })
 }
 
 fn serve(

@@ -3,16 +3,18 @@
 //! Uses the same wire format as the session protocol: `[u32 len][u8 type][payload]`.
 //! Type bytes are in the `0x80+` range to avoid collision with session frame types.
 
+use shard_core::harness::Harness;
 use shard_core::repos::Repository;
+use shard_core::sessions::Session;
 use shard_core::state::{RepoState, WorkspaceHealth, WorkspaceStatus};
 use shard_core::workspaces::{BranchInfo, Workspace, WorkspaceMode, WorkspaceWithStatus};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current control protocol version. Bumped on breaking wire changes.
 ///
-/// v5 adds `AddRepo`/`RemoveRepo`/`SyncRepo`/`ListRepos` (type bytes
-/// 0x9A–0xA1) for Phase 3 of the daemon-broker migration.
-pub const PROTOCOL_VERSION: u16 = 5;
+/// v6 adds `RemoveSession`/`RenameSession`/`DetachSession`/`FindSessionById`
+/// (type bytes 0xA2–0xA9) for Phase 4 of the daemon-broker migration.
+pub const PROTOCOL_VERSION: u16 = 6;
 
 /// Well-known named pipe address for the daemon control channel.
 #[cfg(windows)]
@@ -190,6 +192,46 @@ pub enum ControlFrame {
     /// Daemon → Client: the full repo list, ordered by alias.
     RepoList { repos: Vec<Repository> },
 
+    // --- Session Lifecycle Tail (Phase 4 of daemon-broker migration) ---
+    /// Client → Daemon: remove a terminal-status session from the DB and
+    /// clean up its session directory. Guards inside the daemon reject
+    /// `running` / `starting` sessions with a typed error — the caller is
+    /// expected to `StopSession` first.
+    RemoveSession { repo: String, id: String },
+
+    /// Daemon → Client: remove succeeded.
+    RemoveSessionAck,
+
+    /// Client → Daemon: set or clear a session's label. Pure DB update;
+    /// no watcher / supervisor coordination.
+    RenameSession {
+        repo: String,
+        id: String,
+        label: Option<String>,
+    },
+
+    /// Daemon → Client: rename succeeded.
+    RenameSessionAck,
+
+    /// Client → Daemon: validate a session id. The daemon's handler is
+    /// effectively a "does this session still exist" probe — the actual
+    /// attach/detach connection management stays in the Tauri backend
+    /// (per migration non-goals: terminal I/O stays direct). Provides a
+    /// symmetric RPC surface so CLI and GUI detach flows run the same
+    /// daemon round-trip for telemetry and future multi-window work.
+    DetachSession { id: String },
+
+    /// Daemon → Client: detach acknowledged.
+    DetachSessionAck,
+
+    /// Client → Daemon: resolve a full-or-prefix session id against the
+    /// daemon's global session index. Walks every repo DB and returns
+    /// the unique match, or an `Error` frame on zero / ambiguous matches.
+    FindSessionById { prefix: String },
+
+    /// Daemon → Client: resolved session, tagged with its repo alias.
+    FoundSession { repo: String, session: Session },
+
     // --- Errors ---
     /// Daemon → Client: request failed.
     Error { message: String },
@@ -240,6 +282,14 @@ const TYPE_SYNC_REPO: u8 = 0x9E;
 const TYPE_SYNC_REPO_ACK: u8 = 0x9F;
 const TYPE_LIST_REPOS: u8 = 0xA0;
 const TYPE_REPO_LIST: u8 = 0xA1;
+const TYPE_REMOVE_SESSION: u8 = 0xA2;
+const TYPE_REMOVE_SESSION_ACK: u8 = 0xA3;
+const TYPE_RENAME_SESSION: u8 = 0xA4;
+const TYPE_RENAME_SESSION_ACK: u8 = 0xA5;
+const TYPE_DETACH_SESSION: u8 = 0xA6;
+const TYPE_DETACH_SESSION_ACK: u8 = 0xA7;
+const TYPE_FIND_SESSION_BY_ID: u8 = 0xA8;
+const TYPE_FOUND_SESSION: u8 = 0xA9;
 
 // WorkspaceMode wire tag
 const MODE_NEW_BRANCH: u8 = 0;
@@ -437,6 +487,33 @@ pub async fn write_control_frame<W: AsyncWrite + Unpin>(
                 write_repository(&mut payload, r);
             }
             TYPE_REPO_LIST
+        }
+        ControlFrame::RemoveSession { repo, id } => {
+            write_str(&mut payload, repo);
+            write_str(&mut payload, id);
+            TYPE_REMOVE_SESSION
+        }
+        ControlFrame::RemoveSessionAck => TYPE_REMOVE_SESSION_ACK,
+        ControlFrame::RenameSession { repo, id, label } => {
+            write_str(&mut payload, repo);
+            write_str(&mut payload, id);
+            write_opt_str(&mut payload, label.as_deref());
+            TYPE_RENAME_SESSION
+        }
+        ControlFrame::RenameSessionAck => TYPE_RENAME_SESSION_ACK,
+        ControlFrame::DetachSession { id } => {
+            write_str(&mut payload, id);
+            TYPE_DETACH_SESSION
+        }
+        ControlFrame::DetachSessionAck => TYPE_DETACH_SESSION_ACK,
+        ControlFrame::FindSessionById { prefix } => {
+            write_str(&mut payload, prefix);
+            TYPE_FIND_SESSION_BY_ID
+        }
+        ControlFrame::FoundSession { repo, session } => {
+            write_str(&mut payload, repo);
+            write_session(&mut payload, session);
+            TYPE_FOUND_SESSION
         }
         ControlFrame::Error { message } => {
             write_str(&mut payload, message);
@@ -745,6 +822,36 @@ pub async fn read_control_frame<R: AsyncRead + Unpin>(
             }
             ControlFrame::RepoList { repos }
         }
+        TYPE_REMOVE_SESSION => {
+            let (repo, n) = read_str(payload)?;
+            let (id, _) = read_str(&payload[n..])?;
+            ControlFrame::RemoveSession { repo, id }
+        }
+        TYPE_REMOVE_SESSION_ACK => ControlFrame::RemoveSessionAck,
+        TYPE_RENAME_SESSION => {
+            let mut offset = 0;
+            let (repo, n) = read_str(&payload[offset..])?;
+            offset += n;
+            let (id, n) = read_str(&payload[offset..])?;
+            offset += n;
+            let (label, _) = read_opt_str(&payload[offset..])?;
+            ControlFrame::RenameSession { repo, id, label }
+        }
+        TYPE_RENAME_SESSION_ACK => ControlFrame::RenameSessionAck,
+        TYPE_DETACH_SESSION => {
+            let (id, _) = read_str(payload)?;
+            ControlFrame::DetachSession { id }
+        }
+        TYPE_DETACH_SESSION_ACK => ControlFrame::DetachSessionAck,
+        TYPE_FIND_SESSION_BY_ID => {
+            let (prefix, _) = read_str(payload)?;
+            ControlFrame::FindSessionById { prefix }
+        }
+        TYPE_FOUND_SESSION => {
+            let (repo, n) = read_str(payload)?;
+            let (session, _) = read_session(&payload[n..])?;
+            ControlFrame::FoundSession { repo, session }
+        }
         TYPE_ERROR => {
             let (message, _) = read_str(payload)?;
             ControlFrame::Error { message }
@@ -967,6 +1074,147 @@ fn read_repository(buf: &[u8]) -> std::io::Result<(Repository, usize)> {
             name,
             local_path,
             created_at,
+        },
+        offset,
+    ))
+}
+
+// --- Session wire encoding ---
+//
+// Layout (matches the DB schema order in shard-core::sessions::Session):
+//   [id str][workspace_name str][command_json str][transport_addr str]
+//   [log_path str][supervisor_pid opt_u32][child_pid opt_u32]
+//   [status str][exit_code opt_i32][created_at u64][stopped_at opt_u64]
+//   [label opt_str][harness opt_str]
+//
+// `harness` is encoded via its Display impl ("claude-code" / "codex"); the
+// receiver parses it back through `FromStr`. Unknown strings become `None`
+// on the wire side, matching the DB's tolerance in `row_to_session`.
+
+fn write_opt_u32(buf: &mut Vec<u8>, value: Option<u32>) {
+    match value {
+        Some(v) => {
+            buf.push(1);
+            buf.extend_from_slice(&v.to_be_bytes());
+        }
+        None => buf.push(0),
+    }
+}
+
+fn read_opt_u32(buf: &[u8]) -> std::io::Result<(Option<u32>, usize)> {
+    ensure_len(buf, 1, "Option<u32> tag")?;
+    if buf[0] == 1 {
+        ensure_len(&buf[1..], 4, "Option<u32> body")?;
+        let v = u32::from_be_bytes(buf[1..5].try_into().unwrap());
+        Ok((Some(v), 5))
+    } else {
+        Ok((None, 1))
+    }
+}
+
+fn write_opt_i32(buf: &mut Vec<u8>, value: Option<i32>) {
+    match value {
+        Some(v) => {
+            buf.push(1);
+            buf.extend_from_slice(&v.to_be_bytes());
+        }
+        None => buf.push(0),
+    }
+}
+
+fn read_opt_i32(buf: &[u8]) -> std::io::Result<(Option<i32>, usize)> {
+    ensure_len(buf, 1, "Option<i32> tag")?;
+    if buf[0] == 1 {
+        ensure_len(&buf[1..], 4, "Option<i32> body")?;
+        let v = i32::from_be_bytes(buf[1..5].try_into().unwrap());
+        Ok((Some(v), 5))
+    } else {
+        Ok((None, 1))
+    }
+}
+
+fn write_opt_u64(buf: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        Some(v) => {
+            buf.push(1);
+            buf.extend_from_slice(&v.to_be_bytes());
+        }
+        None => buf.push(0),
+    }
+}
+
+fn read_opt_u64(buf: &[u8]) -> std::io::Result<(Option<u64>, usize)> {
+    ensure_len(buf, 1, "Option<u64> tag")?;
+    if buf[0] == 1 {
+        ensure_len(&buf[1..], 8, "Option<u64> body")?;
+        let v = u64::from_be_bytes(buf[1..9].try_into().unwrap());
+        Ok((Some(v), 9))
+    } else {
+        Ok((None, 1))
+    }
+}
+
+fn write_session(buf: &mut Vec<u8>, session: &Session) {
+    write_str(buf, &session.id);
+    write_str(buf, &session.workspace_name);
+    write_str(buf, &session.command_json);
+    write_str(buf, &session.transport_addr);
+    write_str(buf, &session.log_path);
+    write_opt_u32(buf, session.supervisor_pid);
+    write_opt_u32(buf, session.child_pid);
+    write_str(buf, &session.status);
+    write_opt_i32(buf, session.exit_code);
+    buf.extend_from_slice(&session.created_at.to_be_bytes());
+    write_opt_u64(buf, session.stopped_at);
+    write_opt_str(buf, session.label.as_deref());
+    write_opt_str(buf, session.harness.map(|h| h.to_string()).as_deref());
+}
+
+fn read_session(buf: &[u8]) -> std::io::Result<(Session, usize)> {
+    let mut offset = 0;
+    let (id, n) = read_str(&buf[offset..])?;
+    offset += n;
+    let (workspace_name, n) = read_str(&buf[offset..])?;
+    offset += n;
+    let (command_json, n) = read_str(&buf[offset..])?;
+    offset += n;
+    let (transport_addr, n) = read_str(&buf[offset..])?;
+    offset += n;
+    let (log_path, n) = read_str(&buf[offset..])?;
+    offset += n;
+    let (supervisor_pid, n) = read_opt_u32(&buf[offset..])?;
+    offset += n;
+    let (child_pid, n) = read_opt_u32(&buf[offset..])?;
+    offset += n;
+    let (status, n) = read_str(&buf[offset..])?;
+    offset += n;
+    let (exit_code, n) = read_opt_i32(&buf[offset..])?;
+    offset += n;
+    ensure_len(&buf[offset..], 8, "Session created_at")?;
+    let created_at = u64::from_be_bytes(buf[offset..offset + 8].try_into().unwrap());
+    offset += 8;
+    let (stopped_at, n) = read_opt_u64(&buf[offset..])?;
+    offset += n;
+    let (label, n) = read_opt_str(&buf[offset..])?;
+    offset += n;
+    let (harness_str, n) = read_opt_str(&buf[offset..])?;
+    offset += n;
+    let harness: Option<Harness> = harness_str.and_then(|s| s.parse().ok());
+    Ok((
+        Session {
+            id,
+            workspace_name,
+            command_json,
+            transport_addr,
+            log_path,
+            supervisor_pid,
+            child_pid,
+            status,
+            exit_code,
+            created_at,
+            stopped_at,
+            label,
+            harness,
         },
         offset,
     ))
@@ -1465,6 +1713,144 @@ mod tests {
     async fn roundtrip_repo_list_empty() {
         let frame = ControlFrame::RepoList { repos: vec![] };
         assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    fn sample_session(id: &str, status: &str) -> Session {
+        Session {
+            id: id.to_string(),
+            workspace_name: "feature".to_string(),
+            command_json: r#"["pwsh","-NoLogo"]"#.to_string(),
+            transport_addr: format!(r"\\.\pipe\shard-session-{id}"),
+            log_path: format!(r"C:\tmp\{id}\session.log"),
+            supervisor_pid: Some(1234),
+            child_pid: Some(5678),
+            status: status.to_string(),
+            exit_code: Some(0),
+            created_at: 1_700_000_321,
+            stopped_at: Some(1_700_000_999),
+            label: Some("my-agent".to_string()),
+            harness: Some(Harness::ClaudeCode),
+        }
+    }
+
+    fn minimal_session(id: &str) -> Session {
+        Session {
+            id: id.to_string(),
+            workspace_name: "main".to_string(),
+            command_json: "[]".to_string(),
+            transport_addr: String::new(),
+            log_path: String::new(),
+            supervisor_pid: None,
+            child_pid: None,
+            status: "starting".to_string(),
+            exit_code: None,
+            created_at: 1_700_000_100,
+            stopped_at: None,
+            label: None,
+            harness: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn roundtrip_remove_session() {
+        let frame = ControlFrame::RemoveSession {
+            repo: "demo".to_string(),
+            id: "019d5a15-session-01".to_string(),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+        assert_eq!(
+            roundtrip(ControlFrame::RemoveSessionAck).await,
+            ControlFrame::RemoveSessionAck
+        );
+    }
+
+    #[tokio::test]
+    async fn roundtrip_rename_session() {
+        let frame = ControlFrame::RenameSession {
+            repo: "demo".to_string(),
+            id: "abc".to_string(),
+            label: Some("my-agent".to_string()),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+
+        let clear = ControlFrame::RenameSession {
+            repo: "demo".to_string(),
+            id: "abc".to_string(),
+            label: None,
+        };
+        assert_eq!(roundtrip(clear.clone()).await, clear);
+
+        assert_eq!(
+            roundtrip(ControlFrame::RenameSessionAck).await,
+            ControlFrame::RenameSessionAck
+        );
+    }
+
+    #[tokio::test]
+    async fn roundtrip_detach_session() {
+        let frame = ControlFrame::DetachSession {
+            id: "019d5a15".to_string(),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+        assert_eq!(
+            roundtrip(ControlFrame::DetachSessionAck).await,
+            ControlFrame::DetachSessionAck
+        );
+    }
+
+    #[tokio::test]
+    async fn roundtrip_find_session_by_id() {
+        let req = ControlFrame::FindSessionById {
+            prefix: "019d5a15".to_string(),
+        };
+        assert_eq!(roundtrip(req.clone()).await, req);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_found_session_full() {
+        let frame = ControlFrame::FoundSession {
+            repo: "demo".to_string(),
+            session: sample_session("019d5a15-0001", "running"),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_found_session_minimal() {
+        let frame = ControlFrame::FoundSession {
+            repo: "demo".to_string(),
+            session: minimal_session("019d5a15-0002"),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_found_session_unknown_harness_drops() {
+        // If a future daemon sends a harness string the client doesn't
+        // recognize, we decode it as `None` — matches the DB's tolerance.
+        let mut payload = Vec::new();
+        // Session fields, matching write_session layout:
+        write_str(&mut payload, "id"); // id
+        write_str(&mut payload, "ws"); // workspace_name
+        write_str(&mut payload, "[]"); // command_json
+        write_str(&mut payload, ""); // transport_addr
+        write_str(&mut payload, ""); // log_path
+        payload.push(0); // supervisor_pid: None
+        payload.push(0); // child_pid: None
+        write_str(&mut payload, "running"); // status
+        payload.push(0); // exit_code: None
+        payload.extend_from_slice(&0u64.to_be_bytes()); // created_at
+        payload.push(0); // stopped_at: None
+        payload.push(0); // label: None
+        // harness: Some("unknown-harness") — expected to decode as None
+        payload.push(1);
+        write_str(&mut payload, "unknown-harness");
+
+        let (session, _) = read_session(&payload).unwrap();
+        assert!(
+            session.harness.is_none(),
+            "unknown harness string should decode as None"
+        );
     }
 
     #[tokio::test]

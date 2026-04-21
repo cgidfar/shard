@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use shard_core::repos::Repository;
+use shard_core::sessions::Session;
 use shard_core::state::RepoState;
 use shard_core::workspaces::{BranchInfo, Workspace, WorkspaceMode, WorkspaceWithStatus};
 use shard_transport::control_protocol::ControlFrame;
@@ -195,6 +196,104 @@ pub async fn sync_repo(alias: &str) -> Result<(), String> {
         },
         |f| match f {
             ControlFrame::SyncRepoAck => Ok(()),
+            other => Err(other),
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Resolve a full-or-prefix session id against the daemon's global
+/// session index. Returns `(repo_alias, session)`; error on zero /
+/// ambiguous matches.
+pub async fn find_session_by_id(prefix: &str) -> Result<(String, Session), String> {
+    let mut conn = daemon_client::connect()
+        .await
+        .map_err(|e| format!("daemon connect failed: {e}"))?;
+    conn.handshake()
+        .await
+        .map_err(|e| format!("daemon handshake failed: {e}"))?;
+    conn.request_typed(
+        &ControlFrame::FindSessionById {
+            prefix: prefix.to_string(),
+        },
+        |f| match f {
+            ControlFrame::FoundSession { repo, session } => Ok((repo, session)),
+            other => Err(other),
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Remove a terminal-status session via the daemon RPC. The daemon
+/// guards on `running`/`starting` and cleans up the session directory
+/// under the per-repo mutation lock.
+pub async fn remove_session(repo: &str, id: &str) -> Result<(), String> {
+    let mut conn = daemon_client::connect()
+        .await
+        .map_err(|e| format!("daemon connect failed: {e}"))?;
+    conn.handshake()
+        .await
+        .map_err(|e| format!("daemon handshake failed: {e}"))?;
+    conn.request_typed(
+        &ControlFrame::RemoveSession {
+            repo: repo.to_string(),
+            id: id.to_string(),
+        },
+        |f| match f {
+            ControlFrame::RemoveSessionAck => Ok(()),
+            other => Err(other),
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Set or clear a session's label via the daemon RPC. Pure DB update.
+pub async fn rename_session(
+    repo: &str,
+    id: &str,
+    label: Option<String>,
+) -> Result<(), String> {
+    let mut conn = daemon_client::connect()
+        .await
+        .map_err(|e| format!("daemon connect failed: {e}"))?;
+    conn.handshake()
+        .await
+        .map_err(|e| format!("daemon handshake failed: {e}"))?;
+    conn.request_typed(
+        &ControlFrame::RenameSession {
+            repo: repo.to_string(),
+            id: id.to_string(),
+            label,
+        },
+        |f| match f {
+            ControlFrame::RenameSessionAck => Ok(()),
+            other => Err(other),
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Probe that a session still exists, routed through the daemon for a
+/// consistent attach/detach signal across CLI and GUI. The actual
+/// connection teardown stays in the Tauri backend (terminal I/O is
+/// direct; see migration non-goals).
+pub async fn detach_session(id: &str) -> Result<(), String> {
+    let mut conn = daemon_client::connect()
+        .await
+        .map_err(|e| format!("daemon connect failed: {e}"))?;
+    conn.handshake()
+        .await
+        .map_err(|e| format!("daemon handshake failed: {e}"))?;
+    conn.request_typed(
+        &ControlFrame::DetachSession {
+            id: id.to_string(),
+        },
+        |f| match f {
+            ControlFrame::DetachSessionAck => Ok(()),
             other => Err(other),
         },
     )
