@@ -391,6 +391,93 @@ async fn install_malformed_settings_errors() {
 }
 
 #[tokio::test]
+async fn install_preserves_user_hooks_mixed_with_shard_in_same_entry() {
+    // Codex Phase 5 review round 1 MEDIUM: users can legitimately mix
+    // their own commands alongside Shard's within the same inner
+    // `hooks[]` array of a single outer entry. A whole-entry strip
+    // (the pre-fix retain) would drop the user command together with
+    // the shard one. The fix moves the strip to the inner level so
+    // user commands survive reinstall.
+    let home = TempDir::new().expect("tempdir");
+    let claude_dir = home.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir).expect("create .claude");
+
+    // Seed: a single outer entry under UserPromptSubmit that mixes a
+    // stale shardctl command with a user-owned command. The stale path
+    // forces reinstall (predicate mismatch); the user command must
+    // survive.
+    let user_command = "C:/Users/me/bin/tracker.exe --user-flag";
+    let mixed = serde_json::json!({
+        "hooks": {
+            "UserPromptSubmit": [{
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "C:/old/path/shardctl notify active",
+                    },
+                    {
+                        "type": "command",
+                        "command": user_command,
+                    },
+                ],
+            }],
+        },
+    });
+    std::fs::write(
+        claude_dir.join("settings.json"),
+        serde_json::to_string_pretty(&mixed).unwrap(),
+    )
+    .expect("write mixed settings");
+
+    let harness = TestHarness::start_with_hooks_home(home.path().to_path_buf()).await;
+
+    match install_hooks_rpc(&harness, "claude-code").await {
+        ControlFrame::InstallHarnessHooksAck {
+            installed: true,
+            skipped_reason: None,
+        } => {}
+        other => panic!("unexpected response: {other:?}"),
+    }
+
+    // The user's command must still be present after install.
+    let settings = read_settings_json(home.path());
+    let ups = settings
+        .get("hooks")
+        .and_then(|h| h.get("UserPromptSubmit"))
+        .and_then(|a| a.as_array())
+        .expect("UserPromptSubmit array");
+    let mut found_user = false;
+    for entry in ups {
+        let inner = entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .expect("inner hooks");
+        for h in inner {
+            let cmd = h
+                .get("command")
+                .and_then(|c| c.as_str())
+                .expect("command string");
+            if cmd == user_command {
+                found_user = true;
+            }
+            assert!(
+                !cmd.contains("C:/old/path"),
+                "stale shardctl path should be stripped: {cmd}",
+            );
+        }
+    }
+    assert!(
+        found_user,
+        "user command in mixed entry must survive reinstall",
+    );
+    // And the four-event shape still holds — exactly one shard entry
+    // per event.
+    assert_all_events_one_shard_entry(&settings);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn install_partial_stale_config_converges() {
     // Codex round 2 finding: the old predicate returned `true` if any
     // entry contained a `shardctl` substring anywhere under `hooks`.

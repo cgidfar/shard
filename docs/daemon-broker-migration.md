@@ -1,6 +1,6 @@
 # Daemon-as-Broker Migration Plan
 
-**Status:** Phase 0 + Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 landed on branch `daemon-broker-migration`. Phase 5 centralizes harness-hook installation behind `InstallHarnessHooks` so concurrent installs serialize against one user-global mutex and the ack matrix surfaces "installed / skipped / why" through the RPC. 150 tests pass (13 new in Phase 5: 9 hooks-install integration + 4 wire roundtrips), zero Phase 5-introduced warnings.
+**Status:** Phase 0 + Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 landed on branch `daemon-broker-migration`. Phase 5 centralizes harness-hook installation behind `InstallHarnessHooks` so concurrent installs serialize against one user-global mutex and the ack matrix surfaces "installed / skipped / why" through the RPC. Phase 5 Codex round 1 done — 1 medium applied (inner-level strip preserves user hooks mixed with shard in the same outer entry). 151 tests pass (14 new in Phase 5: 10 hooks-install integration + 4 wire roundtrips), zero Phase 5-introduced warnings.
 **Related:** SHA-55 (workspace delete failure), `docs/responsibility-map.md`
 
 ## Goals
@@ -512,7 +512,7 @@ Hard `Error` is reserved for genuine failures: malformed settings.json, write/re
 8. ✅ Integration tests live in `crates/shard-cli/tests/hooks_install.rs`. `HarnessOptions` (new in `tests/common/mod.rs`) lets any test mix `git_ops`, `hooks_home_override`, and `exe_path_override` — the Phase 5 tests use the last two together.
 9. ✅ This section (plus the status line at the top) updated for Phase 5 landing.
 
-**Test plan — 9 Phase 5 integration tests + 4 wire roundtrips (13 new):**
+**Test plan — 10 Phase 5 integration tests + 4 wire roundtrips (14 new):**
 
 - ✅ `install_claude_code_happy_path` — fresh install writes settings.json with exactly one shard entry per event; ack is `installed: true, skipped_reason: None`.
 - ✅ `install_claude_code_skips_when_dir_absent` — **the test the original plan missed (Codex round 1 HIGH).** No `.claude/` dir → `installed: false, skipped_reason: Some("claude code not installed")`; settings.json is never created.
@@ -523,6 +523,7 @@ Hard `Error` is reserved for genuine failures: malformed settings.json, write/re
 - ✅ `install_with_existing_settings_preserves_other_keys` — pre-seeded `{"theme": "dark", "hooks": {}}` survives the install; `theme` is still `"dark"` afterward.
 - ✅ `install_malformed_settings_errors` — non-JSON garbage in settings.json surfaces as an `Error` frame with a parse/install message; not a vacuous `Ack`.
 - ✅ `install_partial_stale_config_converges` (Codex round 2) — seeded with only two of four events wired, under a stale shardctl path. Predicate returns `false`, installer runs, ack is `installed: true, skipped_reason: None`, final file has all four events with exactly one shard entry each, and the stale path is stripped.
+- ✅ `install_preserves_user_hooks_mixed_with_shard_in_same_entry` (Codex round 1 MEDIUM fix) — seeded with one outer entry that mixes a stale shardctl command *and* a user-owned command inside the same inner `hooks[]` array. The pre-fix installer would drop the whole outer entry during retain and take the user's command with it. Regression guard: reinstall must strip the shard command at the inner level, leave the user command alone, and still converge the file to the expected four-event shape.
 
 Wire roundtrips: `roundtrip_install_harness_hooks_request`, `_ack_installed_no_reason`, `_ack_already_configured`, `_ack_skipped` cover each of the four ack-matrix rows at the codec layer.
 
@@ -533,6 +534,17 @@ Wire roundtrips: `roundtrip_install_harness_hooks_request`, `_ack_installed_no_r
 - **`shard_core::hooks::default_hooks_home()` published so the daemon doesn't import `directories` directly.** The daemon needs the real user home when no test override is set, but pulling `directories` into `shard-cli` would duplicate a dep that already lives in `shard-core`. Factored the lookup to a public helper in `shard-core::hooks`; the daemon now matches on `state.hooks_home_override.clone().or_else(|| shard_core::hooks::default_hooks_home())`.
 - **`daemon_ipc::install_harness_hooks` helper vs. inline inside the already-open connection.** Tauri uses the helper (opens its own connection — one extra handshake), CLI inlines on the already-open handshaked connection (saves the handshake in the common case where the CLI just connect-or-spawned the daemon). Both work; the helper is canonical for future callers that don't have a connection handy, and Tauri's usage keeps the helper from going stale as dead code.
 - **`tracing::info!` vs `println!` on the CLI side.** CLI subcommands typically don't initialize a tracing subscriber for stdout; the plan said "print one-line summary mapped from the ack matrix". Resolved by `println!`-ing only the noteworthy rows (fresh install, explicit skip-reason) and logging the routine rows (already-configured, unknown-reason false) at `tracing::debug!`. Matches the existing `shardctl session create` output style.
+
+**Codex review round 1 (Phase 5 landing):** 1 medium applied:
+
+| # | Severity | Finding | Resolution |
+|---|---|---|---|
+| 1 | MEDIUM | The installer's outer-level `arr.retain(|e| !entry_contains_shardctl(e))` dropped any outer entry where *any* nested `hooks[].command` contained `"shardctl"`. A user who legitimately mixed their own command alongside Shard's within the same inner `hooks[]` array would lose the user command on the next reinstall. Same broad check treated any third-party command that happened to contain the substring as shard-owned | Installer now strips at the inner level via new `strip_shard_hooks_in_entry(&mut entry)` + a follow-up `retain(|e| !inner_hooks_empty(e))` pass. User commands in mixed entries survive reinstall; entries whose inner list becomes empty after strip are dropped (they would be pure noise otherwise). Predicate's `entry_contains_shardctl` is preserved because the predicate *needs* to match broadly — finding any stale shard command in any entry has to force a reinstall. New regression test `install_preserves_user_hooks_mixed_with_shard_in_same_entry` covers the mixed-entry path |
+
+**Codex round 1 deferrals (not applied as code changes):**
+
+- LOW — `daemon_ipc::install_harness_hooks` opens a second connection instead of reusing the one the Tauri path already established. Non-fatal (hooks failure doesn't block spawn) and the first connection has already succeeded before the helper runs. Noted as a fragility to watch if the helper grows more callers. Kept as-is for Phase 5.
+- Refactor to a structured sentinel marker (`"source": "shard"` on each entry) instead of a `"shardctl"` substring match — would eliminate `exe_path_override` and make the predicate bulletproof. Non-trivial because existing installs under the old heuristic would need one-shot migration on first read. Tracked as a follow-up; Phase 5's `exe_path_override` plus the inner-level strip fix resolves the correctness issue without the migration.
 
 ### Phase 6 — Subscription surface hardening
 
@@ -569,9 +581,7 @@ Add bounded mpsc per subscribe client in the daemon (agent A flagged the current
 
    `handle_find_session_by_id`'s lockless walk confirmed correct (WAL + busy_timeout + per-repo write lock). Open for round 2: the dead-weight `DetachSession` RPC — keep as a forward-compat seam for multi-window or elide and re-add later? Also out-of-scope but real: Tauri's `stop_session` still bypasses the daemon's `StopSession` RPC; track as a separate follow-up.
 
-7. **After Phase 5 lands — round 1 pending.** Things for Codex to look at:
-   - Mutex scope: `state.hooks_install_lock` wraps the full query+install sequence (Codex round-1 finding from planning was applied). Confirm no other code paths touch `~/.claude/settings.json` outside the lock.
-   - Predicate tightness: `claude_code_hooks_installed_in_home` now takes `shardctl_path` and checks all four events have exactly one matching entry. Round-2 planning finding applied — look for edge cases (e.g. settings.json with an empty-array event, user-owned non-shard entries in the same array).
-   - Test seam: `exe_path_override` was added to handle a real gap the plan didn't flag (test binary path doesn't contain `"shardctl"`). Alternative design — widen the predicate's "is this shard-owned" marker from a `"shardctl"` substring to something installer-controlled — would remove the need for the exe-path override entirely but changes the predicate semantics. Worth calling out if Codex sees a better shape.
-   - Quit-mode list: `InstallHarnessHooks` was added to the mutating-frame rejection list. Is that right, or should the install be allowed to drain during a tray quit? The operation is ~10ms and doesn't touch the Job Object; current position is that consistency (every mutation rejected during quit) beats the latency saving.
-   - Out-of-scope but real: `DetachSession` dead-weight from Phase 4 — Phase 5 didn't touch it, but the warning is still there. Track via the Phase 4 follow-up.
+7. **After Phase 5 lands — round 1 done.** One MEDIUM applied (see Phase 5 table above):
+   - MEDIUM: Installer's outer-level retain stripped user commands mixed with shard commands under the same entry. Moved strip to the inner level so user commands survive reinstall.
+
+   Converged on mutex scope (query+install coverage confirmed, only one in-repo path writes `~/.claude/`), call-site swap behavior preservation, and the quit-mode-rejection list (preference-level, kept). Deferred: fragility of the second-connection pattern in `daemon_ipc::install_harness_hooks` (LOW, behavior-correct today) and the structured-sentinel refactor to supersede `"shardctl"` substring detection (follow-up, needs a migration story).

@@ -99,11 +99,23 @@ pub fn install_claude_code_hooks_in_home(home: &Path, shardctl_path: &Path) -> R
             .as_array_mut()
             .ok_or_else(|| ShardError::Other(format!("hooks.{event} is not an array")))?;
 
-        // Remove any existing shard hook entry (idempotent update).
-        // Identify ours by checking if any inner hook command contains "shardctl".
-        arr.retain(|entry| !entry_contains_shardctl(entry));
+        // Strip shard-owned hooks at the INNER level so a user who
+        // mixed their own command into the same outer entry as a shard
+        // command doesn't lose their hook. The previous outer-level
+        // retain would drop the whole entry — including the user's
+        // command — as soon as one inner command contained
+        // `"shardctl"` (Codex Phase 5 review round 1 MEDIUM).
+        //
+        // After strip, any outer entry whose inner `hooks` array is
+        // now empty is dropped too (would be pure noise otherwise).
+        for entry in arr.iter_mut() {
+            strip_shard_hooks_in_entry(entry);
+        }
+        arr.retain(|entry| !inner_hooks_empty(entry));
 
-        // Add our hook entry — no matcher so it fires for all tools/events
+        // Add our hook entry as a standalone outer element — no
+        // matcher (fires for all tools) and always separate from any
+        // user entries. The predicate asserts this shape on read.
         arr.push(serde_json::json!({
             "hooks": [{
                 "type": "command",
@@ -190,9 +202,43 @@ fn shardctl_command_string(shardctl_path: &Path) -> String {
     shardctl_path.to_string_lossy().replace('\\', "/")
 }
 
+/// Strip shard-owned inner hooks from an outer event entry in place.
+/// Commands are identified by a `"shardctl"` substring; anything else
+/// (user-owned or foreign) is left alone. The outer entry keeps its
+/// shape — callers should follow up with [`inner_hooks_empty`] +
+/// `retain` to drop entries whose inner list became empty.
+///
+/// Splitting the operation at the inner level (rather than dropping
+/// the whole outer entry on any shard match) is load-bearing — users
+/// can legitimately mix their own commands alongside Shard's within
+/// the same inner `hooks` array, and an outer-level strip would
+/// silently delete their work.
+fn strip_shard_hooks_in_entry(entry: &mut serde_json::Value) {
+    let Some(inner) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+        return;
+    };
+    inner.retain(|h| {
+        h.get("command")
+            .and_then(|c| c.as_str())
+            .map_or(true, |c| !c.contains("shardctl"))
+    });
+}
+
+/// True if an outer entry's inner `hooks` array is empty or missing.
+/// Used by the installer after [`strip_shard_hooks_in_entry`] to drop
+/// the carcass of entries that held only shard commands.
+fn inner_hooks_empty(entry: &serde_json::Value) -> bool {
+    entry
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .map_or(true, |arr| arr.is_empty())
+}
+
 /// Does an event-array entry contain a nested `hooks[].command` that
-/// mentions `shardctl`? Matches the installer's retain-predicate so the
-/// "is this one of ours" check stays symmetric.
+/// mentions `shardctl`? Used by the predicate to decide whether an
+/// entry is shard-relevant (so the installer would touch it). The
+/// installer itself no longer uses this at the outer level — it
+/// strips at the inner level instead, via [`strip_shard_hooks_in_entry`].
 fn entry_contains_shardctl(entry: &serde_json::Value) -> bool {
     entry
         .get("hooks")
