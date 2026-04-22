@@ -1,6 +1,6 @@
 # Daemon-as-Broker Migration Plan
 
-**Status:** Phase 0 + Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 landed on branch `daemon-broker-migration`. Phase 5 centralizes harness-hook installation behind `InstallHarnessHooks` so concurrent installs serialize against one user-global mutex and the ack matrix surfaces "installed / skipped / why" through the RPC. Phase 5 Codex round 1 done — 1 medium applied (inner-level strip preserves user hooks mixed with shard in the same outer entry). 151 tests pass (14 new in Phase 5: 10 hooks-install integration + 4 wire roundtrips), zero Phase 5-introduced warnings.
+**Status:** Phase 0 + Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 landed on branch `daemon-broker-migration`. Phase 5 centralizes harness-hook installation behind `InstallHarnessHooks` so concurrent installs serialize against one user-global mutex and the ack matrix surfaces "installed / skipped / why" through the RPC. Phase 5 Codex round 1 done (1 medium applied: inner-level strip preserves user hooks mixed with shard in the same outer entry), round 2 converged. 151 tests pass (14 new in Phase 5: 10 hooks-install integration + 4 wire roundtrips), zero Phase 5-introduced warnings.
 **Related:** SHA-55 (workspace delete failure), `docs/responsibility-map.md`
 
 ## Goals
@@ -581,7 +581,7 @@ Add bounded mpsc per subscribe client in the daemon (agent A flagged the current
 
    `handle_find_session_by_id`'s lockless walk confirmed correct (WAL + busy_timeout + per-repo write lock). Open for round 2: the dead-weight `DetachSession` RPC — keep as a forward-compat seam for multi-window or elide and re-add later? Also out-of-scope but real: Tauri's `stop_session` still bypasses the daemon's `StopSession` RPC; track as a separate follow-up.
 
-7. **After Phase 5 lands — round 1 done.** One MEDIUM applied (see Phase 5 table above):
+7. **After Phase 5 lands — round 1 done, round 2 converged.** One MEDIUM applied in round 1 (see Phase 5 table above):
    - MEDIUM: Installer's outer-level retain stripped user commands mixed with shard commands under the same entry. Moved strip to the inner level so user commands survive reinstall.
 
-   Converged on mutex scope (query+install coverage confirmed, only one in-repo path writes `~/.claude/`), call-site swap behavior preservation, and the quit-mode-rejection list (preference-level, kept). Deferred: fragility of the second-connection pattern in `daemon_ipc::install_harness_hooks` (LOW, behavior-correct today) and the structured-sentinel refactor to supersede `"shardctl"` substring detection (follow-up, needs a migration story).
+   Round 1 also converged on mutex scope (query+install coverage confirmed, only one in-repo path writes `~/.claude/`), call-site swap behavior preservation, and the quit-mode-rejection list (preference-level, kept). Round 2 re-reviewed the round-1 fix + broader Phase 5 surface and returned no new findings. Deferred: fragility of the second-connection pattern in `daemon_ipc::install_harness_hooks` (LOW, behavior-correct today) and the structured-sentinel refactor to supersede `"shardctl"` substring detection (follow-up, needs a migration story).
