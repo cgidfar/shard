@@ -43,16 +43,64 @@ pub struct TestHarness {
 /// binaries on the same machine.
 static PIPE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Construction options for [`TestHarness`]. `Default` yields production
+/// git-ops, no hooks-home override, and a synthetic `shardctl.exe` path
+/// for the hooks predicate / installer to render into settings.json.
+pub struct HarnessOptions {
+    pub git_ops: Option<Arc<dyn WorkspaceGitOps>>,
+    pub hooks_home_override: Option<PathBuf>,
+    /// Override for `DaemonState::exe_path`. Defaults to a synthetic
+    /// `shardctl.exe` path rooted in a tempdir so the hooks
+    /// predicate's `"shardctl"` substring check treats installed
+    /// commands as shard-owned. Production uses `std::env::current_exe()`
+    /// (the daemon binary IS shardctl).
+    pub exe_path_override: Option<PathBuf>,
+}
+
+impl Default for HarnessOptions {
+    fn default() -> Self {
+        Self {
+            git_ops: None,
+            hooks_home_override: None,
+            exe_path_override: None,
+        }
+    }
+}
+
 impl TestHarness {
     /// Start a headless daemon in the background with production git-ops.
     pub async fn start() -> Self {
-        Self::start_with_git_ops(default_git_ops()).await
+        Self::start_with(HarnessOptions::default()).await
     }
 
     /// Start a headless daemon with a custom [`WorkspaceGitOps`]. Used by
     /// the partial-failure test to inject a forced `worktree_remove`
     /// failure.
     pub async fn start_with_git_ops(git_ops: Arc<dyn WorkspaceGitOps>) -> Self {
+        Self::start_with(HarnessOptions {
+            git_ops: Some(git_ops),
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// Start a headless daemon with a temp directory redirected as the
+    /// "user home" the `InstallHarnessHooks` handler operates against.
+    /// Phase 5 tests use this so they never touch the developer's real
+    /// `~/.claude/settings.json`.
+    pub async fn start_with_hooks_home(hooks_home: PathBuf) -> Self {
+        Self::start_with(HarnessOptions {
+            hooks_home_override: Some(hooks_home),
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// Full-control constructor — every override surfaces through
+    /// [`HarnessOptions`]. Kept private-ish (callers use the wrappers
+    /// above) so the test surface stays small, but exposed for future
+    /// tests that need to combine overrides.
+    pub async fn start_with(opts: HarnessOptions) -> Self {
         let data_dir = TempDir::new().expect("create tempdir");
         let data_path = data_dir.path().to_path_buf();
 
@@ -63,10 +111,21 @@ impl TestHarness {
         let paths = ShardPaths::from_data_dir(data_path.clone());
         paths.ensure_dirs().expect("ensure_dirs");
 
+        // Default exe_path points inside the tempdir at a synthetic
+        // `shardctl.exe` so the hooks predicate/installer recognize the
+        // rendered command string as shard-owned. Real supervisor spawns
+        // don't use this path in the integration tests (Phase 4+ tests
+        // inject fake supervisors via `test_inject_live_session`).
+        let exe_path_override = opts
+            .exe_path_override
+            .unwrap_or_else(|| data_path.join("shardctl.exe"));
+
         let config = DaemonConfig {
             paths,
             control_pipe_name: control_pipe_name.clone(),
-            git_ops,
+            git_ops: opts.git_ops.unwrap_or_else(default_git_ops),
+            hooks_home_override: opts.hooks_home_override,
+            exe_path_override: Some(exe_path_override),
         };
 
         let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownMode::Running);

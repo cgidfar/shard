@@ -14,7 +14,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 ///
 /// v6 adds `RemoveSession`/`RenameSession`/`DetachSession`/`FindSessionById`
 /// (type bytes 0xA2–0xA9) for Phase 4 of the daemon-broker migration.
-pub const PROTOCOL_VERSION: u16 = 6;
+/// v7 adds `InstallHarnessHooks` (type bytes 0xAA–0xAB) for Phase 5.
+pub const PROTOCOL_VERSION: u16 = 7;
 
 /// Well-known named pipe address for the daemon control channel.
 #[cfg(windows)]
@@ -232,6 +233,22 @@ pub enum ControlFrame {
     /// Daemon → Client: resolved session, tagged with its repo alias.
     FoundSession { repo: String, session: Session },
 
+    // --- Harness Hooks (Phase 5 of daemon-broker migration) ---
+    /// Client → Daemon: install hook integration for `harness` (currently
+    /// `"claude-code"` or `"codex"`). Centralizes today's best-effort
+    /// per-session install so concurrent installs serialize against a
+    /// single global mutex inside the daemon. The `installed` bool in
+    /// the ack is a **postcondition** — `true` means hooks are in place
+    /// after this call, not that bytes were written.
+    InstallHarnessHooks { harness: String },
+
+    /// Daemon → Client: hooks-install outcome. See the ack matrix in
+    /// `docs/daemon-broker-migration.md` Phase 5 section.
+    InstallHarnessHooksAck {
+        installed: bool,
+        skipped_reason: Option<String>,
+    },
+
     // --- Errors ---
     /// Daemon → Client: request failed.
     Error { message: String },
@@ -290,6 +307,8 @@ const TYPE_DETACH_SESSION: u8 = 0xA6;
 const TYPE_DETACH_SESSION_ACK: u8 = 0xA7;
 const TYPE_FIND_SESSION_BY_ID: u8 = 0xA8;
 const TYPE_FOUND_SESSION: u8 = 0xA9;
+const TYPE_INSTALL_HARNESS_HOOKS: u8 = 0xAA;
+const TYPE_INSTALL_HARNESS_HOOKS_ACK: u8 = 0xAB;
 
 // WorkspaceMode wire tag
 const MODE_NEW_BRANCH: u8 = 0;
@@ -514,6 +533,18 @@ pub async fn write_control_frame<W: AsyncWrite + Unpin>(
             write_str(&mut payload, repo);
             write_session(&mut payload, session);
             TYPE_FOUND_SESSION
+        }
+        ControlFrame::InstallHarnessHooks { harness } => {
+            write_str(&mut payload, harness);
+            TYPE_INSTALL_HARNESS_HOOKS
+        }
+        ControlFrame::InstallHarnessHooksAck {
+            installed,
+            skipped_reason,
+        } => {
+            payload.push(if *installed { 1 } else { 0 });
+            write_opt_str(&mut payload, skipped_reason.as_deref());
+            TYPE_INSTALL_HARNESS_HOOKS_ACK
         }
         ControlFrame::Error { message } => {
             write_str(&mut payload, message);
@@ -851,6 +882,19 @@ pub async fn read_control_frame<R: AsyncRead + Unpin>(
             let (repo, n) = read_str(payload)?;
             let (session, _) = read_session(&payload[n..])?;
             ControlFrame::FoundSession { repo, session }
+        }
+        TYPE_INSTALL_HARNESS_HOOKS => {
+            let (harness, _) = read_str(payload)?;
+            ControlFrame::InstallHarnessHooks { harness }
+        }
+        TYPE_INSTALL_HARNESS_HOOKS_ACK => {
+            ensure_len(payload, 1, "InstallHarnessHooksAck installed")?;
+            let installed = payload[0] == 1;
+            let (skipped_reason, _) = read_opt_str(&payload[1..])?;
+            ControlFrame::InstallHarnessHooksAck {
+                installed,
+                skipped_reason,
+            }
         }
         TYPE_ERROR => {
             let (message, _) = read_str(payload)?;
@@ -1851,6 +1895,41 @@ mod tests {
             session.harness.is_none(),
             "unknown harness string should decode as None"
         );
+    }
+
+    #[tokio::test]
+    async fn roundtrip_install_harness_hooks_request() {
+        let frame = ControlFrame::InstallHarnessHooks {
+            harness: "claude-code".to_string(),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_install_harness_hooks_ack_installed_no_reason() {
+        let frame = ControlFrame::InstallHarnessHooksAck {
+            installed: true,
+            skipped_reason: None,
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_install_harness_hooks_ack_already_configured() {
+        let frame = ControlFrame::InstallHarnessHooksAck {
+            installed: true,
+            skipped_reason: Some("already configured".to_string()),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_install_harness_hooks_ack_skipped() {
+        let frame = ControlFrame::InstallHarnessHooksAck {
+            installed: false,
+            skipped_reason: Some("claude code not installed".to_string()),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
     }
 
     #[tokio::test]

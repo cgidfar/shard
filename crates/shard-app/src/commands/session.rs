@@ -162,17 +162,16 @@ pub fn create_session(
 
     let command = command.unwrap_or_else(default_command);
 
-    // Best-effort: install harness hooks
-    let shardctl = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("shardctl.exe")));
-    if let Some(ref exe) = shardctl {
-        if exe.exists() && !shard_core::hooks::claude_code_hooks_installed() {
-            let _ = shard_core::hooks::install_claude_code_hooks(exe);
-        }
-    }
-
-    // Route through daemon
+    // Route through daemon. Harness-hook installation is a separate
+    // RPC so the read-modify-write on `~/.claude/settings.json` is
+    // serialized across CLI and GUI spawns (Phase 5).
+    //
+    // We always request the Claude Code installer regardless of the
+    // session's selected harness — the RPC's `harness` arg is the
+    // install target, not the session's harness. This preserves the
+    // pre-Phase-5 opportunistic-install behavior where Codex sessions
+    // still get Claude hooks bootstrapped. Changing that is a UX
+    // decision, not a plumbing change.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -188,6 +187,21 @@ pub fn create_session(
         conn.handshake()
             .await
             .map_err(|e| format!("daemon handshake failed: {e}"))?;
+
+        // Hooks install round-trip — non-fatal. A hooks failure must
+        // not block session spawn (today's behavior preserved).
+        match crate::daemon_ipc::install_harness_hooks("claude-code").await {
+            Ok((installed, skipped_reason)) => {
+                tracing::info!(
+                    installed,
+                    skipped_reason = skipped_reason.as_deref(),
+                    "hooks install ack",
+                );
+            }
+            Err(e) => {
+                tracing::warn!("hooks install failed: {e}");
+            }
+        }
 
         let response = conn
             .request(&ControlFrame::SpawnSession {

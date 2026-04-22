@@ -41,15 +41,15 @@ fn create(target: String, harness: Option<shard_core::Harness>, command: Vec<Str
         command
     };
 
-    // Best-effort: install harness hooks so agents can report activity state
-    let exe = std::env::current_exe()?;
-    if !shard_core::hooks::claude_code_hooks_installed() {
-        if let Err(e) = shard_core::hooks::install_claude_code_hooks(&exe) {
-            tracing::warn!("failed to install Claude Code hooks: {e}");
-        }
-    }
-
-    // Route through daemon: connect-or-spawn, then send SpawnSession RPC
+    // Route through daemon: connect-or-spawn, install harness hooks
+    // (daemon-centralized per Phase 5), then send SpawnSession RPC.
+    //
+    // Phase 5 note: callers always request the Claude Code installer
+    // regardless of the session's selected harness. The RPC's `harness`
+    // arg is the install *target*, not the session's harness — this
+    // preserves today's opportunistic-install behavior where Codex
+    // sessions still get Claude hooks bootstrapped, so switching
+    // harnesses mid-session doesn't strand the user.
     let rt = tokio::runtime::Runtime::new()?;
     let result = rt.block_on(async {
         use shard_transport::control_protocol::ControlFrame;
@@ -58,6 +58,43 @@ fn create(target: String, harness: Option<shard_core::Harness>, command: Vec<Str
         conn.handshake().await.map_err(|e| {
             shard_core::ShardError::Other(format!("daemon handshake failed: {e}"))
         })?;
+
+        // Hooks install round-trip — non-fatal. A hooks failure must
+        // not block the session from spawning; the daemon centralizes
+        // the serialized read-modify-write, so there's no cleanup to
+        // unwind here. Print a one-line summary mapped from the ack
+        // matrix so the operator can tell whether hooks are in place.
+        match conn
+            .request(&ControlFrame::InstallHarnessHooks {
+                harness: "claude-code".to_string(),
+            })
+            .await
+        {
+            Ok(ControlFrame::InstallHarnessHooksAck {
+                installed,
+                skipped_reason,
+            }) => match (installed, skipped_reason.as_deref()) {
+                (true, None) => println!("Installed Claude Code hooks."),
+                (true, Some(_already_configured)) => {
+                    tracing::debug!("Claude Code hooks already configured");
+                }
+                (false, Some(reason)) => {
+                    eprintln!("Claude Code hooks skipped: {reason}");
+                }
+                (false, None) => {
+                    tracing::debug!("Claude Code hooks skipped with no reason");
+                }
+            },
+            Ok(ControlFrame::Error { message }) => {
+                eprintln!("warning: hooks install failed: {message}");
+            }
+            Ok(other) => {
+                tracing::warn!("hooks install: unexpected response {other:?}");
+            }
+            Err(e) => {
+                tracing::warn!("hooks install: request failed: {e}");
+            }
+        }
 
         let response = conn
             .request(&ControlFrame::SpawnSession {

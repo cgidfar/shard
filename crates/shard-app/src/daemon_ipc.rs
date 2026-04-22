@@ -301,6 +301,40 @@ pub async fn detach_session(id: &str) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
+/// Install (or verify) harness hooks via the daemon. Centralizes today's
+/// best-effort per-session install; the daemon wraps query+install in a
+/// global mutex so concurrent CLI + GUI spawns don't race the
+/// `~/.claude/settings.json` rewrite.
+///
+/// Returns `(installed, skipped_reason)` — `installed` is a postcondition
+/// ("are hooks in place after this call"), not "did this call write
+/// bytes". See the ack matrix in `docs/daemon-broker-migration.md`
+/// Phase 5 section.
+pub async fn install_harness_hooks(
+    harness: &str,
+) -> Result<(bool, Option<String>), String> {
+    let mut conn = daemon_client::connect()
+        .await
+        .map_err(|e| format!("daemon connect failed: {e}"))?;
+    conn.handshake()
+        .await
+        .map_err(|e| format!("daemon handshake failed: {e}"))?;
+    conn.request_typed(
+        &ControlFrame::InstallHarnessHooks {
+            harness: harness.to_string(),
+        },
+        |f| match f {
+            ControlFrame::InstallHarnessHooksAck {
+                installed,
+                skipped_reason,
+            } => Ok((installed, skipped_reason)),
+            other => Err(other),
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// List registered repositories via the daemon so readers agree with the
 /// event stream.
 pub async fn list_repos() -> Result<Vec<Repository>, String> {

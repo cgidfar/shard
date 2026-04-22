@@ -783,6 +783,25 @@ pub struct DaemonConfig {
     /// a stub to force `worktree_remove` failures and exercise the
     /// `broken` state transition in `RemoveWorkspace`.
     pub git_ops: Arc<dyn WorkspaceGitOps>,
+    /// Integration-test override for the user home directory the
+    /// `InstallHarnessHooks` handler queries / writes. `None` in production
+    /// — the handler resolves `directories::UserDirs::new()` at call time.
+    ///
+    /// Explicit-path injection is deliberate: `std::env::set_var` became
+    /// `unsafe` in newer Rust toolchains and `serial_test` isn't in the
+    /// workspace, so the test seam lives in the config struct rather than
+    /// an env var.
+    pub hooks_home_override: Option<PathBuf>,
+    /// Integration-test override for `state.exe_path`. Production leaves
+    /// this `None` and the daemon uses `std::env::current_exe()` (which
+    /// IS the shardctl binary since the daemon is invoked as `shardctl
+    /// daemon start`). Tests set a fake path ending in `shardctl.exe`
+    /// because the hooks predicate identifies shard-owned entries via
+    /// a `"shardctl"` substring match on the rendered command — a test
+    /// binary path (e.g. `hooks_install-<hash>.exe`) would otherwise
+    /// masquerade as a third-party entry the installer / predicate
+    /// refuses to touch.
+    pub exe_path_override: Option<PathBuf>,
 }
 
 impl DaemonConfig {
@@ -793,6 +812,8 @@ impl DaemonConfig {
             paths: ShardPaths::new()?,
             control_pipe_name: CONTROL_PIPE_NAME.to_string(),
             git_ops: default_git_ops(),
+            hooks_home_override: None,
+            exe_path_override: None,
         })
     }
 }
@@ -850,6 +871,20 @@ pub struct DaemonState {
     repo_mutation_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Git operations used by mutation handlers (test seam).
     pub(crate) git_ops: Arc<dyn WorkspaceGitOps>,
+    /// Serializes `InstallHarnessHooks` across the whole query+install
+    /// sequence. User-global scope (not per-repo) because
+    /// `~/.claude/settings.json` is shared by every repo — a concurrent
+    /// install from a CLI `session create` and a GUI `Spawn` would
+    /// otherwise race the read-modify-write. Wrapping query+install
+    /// (not just install) is load-bearing: checking
+    /// `claude_code_hooks_installed` outside the lock and only grabbing
+    /// it for the write still races two installers into duplicate writes.
+    pub(crate) hooks_install_lock: tokio::sync::Mutex<()>,
+    /// Integration-test override for the user home directory the
+    /// `InstallHarnessHooks` handler operates against. `None` in
+    /// production — the handler resolves the real user dir via
+    /// `directories::UserDirs::new()`. See `DaemonConfig::hooks_home_override`.
+    pub(crate) hooks_home_override: Option<PathBuf>,
 }
 
 impl DaemonState {
@@ -892,7 +927,11 @@ pub fn build_headless_state(
         shard_core::ShardError::Other(format!("Job Object creation failed: {e}"))
     })?;
 
-    let exe_path = std::env::current_exe()?;
+    let hooks_home_override = config.hooks_home_override.clone();
+    let exe_path = match config.exe_path_override.clone() {
+        Some(p) => p,
+        None => std::env::current_exe()?,
+    };
 
     Ok(Arc::new(DaemonState {
         sessions: Mutex::new(HashMap::new()),
@@ -907,6 +946,8 @@ pub fn build_headless_state(
         lifecycle: Arc::new(crate::cmd::lifecycle::LifecycleRegistry::new()),
         repo_mutation_locks: tokio::sync::Mutex::new(HashMap::new()),
         git_ops: config.git_ops,
+        hooks_install_lock: tokio::sync::Mutex::new(()),
+        hooks_home_override,
     }))
 }
 
@@ -1059,6 +1100,8 @@ fn run_daemon() -> shard_core::Result<()> {
         lifecycle: Arc::new(crate::cmd::lifecycle::LifecycleRegistry::new()),
         repo_mutation_locks: tokio::sync::Mutex::new(HashMap::new()),
         git_ops: default_git_ops(),
+        hooks_install_lock: tokio::sync::Mutex::new(()),
+        hooks_home_override: None,
     });
 
     // Build the tokio runtime on the main thread and share it via Arc. The
@@ -1574,6 +1617,7 @@ async fn dispatch_request(state: &Arc<DaemonState>, frame: ControlFrame) -> Cont
                 | ControlFrame::RemoveSession { .. }
                 | ControlFrame::RenameSession { .. }
                 | ControlFrame::DetachSession { .. }
+                | ControlFrame::InstallHarnessHooks { .. }
         )
     {
         return ControlFrame::Error {
@@ -1627,6 +1671,10 @@ async fn dispatch_request(state: &Arc<DaemonState>, frame: ControlFrame) -> Cont
         ControlFrame::DetachSession { id } => handle_detach_session(state, id).await,
 
         ControlFrame::FindSessionById { prefix } => handle_find_session_by_id(state, prefix).await,
+
+        ControlFrame::InstallHarnessHooks { harness } => {
+            handle_install_harness_hooks(state, harness).await
+        }
 
         ControlFrame::ListSessions => {
             let sessions = state.sessions.lock().await;
@@ -2750,6 +2798,113 @@ async fn handle_find_session_by_id(
         Ok((repo, session)) => ControlFrame::FoundSession { repo, session },
         Err(e) => ControlFrame::Error {
             message: format!("find session: {e}"),
+        },
+    }
+}
+
+// ── Phase 5: harness-hook installation ──────────────────────────────────────
+//
+// Centralizes the best-effort per-session `install_claude_code_hooks` that
+// used to run independently in the CLI and Tauri spawn paths. Routing
+// through one RPC + one global mutex gives us:
+//   - a single source of truth for the "did it install / why was it skipped"
+//     ack, which today's call sites discard with `let _ = ...`.
+//   - serialized read-modify-write on `~/.claude/settings.json`, which is
+//     user-global (not per-repo).
+//   - a forward-compat seam for future harnesses (currently only Claude
+//     Code has an installer; Codex returns a skipped ack).
+
+/// Handle `InstallHarnessHooks` — install or verify hook integration for
+/// the given harness.
+///
+/// The `installed` bool in the returned ack is a **postcondition** — `true`
+/// means hooks are in place after this call, not that bytes were written.
+/// See the ack matrix in `docs/daemon-broker-migration.md` Phase 5 section.
+///
+/// Held under `hooks_install_lock` for the full query+install sequence so
+/// two concurrent calls can't both see "not installed" and both perform a
+/// write (Codex review round 1 medium). Wrapping only the write would still
+/// race duplicate entries into settings.json.
+async fn handle_install_harness_hooks(
+    state: &Arc<DaemonState>,
+    harness: String,
+) -> ControlFrame {
+    // Parse outside the lock — pure string work, and an unknown harness
+    // doesn't need to serialize against anything.
+    let parsed: Option<shard_core::harness::Harness> = harness.parse().ok();
+
+    let Some(parsed) = parsed else {
+        // Unknown harness: soft-skip, matching `handle_spawn`'s
+        // degrade-to-None policy so an older daemon stays quiet when a
+        // future client adds a new harness variant.
+        return ControlFrame::InstallHarnessHooksAck {
+            installed: false,
+            skipped_reason: Some(format!("unknown harness '{harness}'")),
+        };
+    };
+
+    match parsed {
+        shard_core::harness::Harness::ClaudeCode => {
+            install_claude_code_under_lock(state).await
+        }
+        shard_core::harness::Harness::Codex => ControlFrame::InstallHarnessHooksAck {
+            installed: false,
+            skipped_reason: Some("codex hooks not yet implemented".to_string()),
+        },
+    }
+}
+
+async fn install_claude_code_under_lock(state: &Arc<DaemonState>) -> ControlFrame {
+    let _guard = state.hooks_install_lock.lock().await;
+
+    let home: PathBuf = match &state.hooks_home_override {
+        Some(home) => home.clone(),
+        None => match shard_core::hooks::default_hooks_home() {
+            Some(home) => home,
+            None => {
+                return ControlFrame::Error {
+                    message: "cannot determine home directory".to_string(),
+                };
+            }
+        },
+    };
+
+    let claude_dir = home.join(".claude");
+    if !claude_dir.exists() {
+        // Postcondition is "hooks not present" — report false + reason.
+        // Matches today's `install_claude_code_hooks` Ok-but-no-op
+        // behavior without ever claiming installed=true.
+        tracing::info!(
+            "InstallHarnessHooks: {} missing; skipping Claude Code install",
+            claude_dir.display()
+        );
+        return ControlFrame::InstallHarnessHooksAck {
+            installed: false,
+            skipped_reason: Some("claude code not installed".to_string()),
+        };
+    }
+
+    // Predicate takes shardctl_path so it compares against what the
+    // install would actually write (see Codex round 2 finding + hooks
+    // module docs). Stale/partial state falls into the install branch
+    // which converges to the correct 4-event shape.
+    if shard_core::hooks::claude_code_hooks_installed_in_home(&home, &state.exe_path) {
+        return ControlFrame::InstallHarnessHooksAck {
+            installed: true,
+            skipped_reason: Some("already configured".to_string()),
+        };
+    }
+
+    match shard_core::hooks::install_claude_code_hooks_in_home(&home, &state.exe_path) {
+        Ok(()) => {
+            tracing::info!("InstallHarnessHooks: Claude Code hooks written");
+            ControlFrame::InstallHarnessHooksAck {
+                installed: true,
+                skipped_reason: None,
+            }
+        }
+        Err(e) => ControlFrame::Error {
+            message: format!("install claude code hooks: {e}"),
         },
     }
 }
