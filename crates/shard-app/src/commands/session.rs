@@ -286,18 +286,20 @@ pub async fn stop_session(
     force: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    // Resolve the session through the daemon so CLI and GUI agree on
-    // the global session index (Phase 4, D4). The subsequent status
-    // update stays direct — it's a local bookkeeping write that the
-    // supervisor's own exit tick will also perform.
-    let (repo, session) = daemon_ipc::find_session_by_id(&id).await?;
-    let session_store = SessionStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
+    // Route through the daemon's `StopSession` RPC so the daemon can drain
+    // the supervisor, clear its live-registry entry, and write the DB
+    // status in one workflow. The previous direct-pipe path hit SHA-43
+    // (supervisor silently discards stop frames sent as the first frame)
+    // and left the daemon's in-memory registry populated, which then
+    // caused `RemoveSession` to reject with "still live — stop it first".
+    let (_repo, session) = daemon_ipc::find_session_by_id(&id).await?;
 
     if session.status != "running" && session.status != "starting" {
         return Ok(());
     }
 
-    // Abort any existing monitor/attach task FIRST to avoid DB update races
+    // Abort any existing monitor/attach task before sending the stop so
+    // the daemon's drain doesn't race the Tauri reader on the same pipe.
     {
         let mut conns = state.connections.lock().await;
         if let Some(conn) = conns.remove(&id) {
@@ -305,46 +307,7 @@ pub async fn stop_session(
         }
     }
 
-    let frame = if force {
-        Frame::StopForce
-    } else {
-        Frame::StopGraceful
-    };
-
-    let transport_addr = session.transport_addr.clone();
-
-    let rpc_ok = match NamedPipeTransport::connect(&transport_addr).await {
-        Ok(mut client) => {
-            let _ = protocol::write_frame(&mut client, &frame).await;
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                loop {
-                    match protocol::read_frame(&mut client).await {
-                        // Only break on lifecycle Status (codes 0-2), not activity frames
-                        Ok(Some(Frame::Status { code })) if code <= 2 => return,
-                        Ok(None) => return,
-                        _ => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
-                    }
-                }
-            })
-            .await;
-            true
-        }
-        Err(_) => false,
-    };
-
-    if !rpc_ok {
-        use shard_supervisor::process::{PlatformProcessControl, ProcessControl};
-        if let Some(pid) = session.child_pid {
-            let _ = PlatformProcessControl::terminate(pid);
-        }
-        if let Some(pid) = session.supervisor_pid {
-            let _ = PlatformProcessControl::terminate(pid);
-        }
-    }
-
-    session_store
-        .update_status(&repo, &id, "stopped", None)
-        .map_err(|e| e.to_string())?;
+    daemon_ipc::stop_session(&id, force).await?;
     let _ = app.emit("sidebar-changed", ());
     Ok(())
 }

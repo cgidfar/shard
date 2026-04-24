@@ -1962,25 +1962,54 @@ async fn handle_spawn(
     }
 }
 
-/// Handle StopSession: connect to the session pipe and send stop frame.
+/// Handle StopSession: stop the supervisor, wait for exit, and clean up
+/// daemon-owned state.
+///
+/// The pre-migration shape wrote a raw `StopGraceful` as the first frame
+/// on the session pipe and returned `StopAck` on the write. Two problems
+/// surfaced in use: (1) SHA-43 — the supervisor's accept handler only
+/// dispatches stop frames via the post-first-frame recv loop, so the
+/// opening frame was silently discarded; clients thought the session was
+/// stopped but the supervisor kept running. (2) The daemon's in-memory
+/// live registry never dropped the entry, which then caused `RemoveSession`
+/// to reject with "still live — stop it first" on the retry.
+///
+/// The fixed shape delegates to `stop_session_and_wait`, which sends the
+/// required `Resume` preamble, drains until a lifecycle `Status` frame or
+/// pipe EOF, and force-kills on timeout. On success we drop the live
+/// registry entry, write `"stopped"` to the DB as a backstop (the
+/// supervisor's own final-status write races client-side refreshes, and
+/// GUI clients that abort their monitor before calling stop never see the
+/// Status frame), and broadcast `SessionsChanged` so subscribers
+/// invalidate cached lists.
 async fn handle_stop(state: &Arc<DaemonState>, session_id: String, force: bool) -> ControlFrame {
-    let transport_addr = {
+    let (full_id, repo, transport_addr, pid, creation_time) = {
         let sessions = state.sessions.lock().await;
-        match sessions.get(&session_id) {
-            Some(s) => s.transport_addr.clone(),
+        let entry = match sessions.get(&session_id) {
+            Some(s) => Some((
+                s.session_id.clone(),
+                s.repo.clone(),
+                s.transport_addr.clone(),
+                s.supervisor_pid,
+                s.creation_time,
+            )),
             None => {
-                // Try prefix match
                 let matches: Vec<_> = sessions
                     .values()
                     .filter(|s| s.session_id.starts_with(&session_id))
+                    .map(|s| {
+                        (
+                            s.session_id.clone(),
+                            s.repo.clone(),
+                            s.transport_addr.clone(),
+                            s.supervisor_pid,
+                            s.creation_time,
+                        )
+                    })
                     .collect();
                 match matches.len() {
-                    0 => {
-                        return ControlFrame::Error {
-                            message: format!("session '{session_id}' not found in live registry"),
-                        }
-                    }
-                    1 => matches[0].transport_addr.clone(),
+                    0 => None,
+                    1 => Some(matches.into_iter().next().unwrap()),
                     n => {
                         return ControlFrame::Error {
                             message: format!(
@@ -1990,28 +2019,57 @@ async fn handle_stop(state: &Arc<DaemonState>, session_id: String, force: bool) 
                     }
                 }
             }
+        };
+        match entry {
+            Some(e) => e,
+            None => {
+                return ControlFrame::Error {
+                    message: format!("session '{session_id}' not found in live registry"),
+                }
+            }
         }
     };
 
-    // Connect to the session's transport pipe and send stop
-    match shard_transport::PlatformTransport::connect(&transport_addr).await {
-        Ok(mut client) => {
-            use shard_transport::protocol::{write_frame, Frame};
-            let frame = if force {
-                Frame::StopForce
-            } else {
-                Frame::StopGraceful
-            };
-            if let Err(e) = write_frame(&mut client, &frame).await {
-                return ControlFrame::Error {
-                    message: format!("failed to send stop frame: {e}"),
-                };
+    let stop_result: shard_core::Result<()> = if force {
+        // Explicit force: skip the graceful window and terminate directly.
+        // `force_kill_pid_checked` refuses on a PID-recycle mismatch.
+        shard_supervisor::process_windows::force_kill_pid_checked(pid, creation_time).map_err(
+            |e| shard_core::ShardError::Other(format!("force-kill pid {pid} failed: {e}")),
+        )
+    } else {
+        stop_session_and_wait(&transport_addr, pid, creation_time, Duration::from_secs(5))
+            .await
+            .map(|_| ())
+    };
+
+    match stop_result {
+        Ok(()) => {
+            {
+                let mut sessions = state.sessions.lock().await;
+                sessions.remove(&full_id);
             }
-            info!("Sent stop to session {}", &session_id[..8.min(session_id.len())]);
+            let store = SessionStore::new(state.paths.clone());
+            if let Err(e) = store.update_status(&repo, &full_id, "stopped", None) {
+                warn!(
+                    "StopSession: DB status update failed for {} ({e}); proceeding",
+                    &full_id[..8.min(full_id.len())]
+                );
+            }
+            if let Some(monitor) = state.monitor.get() {
+                monitor.broadcast(crate::cmd::workspace_monitor::ChangeKind::Sessions(
+                    repo.clone(),
+                ));
+            }
+            info!(
+                "StopSession: {} [{}] stopped{}",
+                &full_id[..8.min(full_id.len())],
+                repo,
+                if force { " (forced)" } else { "" }
+            );
             ControlFrame::StopAck
         }
         Err(e) => ControlFrame::Error {
-            message: format!("failed to connect to session pipe: {e}"),
+            message: format!("failed to stop session: {e}"),
         },
     }
 }

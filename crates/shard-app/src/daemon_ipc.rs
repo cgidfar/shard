@@ -277,6 +277,33 @@ pub async fn rename_session(
     .map_err(|e| e.to_string())
 }
 
+/// Ask the daemon to stop a running session. See
+/// `crates/shard-cli/src/cmd/daemon.rs::handle_stop` for the drain +
+/// registry-cleanup + DB-backstop workflow. Callers still emit
+/// `sidebar-changed` themselves after the Ack; the daemon broadcasts
+/// `SessionsChanged` over the subscribe channel for any long-lived
+/// subscribers.
+pub async fn stop_session(id: &str, force: bool) -> Result<(), String> {
+    let mut conn = daemon_client::connect()
+        .await
+        .map_err(|e| format!("daemon connect failed: {e}"))?;
+    conn.handshake()
+        .await
+        .map_err(|e| format!("daemon handshake failed: {e}"))?;
+    conn.request_typed(
+        &ControlFrame::StopSession {
+            session_id: id.to_string(),
+            force,
+        },
+        |f| match f {
+            ControlFrame::StopAck => Ok(()),
+            other => Err(other),
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// Probe that a session still exists, routed through the daemon for a
 /// consistent attach/detach signal across CLI and GUI. The actual
 /// connection teardown stays in the Tauri backend (terminal I/O is
