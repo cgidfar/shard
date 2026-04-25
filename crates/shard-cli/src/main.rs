@@ -1,9 +1,6 @@
-pub mod attach;
-mod cmd;
-mod opts;
-
 use clap::Parser;
-use opts::{Cli, Commands};
+use shard_cli::cmd;
+use shard_cli::opts::{Cli, Commands};
 
 fn main() {
     // Note: the `serve` and `daemon start` subcommands set up their own logging.

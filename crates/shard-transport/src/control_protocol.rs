@@ -3,11 +3,19 @@
 //! Uses the same wire format as the session protocol: `[u32 len][u8 type][payload]`.
 //! Type bytes are in the `0x80+` range to avoid collision with session frame types.
 
+use shard_core::harness::Harness;
+use shard_core::repos::Repository;
+use shard_core::sessions::Session;
 use shard_core::state::{RepoState, WorkspaceHealth, WorkspaceStatus};
+use shard_core::workspaces::{BranchInfo, Workspace, WorkspaceMode, WorkspaceWithStatus};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current control protocol version. Bumped on breaking wire changes.
-pub const PROTOCOL_VERSION: u16 = 3;
+///
+/// v6 adds `RemoveSession`/`RenameSession`/`DetachSession`/`FindSessionById`
+/// (type bytes 0xA2–0xA9) for Phase 4 of the daemon-broker migration.
+/// v7 adds `InstallHarnessHooks` (type bytes 0xAA–0xAB) for Phase 5.
+pub const PROTOCOL_VERSION: u16 = 7;
 
 /// Well-known named pipe address for the daemon control channel.
 #[cfg(windows)]
@@ -98,6 +106,149 @@ pub enum ControlFrame {
     /// the daemon does not reply.
     TopologyChanged { repo_alias: Option<String> },
 
+    // --- Workspace Lifecycle (Phase 1 of daemon-broker migration) ---
+    /// Client → Daemon: atomically remove a workspace. The daemon stops
+    /// any bound sessions (graceful → force), drops watchers, runs
+    /// `git worktree remove`, deletes the DB row, and broadcasts
+    /// `WorkspaceRemoved`. Replaces the old split path (Tauri backend +
+    /// CLI calling `WorkspaceStore::remove` directly then firing a
+    /// topology poke) which caused SHA-55.
+    RemoveWorkspace { repo: String, name: String },
+
+    /// Daemon → Client: remove succeeded.
+    RemoveWorkspaceAck,
+
+    /// Daemon → Subscribers: a workspace has been removed. Emitted once
+    /// per successful `RemoveWorkspace`, after all side effects have
+    /// landed. Subscribers should drop any cached state for this
+    /// `(repo, name)` and refresh their sidebar / tree.
+    WorkspaceRemoved { repo: String, name: String },
+
+    // --- Workspace Create + Reads (Phase 2 of daemon-broker migration) ---
+    /// Client → Daemon: create a new workspace under `repo`. Always
+    /// `is_base=false`; base workspaces are only created during
+    /// `AddRepo`. On success the daemon registers the workspace in the
+    /// lifecycle map (Active) and fires a topology poke so subscribers
+    /// see the new row in the next StateSnapshot.
+    CreateWorkspace {
+        repo: String,
+        name: Option<String>,
+        mode: WorkspaceMode,
+        branch: Option<String>,
+    },
+
+    /// Daemon → Client: create succeeded; returns the persisted row.
+    CreateWorkspaceAck { workspace: Workspace },
+
+    /// Client → Daemon: list workspaces for `repo` enriched with the
+    /// monitor's live `WorkspaceStatus` snapshot. Routed through the
+    /// daemon so readers and the event stream see a consistent view.
+    ListWorkspaces { repo: String },
+
+    /// Daemon → Client: enriched workspace list for a repo.
+    WorkspaceList { items: Vec<WorkspaceWithStatus> },
+
+    /// Client → Daemon: list branch-occupancy info for `repo`. Git-backed;
+    /// routed through the daemon because the monitor already walks the
+    /// worktree list on its tick and we want readers to agree with the
+    /// monitor's view.
+    ListBranchInfo { repo: String },
+
+    /// Daemon → Client: branches + occupancy.
+    BranchInfoList { branches: Vec<BranchInfo> },
+
+    // --- Repo Lifecycle (Phase 3 of daemon-broker migration) ---
+    /// Client → Daemon: register a new repository by URL or local path.
+    /// Remote URLs are bare-cloned into the data dir; local paths are
+    /// referenced in place. Auto-creates a base workspace for the
+    /// detected default branch.
+    AddRepo {
+        url: String,
+        alias: Option<String>,
+    },
+
+    /// Daemon → Client: add succeeded; returns the persisted row.
+    AddRepoAck { repo: Repository },
+
+    /// Client → Daemon: tear down a repository. Stops every live
+    /// session bound to it, drops the monitor's watcher, removes
+    /// worktrees + `.shard/` for local repos (the original checkout is
+    /// preserved), or the entire repo directory for remote repos, then
+    /// deletes the DB row.
+    RemoveRepo { alias: String },
+
+    /// Daemon → Client: remove succeeded.
+    RemoveRepoAck,
+
+    /// Client → Daemon: `git fetch --all --prune` against the repo's
+    /// source (bare clone or local checkout). No DB mutation.
+    SyncRepo { alias: String },
+
+    /// Daemon → Client: sync completed.
+    SyncRepoAck,
+
+    /// Client → Daemon: list registered repositories.
+    ListRepos,
+
+    /// Daemon → Client: the full repo list, ordered by alias.
+    RepoList { repos: Vec<Repository> },
+
+    // --- Session Lifecycle Tail (Phase 4 of daemon-broker migration) ---
+    /// Client → Daemon: remove a terminal-status session from the DB and
+    /// clean up its session directory. Guards inside the daemon reject
+    /// `running` / `starting` sessions with a typed error — the caller is
+    /// expected to `StopSession` first.
+    RemoveSession { repo: String, id: String },
+
+    /// Daemon → Client: remove succeeded.
+    RemoveSessionAck,
+
+    /// Client → Daemon: set or clear a session's label. Pure DB update;
+    /// no watcher / supervisor coordination.
+    RenameSession {
+        repo: String,
+        id: String,
+        label: Option<String>,
+    },
+
+    /// Daemon → Client: rename succeeded.
+    RenameSessionAck,
+
+    /// Client → Daemon: validate a session id. The daemon's handler is
+    /// effectively a "does this session still exist" probe — the actual
+    /// attach/detach connection management stays in the Tauri backend
+    /// (per migration non-goals: terminal I/O stays direct). Provides a
+    /// symmetric RPC surface so CLI and GUI detach flows run the same
+    /// daemon round-trip for telemetry and future multi-window work.
+    DetachSession { id: String },
+
+    /// Daemon → Client: detach acknowledged.
+    DetachSessionAck,
+
+    /// Client → Daemon: resolve a full-or-prefix session id against the
+    /// daemon's global session index. Walks every repo DB and returns
+    /// the unique match, or an `Error` frame on zero / ambiguous matches.
+    FindSessionById { prefix: String },
+
+    /// Daemon → Client: resolved session, tagged with its repo alias.
+    FoundSession { repo: String, session: Session },
+
+    // --- Harness Hooks (Phase 5 of daemon-broker migration) ---
+    /// Client → Daemon: install hook integration for `harness` (currently
+    /// `"claude-code"` or `"codex"`). Centralizes today's best-effort
+    /// per-session install so concurrent installs serialize against a
+    /// single global mutex inside the daemon. The `installed` bool in
+    /// the ack is a **postcondition** — `true` means hooks are in place
+    /// after this call, not that bytes were written.
+    InstallHarnessHooks { harness: String },
+
+    /// Daemon → Client: hooks-install outcome. See the ack matrix in
+    /// `docs/daemon-broker-migration.md` Phase 5 section.
+    InstallHarnessHooksAck {
+        installed: bool,
+        skipped_reason: Option<String>,
+    },
+
     // --- Errors ---
     /// Daemon → Client: request failed.
     Error { message: String },
@@ -131,6 +282,37 @@ const TYPE_STATE_SNAPSHOT: u8 = 0x8D;
 const TYPE_TOPOLOGY_CHANGED: u8 = 0x8E;
 const TYPE_ERROR: u8 = 0x8F;
 const TYPE_SESSIONS_CHANGED: u8 = 0x90;
+const TYPE_REMOVE_WORKSPACE: u8 = 0x91;
+const TYPE_REMOVE_WORKSPACE_ACK: u8 = 0x92;
+const TYPE_WORKSPACE_REMOVED: u8 = 0x93;
+const TYPE_CREATE_WORKSPACE: u8 = 0x94;
+const TYPE_CREATE_WORKSPACE_ACK: u8 = 0x95;
+const TYPE_LIST_WORKSPACES: u8 = 0x96;
+const TYPE_WORKSPACE_LIST: u8 = 0x97;
+const TYPE_LIST_BRANCH_INFO: u8 = 0x98;
+const TYPE_BRANCH_INFO_LIST: u8 = 0x99;
+const TYPE_ADD_REPO: u8 = 0x9A;
+const TYPE_ADD_REPO_ACK: u8 = 0x9B;
+const TYPE_REMOVE_REPO: u8 = 0x9C;
+const TYPE_REMOVE_REPO_ACK: u8 = 0x9D;
+const TYPE_SYNC_REPO: u8 = 0x9E;
+const TYPE_SYNC_REPO_ACK: u8 = 0x9F;
+const TYPE_LIST_REPOS: u8 = 0xA0;
+const TYPE_REPO_LIST: u8 = 0xA1;
+const TYPE_REMOVE_SESSION: u8 = 0xA2;
+const TYPE_REMOVE_SESSION_ACK: u8 = 0xA3;
+const TYPE_RENAME_SESSION: u8 = 0xA4;
+const TYPE_RENAME_SESSION_ACK: u8 = 0xA5;
+const TYPE_DETACH_SESSION: u8 = 0xA6;
+const TYPE_DETACH_SESSION_ACK: u8 = 0xA7;
+const TYPE_FIND_SESSION_BY_ID: u8 = 0xA8;
+const TYPE_FOUND_SESSION: u8 = 0xA9;
+const TYPE_INSTALL_HARNESS_HOOKS: u8 = 0xAA;
+const TYPE_INSTALL_HARNESS_HOOKS_ACK: u8 = 0xAB;
+
+// WorkspaceMode wire tag
+const MODE_NEW_BRANCH: u8 = 0;
+const MODE_EXISTING_BRANCH: u8 = 1;
 
 /// Write a control frame to an async writer.
 pub async fn write_control_frame<W: AsyncWrite + Unpin>(
@@ -239,6 +421,130 @@ pub async fn write_control_frame<W: AsyncWrite + Unpin>(
         ControlFrame::SessionsChanged { repo } => {
             write_str(&mut payload, repo);
             TYPE_SESSIONS_CHANGED
+        }
+        ControlFrame::RemoveWorkspace { repo, name } => {
+            write_str(&mut payload, repo);
+            write_str(&mut payload, name);
+            TYPE_REMOVE_WORKSPACE
+        }
+        ControlFrame::RemoveWorkspaceAck => TYPE_REMOVE_WORKSPACE_ACK,
+        ControlFrame::WorkspaceRemoved { repo, name } => {
+            write_str(&mut payload, repo);
+            write_str(&mut payload, name);
+            TYPE_WORKSPACE_REMOVED
+        }
+        ControlFrame::CreateWorkspace {
+            repo,
+            name,
+            mode,
+            branch,
+        } => {
+            write_str(&mut payload, repo);
+            write_opt_str(&mut payload, name.as_deref());
+            payload.push(mode_to_byte(*mode));
+            write_opt_str(&mut payload, branch.as_deref());
+            TYPE_CREATE_WORKSPACE
+        }
+        ControlFrame::CreateWorkspaceAck { workspace } => {
+            write_workspace(&mut payload, workspace);
+            TYPE_CREATE_WORKSPACE_ACK
+        }
+        ControlFrame::ListWorkspaces { repo } => {
+            write_str(&mut payload, repo);
+            TYPE_LIST_WORKSPACES
+        }
+        ControlFrame::WorkspaceList { items } => {
+            payload.extend_from_slice(&(items.len() as u32).to_be_bytes());
+            for item in items {
+                write_workspace(&mut payload, &item.workspace);
+                match &item.status {
+                    Some(status) => {
+                        payload.push(1);
+                        write_workspace_status(&mut payload, status);
+                    }
+                    None => payload.push(0),
+                }
+            }
+            TYPE_WORKSPACE_LIST
+        }
+        ControlFrame::ListBranchInfo { repo } => {
+            write_str(&mut payload, repo);
+            TYPE_LIST_BRANCH_INFO
+        }
+        ControlFrame::BranchInfoList { branches } => {
+            payload.extend_from_slice(&(branches.len() as u32).to_be_bytes());
+            for b in branches {
+                write_str(&mut payload, &b.name);
+                payload.push(if b.is_head { 1 } else { 0 });
+                write_opt_str(&mut payload, b.checked_out_by.as_deref());
+            }
+            TYPE_BRANCH_INFO_LIST
+        }
+        ControlFrame::AddRepo { url, alias } => {
+            write_str(&mut payload, url);
+            write_opt_str(&mut payload, alias.as_deref());
+            TYPE_ADD_REPO
+        }
+        ControlFrame::AddRepoAck { repo } => {
+            write_repository(&mut payload, repo);
+            TYPE_ADD_REPO_ACK
+        }
+        ControlFrame::RemoveRepo { alias } => {
+            write_str(&mut payload, alias);
+            TYPE_REMOVE_REPO
+        }
+        ControlFrame::RemoveRepoAck => TYPE_REMOVE_REPO_ACK,
+        ControlFrame::SyncRepo { alias } => {
+            write_str(&mut payload, alias);
+            TYPE_SYNC_REPO
+        }
+        ControlFrame::SyncRepoAck => TYPE_SYNC_REPO_ACK,
+        ControlFrame::ListRepos => TYPE_LIST_REPOS,
+        ControlFrame::RepoList { repos } => {
+            payload.extend_from_slice(&(repos.len() as u32).to_be_bytes());
+            for r in repos {
+                write_repository(&mut payload, r);
+            }
+            TYPE_REPO_LIST
+        }
+        ControlFrame::RemoveSession { repo, id } => {
+            write_str(&mut payload, repo);
+            write_str(&mut payload, id);
+            TYPE_REMOVE_SESSION
+        }
+        ControlFrame::RemoveSessionAck => TYPE_REMOVE_SESSION_ACK,
+        ControlFrame::RenameSession { repo, id, label } => {
+            write_str(&mut payload, repo);
+            write_str(&mut payload, id);
+            write_opt_str(&mut payload, label.as_deref());
+            TYPE_RENAME_SESSION
+        }
+        ControlFrame::RenameSessionAck => TYPE_RENAME_SESSION_ACK,
+        ControlFrame::DetachSession { id } => {
+            write_str(&mut payload, id);
+            TYPE_DETACH_SESSION
+        }
+        ControlFrame::DetachSessionAck => TYPE_DETACH_SESSION_ACK,
+        ControlFrame::FindSessionById { prefix } => {
+            write_str(&mut payload, prefix);
+            TYPE_FIND_SESSION_BY_ID
+        }
+        ControlFrame::FoundSession { repo, session } => {
+            write_str(&mut payload, repo);
+            write_session(&mut payload, session);
+            TYPE_FOUND_SESSION
+        }
+        ControlFrame::InstallHarnessHooks { harness } => {
+            write_str(&mut payload, harness);
+            TYPE_INSTALL_HARNESS_HOOKS
+        }
+        ControlFrame::InstallHarnessHooksAck {
+            installed,
+            skipped_reason,
+        } => {
+            payload.push(if *installed { 1 } else { 0 });
+            write_opt_str(&mut payload, skipped_reason.as_deref());
+            TYPE_INSTALL_HARNESS_HOOKS_ACK
         }
         ControlFrame::Error { message } => {
             write_str(&mut payload, message);
@@ -432,6 +738,164 @@ pub async fn read_control_frame<R: AsyncRead + Unpin>(
             let (repo, _) = read_str(payload)?;
             ControlFrame::SessionsChanged { repo }
         }
+        TYPE_REMOVE_WORKSPACE => {
+            let (repo, n) = read_str(payload)?;
+            let (name, _) = read_str(&payload[n..])?;
+            ControlFrame::RemoveWorkspace { repo, name }
+        }
+        TYPE_REMOVE_WORKSPACE_ACK => ControlFrame::RemoveWorkspaceAck,
+        TYPE_WORKSPACE_REMOVED => {
+            let (repo, n) = read_str(payload)?;
+            let (name, _) = read_str(&payload[n..])?;
+            ControlFrame::WorkspaceRemoved { repo, name }
+        }
+        TYPE_CREATE_WORKSPACE => {
+            let mut offset = 0;
+            let (repo, n) = read_str(&payload[offset..])?;
+            offset += n;
+            let (name, n) = read_opt_str(&payload[offset..])?;
+            offset += n;
+            ensure_len(&payload[offset..], 1, "CreateWorkspace mode")?;
+            let mode = mode_from_byte(payload[offset])?;
+            offset += 1;
+            let (branch, _) = read_opt_str(&payload[offset..])?;
+            ControlFrame::CreateWorkspace {
+                repo,
+                name,
+                mode,
+                branch,
+            }
+        }
+        TYPE_CREATE_WORKSPACE_ACK => {
+            let (workspace, _) = read_workspace(payload)?;
+            ControlFrame::CreateWorkspaceAck { workspace }
+        }
+        TYPE_LIST_WORKSPACES => {
+            let (repo, _) = read_str(payload)?;
+            ControlFrame::ListWorkspaces { repo }
+        }
+        TYPE_WORKSPACE_LIST => {
+            ensure_len(payload, 4, "WorkspaceList count")?;
+            let count = u32::from_be_bytes(payload[..4].try_into().unwrap()) as usize;
+            let mut offset = 4;
+            let mut items = Vec::with_capacity(count);
+            for _ in 0..count {
+                let (workspace, n) = read_workspace(&payload[offset..])?;
+                offset += n;
+                ensure_len(&payload[offset..], 1, "WorkspaceList status tag")?;
+                let status = if payload[offset] == 1 {
+                    offset += 1;
+                    let (s, n) = read_workspace_status(&payload[offset..])?;
+                    offset += n;
+                    Some(s)
+                } else {
+                    offset += 1;
+                    None
+                };
+                items.push(WorkspaceWithStatus { workspace, status });
+            }
+            ControlFrame::WorkspaceList { items }
+        }
+        TYPE_LIST_BRANCH_INFO => {
+            let (repo, _) = read_str(payload)?;
+            ControlFrame::ListBranchInfo { repo }
+        }
+        TYPE_BRANCH_INFO_LIST => {
+            ensure_len(payload, 4, "BranchInfoList count")?;
+            let count = u32::from_be_bytes(payload[..4].try_into().unwrap()) as usize;
+            let mut offset = 4;
+            let mut branches = Vec::with_capacity(count);
+            for _ in 0..count {
+                let (name, n) = read_str(&payload[offset..])?;
+                offset += n;
+                ensure_len(&payload[offset..], 1, "BranchInfo is_head")?;
+                let is_head = payload[offset] == 1;
+                offset += 1;
+                let (checked_out_by, n) = read_opt_str(&payload[offset..])?;
+                offset += n;
+                branches.push(BranchInfo {
+                    name,
+                    is_head,
+                    checked_out_by,
+                });
+            }
+            ControlFrame::BranchInfoList { branches }
+        }
+        TYPE_ADD_REPO => {
+            let (url, n) = read_str(payload)?;
+            let (alias, _) = read_opt_str(&payload[n..])?;
+            ControlFrame::AddRepo { url, alias }
+        }
+        TYPE_ADD_REPO_ACK => {
+            let (repo, _) = read_repository(payload)?;
+            ControlFrame::AddRepoAck { repo }
+        }
+        TYPE_REMOVE_REPO => {
+            let (alias, _) = read_str(payload)?;
+            ControlFrame::RemoveRepo { alias }
+        }
+        TYPE_REMOVE_REPO_ACK => ControlFrame::RemoveRepoAck,
+        TYPE_SYNC_REPO => {
+            let (alias, _) = read_str(payload)?;
+            ControlFrame::SyncRepo { alias }
+        }
+        TYPE_SYNC_REPO_ACK => ControlFrame::SyncRepoAck,
+        TYPE_LIST_REPOS => ControlFrame::ListRepos,
+        TYPE_REPO_LIST => {
+            ensure_len(payload, 4, "RepoList count")?;
+            let count = u32::from_be_bytes(payload[..4].try_into().unwrap()) as usize;
+            let mut offset = 4;
+            let mut repos = Vec::with_capacity(count);
+            for _ in 0..count {
+                let (repo, n) = read_repository(&payload[offset..])?;
+                offset += n;
+                repos.push(repo);
+            }
+            ControlFrame::RepoList { repos }
+        }
+        TYPE_REMOVE_SESSION => {
+            let (repo, n) = read_str(payload)?;
+            let (id, _) = read_str(&payload[n..])?;
+            ControlFrame::RemoveSession { repo, id }
+        }
+        TYPE_REMOVE_SESSION_ACK => ControlFrame::RemoveSessionAck,
+        TYPE_RENAME_SESSION => {
+            let mut offset = 0;
+            let (repo, n) = read_str(&payload[offset..])?;
+            offset += n;
+            let (id, n) = read_str(&payload[offset..])?;
+            offset += n;
+            let (label, _) = read_opt_str(&payload[offset..])?;
+            ControlFrame::RenameSession { repo, id, label }
+        }
+        TYPE_RENAME_SESSION_ACK => ControlFrame::RenameSessionAck,
+        TYPE_DETACH_SESSION => {
+            let (id, _) = read_str(payload)?;
+            ControlFrame::DetachSession { id }
+        }
+        TYPE_DETACH_SESSION_ACK => ControlFrame::DetachSessionAck,
+        TYPE_FIND_SESSION_BY_ID => {
+            let (prefix, _) = read_str(payload)?;
+            ControlFrame::FindSessionById { prefix }
+        }
+        TYPE_FOUND_SESSION => {
+            let (repo, n) = read_str(payload)?;
+            let (session, _) = read_session(&payload[n..])?;
+            ControlFrame::FoundSession { repo, session }
+        }
+        TYPE_INSTALL_HARNESS_HOOKS => {
+            let (harness, _) = read_str(payload)?;
+            ControlFrame::InstallHarnessHooks { harness }
+        }
+        TYPE_INSTALL_HARNESS_HOOKS_ACK => {
+            ensure_len(payload, 1, "InstallHarnessHooksAck installed")?;
+            let installed = payload[0] == 1;
+            let (skipped_reason, _) = read_opt_str(&payload[1..])?;
+            ControlFrame::InstallHarnessHooksAck {
+                installed,
+                skipped_reason,
+            }
+        }
         TYPE_ERROR => {
             let (message, _) = read_str(payload)?;
             ControlFrame::Error { message }
@@ -524,6 +988,277 @@ fn read_workspace_status(buf: &[u8]) -> std::io::Result<(WorkspaceStatus, usize)
             head_sha: sha,
             detached,
             health,
+        },
+        offset,
+    ))
+}
+
+// --- Workspace + BranchInfo + WorkspaceMode wire encoding ---
+//
+// Layout for Workspace:
+//   [name str][branch str][path str][is_base u8][created_at u64]
+//
+// Option<String> is encoded with a 1-byte tag (0 = None, 1 = Some) followed by
+// a length-prefixed string in the Some case.
+
+fn mode_to_byte(mode: WorkspaceMode) -> u8 {
+    match mode {
+        WorkspaceMode::NewBranch => MODE_NEW_BRANCH,
+        WorkspaceMode::ExistingBranch => MODE_EXISTING_BRANCH,
+    }
+}
+
+fn mode_from_byte(byte: u8) -> std::io::Result<WorkspaceMode> {
+    match byte {
+        MODE_NEW_BRANCH => Ok(WorkspaceMode::NewBranch),
+        MODE_EXISTING_BRANCH => Ok(WorkspaceMode::ExistingBranch),
+        other => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unknown WorkspaceMode byte: {other}"),
+        )),
+    }
+}
+
+fn write_opt_str(buf: &mut Vec<u8>, s: Option<&str>) {
+    match s {
+        Some(value) => {
+            buf.push(1);
+            write_str(buf, value);
+        }
+        None => buf.push(0),
+    }
+}
+
+fn read_opt_str(buf: &[u8]) -> std::io::Result<(Option<String>, usize)> {
+    ensure_len(buf, 1, "Option<String> tag")?;
+    if buf[0] == 1 {
+        let (s, n) = read_str(&buf[1..])?;
+        Ok((Some(s), 1 + n))
+    } else {
+        Ok((None, 1))
+    }
+}
+
+fn write_workspace(buf: &mut Vec<u8>, ws: &Workspace) {
+    write_str(buf, &ws.name);
+    write_str(buf, &ws.branch);
+    write_str(buf, &ws.path);
+    buf.push(if ws.is_base { 1 } else { 0 });
+    buf.extend_from_slice(&ws.created_at.to_be_bytes());
+}
+
+fn read_workspace(buf: &[u8]) -> std::io::Result<(Workspace, usize)> {
+    let mut offset = 0;
+    let (name, n) = read_str(&buf[offset..])?;
+    offset += n;
+    let (branch, n) = read_str(&buf[offset..])?;
+    offset += n;
+    let (path, n) = read_str(&buf[offset..])?;
+    offset += n;
+    ensure_len(&buf[offset..], 9, "Workspace is_base + created_at")?;
+    let is_base = buf[offset] == 1;
+    offset += 1;
+    let created_at = u64::from_be_bytes(buf[offset..offset + 8].try_into().unwrap());
+    offset += 8;
+    Ok((
+        Workspace {
+            name,
+            branch,
+            path,
+            is_base,
+            created_at,
+        },
+        offset,
+    ))
+}
+
+// --- Repository wire encoding ---
+//
+// Layout:
+//   [id str][url str][alias str][host opt_str][owner opt_str]
+//   [name opt_str][local_path opt_str][created_at u64]
+
+fn write_repository(buf: &mut Vec<u8>, repo: &Repository) {
+    write_str(buf, &repo.id);
+    write_str(buf, &repo.url);
+    write_str(buf, &repo.alias);
+    write_opt_str(buf, repo.host.as_deref());
+    write_opt_str(buf, repo.owner.as_deref());
+    write_opt_str(buf, repo.name.as_deref());
+    write_opt_str(buf, repo.local_path.as_deref());
+    buf.extend_from_slice(&repo.created_at.to_be_bytes());
+}
+
+fn read_repository(buf: &[u8]) -> std::io::Result<(Repository, usize)> {
+    let mut offset = 0;
+    let (id, n) = read_str(&buf[offset..])?;
+    offset += n;
+    let (url, n) = read_str(&buf[offset..])?;
+    offset += n;
+    let (alias, n) = read_str(&buf[offset..])?;
+    offset += n;
+    let (host, n) = read_opt_str(&buf[offset..])?;
+    offset += n;
+    let (owner, n) = read_opt_str(&buf[offset..])?;
+    offset += n;
+    let (name, n) = read_opt_str(&buf[offset..])?;
+    offset += n;
+    let (local_path, n) = read_opt_str(&buf[offset..])?;
+    offset += n;
+    ensure_len(&buf[offset..], 8, "Repository created_at")?;
+    let created_at = u64::from_be_bytes(buf[offset..offset + 8].try_into().unwrap());
+    offset += 8;
+    Ok((
+        Repository {
+            id,
+            url,
+            alias,
+            host,
+            owner,
+            name,
+            local_path,
+            created_at,
+        },
+        offset,
+    ))
+}
+
+// --- Session wire encoding ---
+//
+// Layout (matches the DB schema order in shard-core::sessions::Session):
+//   [id str][workspace_name str][command_json str][transport_addr str]
+//   [log_path str][supervisor_pid opt_u32][child_pid opt_u32]
+//   [status str][exit_code opt_i32][created_at u64][stopped_at opt_u64]
+//   [label opt_str][harness opt_str]
+//
+// `harness` is encoded via its Display impl ("claude-code" / "codex"); the
+// receiver parses it back through `FromStr`. Unknown strings become `None`
+// on the wire side, matching the DB's tolerance in `row_to_session`.
+
+fn write_opt_u32(buf: &mut Vec<u8>, value: Option<u32>) {
+    match value {
+        Some(v) => {
+            buf.push(1);
+            buf.extend_from_slice(&v.to_be_bytes());
+        }
+        None => buf.push(0),
+    }
+}
+
+fn read_opt_u32(buf: &[u8]) -> std::io::Result<(Option<u32>, usize)> {
+    ensure_len(buf, 1, "Option<u32> tag")?;
+    if buf[0] == 1 {
+        ensure_len(&buf[1..], 4, "Option<u32> body")?;
+        let v = u32::from_be_bytes(buf[1..5].try_into().unwrap());
+        Ok((Some(v), 5))
+    } else {
+        Ok((None, 1))
+    }
+}
+
+fn write_opt_i32(buf: &mut Vec<u8>, value: Option<i32>) {
+    match value {
+        Some(v) => {
+            buf.push(1);
+            buf.extend_from_slice(&v.to_be_bytes());
+        }
+        None => buf.push(0),
+    }
+}
+
+fn read_opt_i32(buf: &[u8]) -> std::io::Result<(Option<i32>, usize)> {
+    ensure_len(buf, 1, "Option<i32> tag")?;
+    if buf[0] == 1 {
+        ensure_len(&buf[1..], 4, "Option<i32> body")?;
+        let v = i32::from_be_bytes(buf[1..5].try_into().unwrap());
+        Ok((Some(v), 5))
+    } else {
+        Ok((None, 1))
+    }
+}
+
+fn write_opt_u64(buf: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        Some(v) => {
+            buf.push(1);
+            buf.extend_from_slice(&v.to_be_bytes());
+        }
+        None => buf.push(0),
+    }
+}
+
+fn read_opt_u64(buf: &[u8]) -> std::io::Result<(Option<u64>, usize)> {
+    ensure_len(buf, 1, "Option<u64> tag")?;
+    if buf[0] == 1 {
+        ensure_len(&buf[1..], 8, "Option<u64> body")?;
+        let v = u64::from_be_bytes(buf[1..9].try_into().unwrap());
+        Ok((Some(v), 9))
+    } else {
+        Ok((None, 1))
+    }
+}
+
+fn write_session(buf: &mut Vec<u8>, session: &Session) {
+    write_str(buf, &session.id);
+    write_str(buf, &session.workspace_name);
+    write_str(buf, &session.command_json);
+    write_str(buf, &session.transport_addr);
+    write_str(buf, &session.log_path);
+    write_opt_u32(buf, session.supervisor_pid);
+    write_opt_u32(buf, session.child_pid);
+    write_str(buf, &session.status);
+    write_opt_i32(buf, session.exit_code);
+    buf.extend_from_slice(&session.created_at.to_be_bytes());
+    write_opt_u64(buf, session.stopped_at);
+    write_opt_str(buf, session.label.as_deref());
+    write_opt_str(buf, session.harness.map(|h| h.to_string()).as_deref());
+}
+
+fn read_session(buf: &[u8]) -> std::io::Result<(Session, usize)> {
+    let mut offset = 0;
+    let (id, n) = read_str(&buf[offset..])?;
+    offset += n;
+    let (workspace_name, n) = read_str(&buf[offset..])?;
+    offset += n;
+    let (command_json, n) = read_str(&buf[offset..])?;
+    offset += n;
+    let (transport_addr, n) = read_str(&buf[offset..])?;
+    offset += n;
+    let (log_path, n) = read_str(&buf[offset..])?;
+    offset += n;
+    let (supervisor_pid, n) = read_opt_u32(&buf[offset..])?;
+    offset += n;
+    let (child_pid, n) = read_opt_u32(&buf[offset..])?;
+    offset += n;
+    let (status, n) = read_str(&buf[offset..])?;
+    offset += n;
+    let (exit_code, n) = read_opt_i32(&buf[offset..])?;
+    offset += n;
+    ensure_len(&buf[offset..], 8, "Session created_at")?;
+    let created_at = u64::from_be_bytes(buf[offset..offset + 8].try_into().unwrap());
+    offset += 8;
+    let (stopped_at, n) = read_opt_u64(&buf[offset..])?;
+    offset += n;
+    let (label, n) = read_opt_str(&buf[offset..])?;
+    offset += n;
+    let (harness_str, n) = read_opt_str(&buf[offset..])?;
+    offset += n;
+    let harness: Option<Harness> = harness_str.and_then(|s| s.parse().ok());
+    Ok((
+        Session {
+            id,
+            workspace_name,
+            command_json,
+            transport_addr,
+            log_path,
+            supervisor_pid,
+            child_pid,
+            status,
+            exit_code,
+            created_at,
+            stopped_at,
+            label,
+            harness,
         },
         offset,
     ))
@@ -734,6 +1469,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn roundtrip_remove_workspace() {
+        let f = ControlFrame::RemoveWorkspace {
+            repo: "my-repo".to_string(),
+            name: "feature-a".to_string(),
+        };
+        assert_eq!(roundtrip(f.clone()).await, f);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_remove_workspace_ack() {
+        assert_eq!(
+            roundtrip(ControlFrame::RemoveWorkspaceAck).await,
+            ControlFrame::RemoveWorkspaceAck
+        );
+    }
+
+    #[tokio::test]
+    async fn roundtrip_workspace_removed() {
+        let f = ControlFrame::WorkspaceRemoved {
+            repo: "my-repo".to_string(),
+            name: "feature-a".to_string(),
+        };
+        assert_eq!(roundtrip(f.clone()).await, f);
+    }
+
+    #[tokio::test]
     async fn roundtrip_state_snapshot_full() {
         let mut state = RepoState::new("my-repo");
         state.version = 42;
@@ -775,5 +1536,417 @@ mod tests {
         let state = RepoState::new("empty-repo");
         let frame = ControlFrame::StateSnapshot { state };
         assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    fn sample_workspace(name: &str, is_base: bool) -> Workspace {
+        Workspace {
+            name: name.to_string(),
+            branch: format!("branch-{name}"),
+            path: format!(r"C:\tmp\{name}"),
+            is_base,
+            created_at: 1_700_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn roundtrip_create_workspace_full() {
+        let frame = ControlFrame::CreateWorkspace {
+            repo: "demo".to_string(),
+            name: Some("feature".to_string()),
+            mode: WorkspaceMode::ExistingBranch,
+            branch: Some("main".to_string()),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_create_workspace_minimal() {
+        let frame = ControlFrame::CreateWorkspace {
+            repo: "demo".to_string(),
+            name: None,
+            mode: WorkspaceMode::NewBranch,
+            branch: None,
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_create_workspace_ack() {
+        let frame = ControlFrame::CreateWorkspaceAck {
+            workspace: sample_workspace("feature-a", false),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_create_workspace_ack_base() {
+        let frame = ControlFrame::CreateWorkspaceAck {
+            workspace: sample_workspace("base", true),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_list_workspaces() {
+        let frame = ControlFrame::ListWorkspaces {
+            repo: "demo".to_string(),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_workspace_list_full() {
+        let frame = ControlFrame::WorkspaceList {
+            items: vec![
+                WorkspaceWithStatus {
+                    workspace: sample_workspace("main", true),
+                    status: Some(WorkspaceStatus {
+                        current_branch: Some("main".to_string()),
+                        head_sha: Some("a".repeat(40)),
+                        detached: false,
+                        health: WorkspaceHealth::Healthy,
+                    }),
+                },
+                WorkspaceWithStatus {
+                    workspace: sample_workspace("feature", false),
+                    status: None,
+                },
+            ],
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_workspace_list_empty() {
+        let frame = ControlFrame::WorkspaceList { items: vec![] };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_list_branch_info() {
+        let frame = ControlFrame::ListBranchInfo {
+            repo: "demo".to_string(),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_branch_info_list() {
+        let frame = ControlFrame::BranchInfoList {
+            branches: vec![
+                BranchInfo {
+                    name: "main".to_string(),
+                    is_head: true,
+                    checked_out_by: None,
+                },
+                BranchInfo {
+                    name: "feature".to_string(),
+                    is_head: false,
+                    checked_out_by: Some("feature-workspace".to_string()),
+                },
+            ],
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_branch_info_list_empty() {
+        let frame = ControlFrame::BranchInfoList { branches: vec![] };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    fn sample_repository(alias: &str, local: bool) -> Repository {
+        Repository {
+            id: format!("id-{alias}"),
+            url: if local {
+                format!(r"C:\repos\{alias}")
+            } else {
+                format!("https://github.com/demo/{alias}.git")
+            },
+            alias: alias.to_string(),
+            host: if local {
+                None
+            } else {
+                Some("github.com".to_string())
+            },
+            owner: if local { None } else { Some("demo".to_string()) },
+            name: Some(alias.to_string()),
+            local_path: if local {
+                Some(format!(r"C:\repos\{alias}"))
+            } else {
+                None
+            },
+            created_at: 1_700_000_123,
+        }
+    }
+
+    #[tokio::test]
+    async fn roundtrip_add_repo_with_alias() {
+        let frame = ControlFrame::AddRepo {
+            url: "https://github.com/demo/x.git".to_string(),
+            alias: Some("demo".to_string()),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_add_repo_no_alias() {
+        let frame = ControlFrame::AddRepo {
+            url: r"C:\repos\demo".to_string(),
+            alias: None,
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_add_repo_ack_remote() {
+        let frame = ControlFrame::AddRepoAck {
+            repo: sample_repository("demo", false),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_add_repo_ack_local() {
+        let frame = ControlFrame::AddRepoAck {
+            repo: sample_repository("local-demo", true),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_remove_repo_and_ack() {
+        let req = ControlFrame::RemoveRepo {
+            alias: "demo".to_string(),
+        };
+        assert_eq!(roundtrip(req.clone()).await, req);
+        assert_eq!(
+            roundtrip(ControlFrame::RemoveRepoAck).await,
+            ControlFrame::RemoveRepoAck
+        );
+    }
+
+    #[tokio::test]
+    async fn roundtrip_sync_repo_and_ack() {
+        let req = ControlFrame::SyncRepo {
+            alias: "demo".to_string(),
+        };
+        assert_eq!(roundtrip(req.clone()).await, req);
+        assert_eq!(
+            roundtrip(ControlFrame::SyncRepoAck).await,
+            ControlFrame::SyncRepoAck
+        );
+    }
+
+    #[tokio::test]
+    async fn roundtrip_list_repos_and_response() {
+        assert_eq!(
+            roundtrip(ControlFrame::ListRepos).await,
+            ControlFrame::ListRepos
+        );
+        let frame = ControlFrame::RepoList {
+            repos: vec![
+                sample_repository("alpha", false),
+                sample_repository("beta", true),
+            ],
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_repo_list_empty() {
+        let frame = ControlFrame::RepoList { repos: vec![] };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    fn sample_session(id: &str, status: &str) -> Session {
+        Session {
+            id: id.to_string(),
+            workspace_name: "feature".to_string(),
+            command_json: r#"["pwsh","-NoLogo"]"#.to_string(),
+            transport_addr: format!(r"\\.\pipe\shard-session-{id}"),
+            log_path: format!(r"C:\tmp\{id}\session.log"),
+            supervisor_pid: Some(1234),
+            child_pid: Some(5678),
+            status: status.to_string(),
+            exit_code: Some(0),
+            created_at: 1_700_000_321,
+            stopped_at: Some(1_700_000_999),
+            label: Some("my-agent".to_string()),
+            harness: Some(Harness::ClaudeCode),
+        }
+    }
+
+    fn minimal_session(id: &str) -> Session {
+        Session {
+            id: id.to_string(),
+            workspace_name: "main".to_string(),
+            command_json: "[]".to_string(),
+            transport_addr: String::new(),
+            log_path: String::new(),
+            supervisor_pid: None,
+            child_pid: None,
+            status: "starting".to_string(),
+            exit_code: None,
+            created_at: 1_700_000_100,
+            stopped_at: None,
+            label: None,
+            harness: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn roundtrip_remove_session() {
+        let frame = ControlFrame::RemoveSession {
+            repo: "demo".to_string(),
+            id: "019d5a15-session-01".to_string(),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+        assert_eq!(
+            roundtrip(ControlFrame::RemoveSessionAck).await,
+            ControlFrame::RemoveSessionAck
+        );
+    }
+
+    #[tokio::test]
+    async fn roundtrip_rename_session() {
+        let frame = ControlFrame::RenameSession {
+            repo: "demo".to_string(),
+            id: "abc".to_string(),
+            label: Some("my-agent".to_string()),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+
+        let clear = ControlFrame::RenameSession {
+            repo: "demo".to_string(),
+            id: "abc".to_string(),
+            label: None,
+        };
+        assert_eq!(roundtrip(clear.clone()).await, clear);
+
+        assert_eq!(
+            roundtrip(ControlFrame::RenameSessionAck).await,
+            ControlFrame::RenameSessionAck
+        );
+    }
+
+    #[tokio::test]
+    async fn roundtrip_detach_session() {
+        let frame = ControlFrame::DetachSession {
+            id: "019d5a15".to_string(),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+        assert_eq!(
+            roundtrip(ControlFrame::DetachSessionAck).await,
+            ControlFrame::DetachSessionAck
+        );
+    }
+
+    #[tokio::test]
+    async fn roundtrip_find_session_by_id() {
+        let req = ControlFrame::FindSessionById {
+            prefix: "019d5a15".to_string(),
+        };
+        assert_eq!(roundtrip(req.clone()).await, req);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_found_session_full() {
+        let frame = ControlFrame::FoundSession {
+            repo: "demo".to_string(),
+            session: sample_session("019d5a15-0001", "running"),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_found_session_minimal() {
+        let frame = ControlFrame::FoundSession {
+            repo: "demo".to_string(),
+            session: minimal_session("019d5a15-0002"),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_found_session_unknown_harness_drops() {
+        // If a future daemon sends a harness string the client doesn't
+        // recognize, we decode it as `None` — matches the DB's tolerance.
+        let mut payload = Vec::new();
+        // Session fields, matching write_session layout:
+        write_str(&mut payload, "id"); // id
+        write_str(&mut payload, "ws"); // workspace_name
+        write_str(&mut payload, "[]"); // command_json
+        write_str(&mut payload, ""); // transport_addr
+        write_str(&mut payload, ""); // log_path
+        payload.push(0); // supervisor_pid: None
+        payload.push(0); // child_pid: None
+        write_str(&mut payload, "running"); // status
+        payload.push(0); // exit_code: None
+        payload.extend_from_slice(&0u64.to_be_bytes()); // created_at
+        payload.push(0); // stopped_at: None
+        payload.push(0); // label: None
+        // harness: Some("unknown-harness") — expected to decode as None
+        payload.push(1);
+        write_str(&mut payload, "unknown-harness");
+
+        let (session, _) = read_session(&payload).unwrap();
+        assert!(
+            session.harness.is_none(),
+            "unknown harness string should decode as None"
+        );
+    }
+
+    #[tokio::test]
+    async fn roundtrip_install_harness_hooks_request() {
+        let frame = ControlFrame::InstallHarnessHooks {
+            harness: "claude-code".to_string(),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_install_harness_hooks_ack_installed_no_reason() {
+        let frame = ControlFrame::InstallHarnessHooksAck {
+            installed: true,
+            skipped_reason: None,
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_install_harness_hooks_ack_already_configured() {
+        let frame = ControlFrame::InstallHarnessHooksAck {
+            installed: true,
+            skipped_reason: Some("already configured".to_string()),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_install_harness_hooks_ack_skipped() {
+        let frame = ControlFrame::InstallHarnessHooksAck {
+            installed: false,
+            skipped_reason: Some("claude code not installed".to_string()),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn mode_byte_rejects_unknown() {
+        let mut bytes = Vec::new();
+        write_str(&mut bytes, "demo");
+        bytes.push(0); // name tag: None
+        bytes.push(0x7f); // invalid mode
+        bytes.push(0); // branch tag: None
+
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&((1 + bytes.len()) as u32).to_be_bytes());
+        framed.push(TYPE_CREATE_WORKSPACE);
+        framed.extend_from_slice(&bytes);
+
+        let mut cursor = std::io::Cursor::new(framed);
+        let err = read_control_frame(&mut cursor).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

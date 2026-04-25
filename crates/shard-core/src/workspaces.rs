@@ -1,3 +1,5 @@
+use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::params;
@@ -9,7 +11,48 @@ use crate::paths::ShardPaths;
 use crate::repos::RepositoryStore;
 use crate::{Result, ShardError};
 
-#[derive(Debug, Clone, Serialize)]
+/// Narrow abstraction over the git operations the daemon's workspace-remove
+/// workflow needs. Lets integration tests inject failures at specific steps
+/// (e.g., force `worktree_remove` to fail so the `broken` state transition
+/// is exercised).
+///
+/// Production uses [`RealGitOps`]; tests plug in a stub.
+pub trait WorkspaceGitOps: Send + Sync {
+    fn worktree_remove(&self, repo_dir: &Path, worktree_path: &Path) -> Result<()>;
+    fn worktree_prune(&self, repo_dir: &Path) -> Result<()>;
+    fn worktree_list_porcelain(
+        &self,
+        repo_dir: &Path,
+    ) -> Result<Vec<git::WorktreeEntry>>;
+}
+
+/// Production git-ops implementation — delegates straight to
+/// [`crate::git`].
+pub struct RealGitOps;
+
+impl WorkspaceGitOps for RealGitOps {
+    fn worktree_remove(&self, repo_dir: &Path, worktree_path: &Path) -> Result<()> {
+        git::worktree_remove(repo_dir, worktree_path)
+    }
+
+    fn worktree_prune(&self, repo_dir: &Path) -> Result<()> {
+        git::worktree_prune(repo_dir)
+    }
+
+    fn worktree_list_porcelain(
+        &self,
+        repo_dir: &Path,
+    ) -> Result<Vec<git::WorktreeEntry>> {
+        git::worktree_list_porcelain(repo_dir)
+    }
+}
+
+/// Convenience constructor for the default git-ops impl.
+pub fn default_git_ops() -> Arc<dyn WorkspaceGitOps> {
+    Arc::new(RealGitOps)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Workspace {
     pub name: String,
     pub branch: String,
@@ -36,11 +79,28 @@ pub enum WorkspaceMode {
 /// Surfaces to the frontend so the new-workspace wizard can pick a base
 /// branch (mode = NewBranch) or pick an existing branch to check out
 /// (mode = ExistingBranch) and warn when that branch is already claimed.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BranchInfo {
     pub name: String,
     pub is_head: bool,
     pub checked_out_by: Option<String>,
+}
+
+/// A workspace persisted row enriched with live derived status from the
+/// daemon's monitor. Returned by `ControlFrame::ListWorkspaces` so callers
+/// get both halves in one round trip instead of joining them client-side.
+///
+/// Kept in `shard-core` (not `shard-app`) so both the Tauri backend and
+/// `shardctl` can render the same shape.
+///
+/// `status` is `None` when the daemon has no snapshot for this repo yet
+/// (e.g. right after `AddRepo`, before the monitor's first tick). The
+/// frontend must handle this as "unknown", not "unhealthy".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkspaceWithStatus {
+    #[serde(flatten)]
+    pub workspace: Workspace,
+    pub status: Option<crate::state::WorkspaceStatus>,
 }
 
 pub struct WorkspaceStore {
@@ -50,6 +110,48 @@ pub struct WorkspaceStore {
 impl WorkspaceStore {
     pub fn new(paths: ShardPaths) -> Self {
         Self { paths }
+    }
+
+    /// Resolve the effective workspace name from `(name, mode, branch)`
+    /// WITHOUT touching disk or the DB. Side-effect-free except for the
+    /// git `default_branch` lookup (a plumbing `git symbolic-ref` — no
+    /// fetch, no commit).
+    ///
+    /// Separated from `create` so the daemon's mutation handler can
+    /// gate-check the resolved name against the lifecycle registry
+    /// before any work is committed. Mirrors the exact resolution logic
+    /// in `create` — if it drifts, the gate check stops matching what
+    /// `create` writes to the DB.
+    ///
+    /// Only models the non-base path. `is_base=true` workspaces are
+    /// only created during `AddRepo`, which has its own handler in
+    /// Phase 3.
+    pub fn resolve_workspace_name(
+        &self,
+        repo_alias: &str,
+        name: Option<&str>,
+        mode: WorkspaceMode,
+        branch: Option<&str>,
+    ) -> Result<String> {
+        let repo_store = RepositoryStore::new(self.paths.clone());
+        let repo = repo_store.get(repo_alias)?;
+        let source_dir = self
+            .paths
+            .repo_source_for_repo(repo_alias, repo.local_path.as_deref());
+
+        let branch_for_db = match mode {
+            WorkspaceMode::NewBranch => match branch {
+                Some(b) => b.to_string(),
+                None => git::default_branch(&source_dir)?,
+            },
+            WorkspaceMode::ExistingBranch => branch
+                .ok_or_else(|| {
+                    ShardError::Other("existing_branch mode requires a branch name".into())
+                })?
+                .to_string(),
+        };
+
+        Ok(resolve_workspace_name_from_branch(name, mode, &branch_for_db))
     }
 
     /// Create a new workspace for a repo.
@@ -72,7 +174,7 @@ impl WorkspaceStore {
         branch: Option<&str>,
         is_base: bool,
     ) -> Result<Workspace> {
-        let repo_store = RepositoryStore::new(ShardPaths::new()?);
+        let repo_store = RepositoryStore::new(self.paths.clone());
         let repo = repo_store.get(repo_alias)?;
 
         let source_dir = self.paths.repo_source_for_repo(
@@ -118,10 +220,7 @@ impl WorkspaceStore {
             }
         };
 
-        let ws_name = match name {
-            Some(n) => n.to_string(),
-            None => branch_for_db.clone(),
-        };
+        let ws_name = resolve_workspace_name_from_branch(name, mode, &branch_for_db);
 
         // Check for duplicates in DB
         let repo_db_path = self.paths.repo_db(repo_alias);
@@ -211,7 +310,7 @@ impl WorkspaceStore {
     /// workspace rows so each occupied branch is labeled with the
     /// workspace name rather than a raw path.
     pub fn list_branch_info(&self, repo_alias: &str) -> Result<Vec<BranchInfo>> {
-        let repo_store = RepositoryStore::new(ShardPaths::new()?);
+        let repo_store = RepositoryStore::new(self.paths.clone());
         let repo = repo_store.get(repo_alias)?;
         let source_dir = self.paths.repo_source_for_repo(
             repo_alias,
@@ -292,7 +391,7 @@ impl WorkspaceStore {
     /// List all workspaces for a repo.
     pub fn list(&self, repo_alias: &str) -> Result<Vec<Workspace>> {
         // Verify the repo exists
-        let repo_store = RepositoryStore::new(ShardPaths::new()?);
+        let repo_store = RepositoryStore::new(self.paths.clone());
         let _repo = repo_store.get(repo_alias)?;
 
         let repo_db_path = self.paths.repo_db(repo_alias);
@@ -363,7 +462,7 @@ impl WorkspaceStore {
         let ws = self.get(repo_alias, ws_name)?;
 
         if !ws.is_base {
-            let repo_store = RepositoryStore::new(ShardPaths::new()?);
+            let repo_store = RepositoryStore::new(self.paths.clone());
             let repo = repo_store.get(repo_alias)?;
             let source_dir = self.paths.repo_source_for_repo(
                 repo_alias,
@@ -405,6 +504,70 @@ impl WorkspaceStore {
 
         Ok(())
     }
+
+    /// Delete the DB row for a workspace. Does NOT touch the filesystem or
+    /// run any git commands. Used by the daemon's `RemoveWorkspace`
+    /// workflow after the filesystem side (via [`remove_worktree_fs`]) has
+    /// already succeeded.
+    pub fn delete_row(&self, repo_alias: &str, ws_name: &str) -> Result<()> {
+        let repo_db_path = self.paths.repo_db(repo_alias);
+        let conn = db::open_connection(&repo_db_path)?;
+        conn.execute(
+            "DELETE FROM workspaces WHERE name = ?1",
+            params![ws_name],
+        )?;
+        Ok(())
+    }
+}
+
+/// Run the filesystem side of a workspace remove through the given
+/// [`WorkspaceGitOps`]: `git worktree remove --force` with a prune + manual
+/// `remove_dir_all` fallback for broken rows. Mirrors the logic embedded
+/// in [`WorkspaceStore::remove`] but decoupled from the DB step so the
+/// daemon can interleave state-machine transitions between them.
+///
+/// Returns `Ok(())` if the workspace directory and git admin entry are
+/// gone after this call. Errors are recoverable — the caller should mark
+/// the workspace `broken` and preserve the DB row.
+pub fn remove_worktree_fs(
+    git_ops: &dyn WorkspaceGitOps,
+    source_dir: &Path,
+    ws_dir: &Path,
+) -> Result<()> {
+    if ws_dir.exists() {
+        if let Err(remove_err) = git_ops.worktree_remove(source_dir, ws_dir) {
+            // Only fall back to manual deletion when git no longer
+            // recognizes this path as a registered worktree. Any other
+            // failure must preserve the directory — a transient git
+            // error shouldn't blow away local state.
+            let registered = git_ops
+                .worktree_list_porcelain(source_dir)
+                .map(|entries| {
+                    let key = normalize_worktree_path(ws_dir);
+                    entries
+                        .iter()
+                        .any(|e| normalize_worktree_path(&e.path) == key)
+                })
+                .unwrap_or(true);
+
+            if registered {
+                return Err(remove_err);
+            }
+
+            git_ops.worktree_prune(source_dir)?;
+            std::fs::remove_dir_all(ws_dir).map_err(|e| {
+                ShardError::Other(format!(
+                    "failed to remove worktree directory {}: {}",
+                    ws_dir.display(),
+                    e
+                ))
+            })?;
+        }
+    } else {
+        // Directory already gone — prune any stale admin entry.
+        let _ = git_ops.worktree_prune(source_dir);
+    }
+    Ok(())
 }
 
 fn is_registered_worktree(repo_dir: &std::path::Path, ws_dir: &std::path::Path) -> Result<bool> {
@@ -424,6 +587,49 @@ fn external_worktree_label(path: &std::path::Path) -> String {
         "(external worktree)".into()
     } else {
         format!("(external: {name})")
+    }
+}
+
+fn resolve_workspace_name_from_branch(
+    name: Option<&str>,
+    mode: WorkspaceMode,
+    branch_for_db: &str,
+) -> String {
+    match (mode, name) {
+        (WorkspaceMode::ExistingBranch, None) => safe_workspace_name(branch_for_db),
+        (WorkspaceMode::ExistingBranch, Some(n)) if n == branch_for_db => {
+            safe_workspace_name(branch_for_db)
+        }
+        (_, Some(n)) => n.to_string(),
+        (_, None) => branch_for_db.to_string(),
+    }
+}
+
+fn safe_workspace_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut last_dash = false;
+
+    for ch in raw.chars() {
+        let safe = match ch {
+            '/' | '\\' => '-',
+            _ => ch,
+        };
+        if safe == '-' {
+            if last_dash {
+                continue;
+            }
+            last_dash = true;
+        } else {
+            last_dash = false;
+        }
+        out.push(safe);
+    }
+
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "workspace".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 

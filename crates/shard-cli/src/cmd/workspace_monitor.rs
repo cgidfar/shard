@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use notify::RecursiveMode;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
-use tokio::sync::{broadcast, mpsc, watch, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, RwLock};
 use tracing::{debug, info, warn};
 
 use shard_core::repos::{Repository, RepositoryStore};
@@ -73,14 +73,64 @@ pub struct MonitorHandle {
 pub enum ChangeKind {
     State(String),
     Sessions(String),
+    /// Fine-grained "a workspace was removed" signal. Emitted by
+    /// `RemoveWorkspace` after the full D5 workflow commits. Subscribers
+    /// translate this into a `ControlFrame::WorkspaceRemoved` frame.
+    WorkspaceRemoved { repo: String, name: String },
+}
+
+/// Typed commands sent from daemon mutation handlers to the monitor task.
+///
+/// Previously the daemon poked the monitor via a bare
+/// `mpsc::UnboundedSender<Option<String>>` with no back-channel. That's
+/// fine for fire-and-forget reloads but unsafe for operations where the
+/// monitor's `ReadDirectoryChangesW` handle must be dropped *before* a
+/// mutation handler's `RemoveDirectoryW` fires (SHA-55). Command variants
+/// that carry a oneshot ack solve this.
+#[derive(Debug)]
+pub enum MonitorCommand {
+    /// Reload the given repo (or every repo if `None`) from DB and
+    /// reconfigure watchers. Fire-and-forget; no ack.
+    PokeTopology { repo_alias: Option<String> },
+
+    /// Drop the repo's current debouncer (releasing all its
+    /// `ReadDirectoryChangesW` handles, including the one on
+    /// `workspace_name`), then rebuild a new debouncer over the remaining
+    /// workspaces, then send the ack.
+    ///
+    /// **Load-bearing ack semantics:** the ack must fire only *after* the
+    /// old `Debouncer` has been dropped on this task. Mutation handlers
+    /// rely on that guarantee to sequence `RemoveDirectoryW` safely.
+    DropRepoWorkspace {
+        alias: String,
+        /// Name of the workspace being deleted. It's filtered out of the
+        /// rebuilt watcher set so the new debouncer doesn't reopen a
+        /// handle on the directory we're about to remove.
+        workspace_name: String,
+        ack: oneshot::Sender<()>,
+    },
+
+    /// Drop the repo's entire debouncer + RepoState entry, releasing
+    /// every `ReadDirectoryChangesW` handle it owned. Used by
+    /// `RemoveRepo` before tearing down the on-disk repo tree, since
+    /// every workspace under the repo is going away at once.
+    ///
+    /// **Load-bearing ack semantics:** same contract as
+    /// `DropRepoWorkspace` — the ack must fire only after the
+    /// `Debouncer` has been dropped on this task so the mutation
+    /// handler can safely call `RemoveDirectoryW`.
+    DropRepo {
+        alias: String,
+        ack: oneshot::Sender<()>,
+    },
 }
 
 struct MonitorInner {
     repos: RwLock<HashMap<String, Arc<RepoState>>>,
     change_tx: broadcast::Sender<ChangeKind>,
-    /// Topology-poke channel. `Some(alias)` scopes the reload to one repo;
-    /// `None` means "reload everything" (used rarely, e.g. at startup).
-    topology_tx: mpsc::UnboundedSender<Option<String>>,
+    /// Typed command channel (replaces the former topology-only poke).
+    /// Fire-and-forget pokes are encoded as `MonitorCommand::PokeTopology`.
+    command_tx: mpsc::UnboundedSender<MonitorCommand>,
 }
 
 impl MonitorHandle {
@@ -107,7 +157,60 @@ impl MonitorHandle {
     /// client has committed a repo/workspace mutation. `None` requests a
     /// full reload; `Some(alias)` scopes it to one repo.
     pub fn poke_topology(&self, repo_alias: Option<String>) {
-        let _ = self.inner.topology_tx.send(repo_alias);
+        let _ = self
+            .inner
+            .command_tx
+            .send(MonitorCommand::PokeTopology { repo_alias });
+    }
+
+    /// Broadcast a change to subscribers. Used by mutation handlers that
+    /// have already committed side effects and want to fan out the
+    /// resulting event (e.g. `WorkspaceRemoved`) to connected clients.
+    #[allow(dead_code)] // consumed by Phase 1 handlers
+    pub fn broadcast(&self, change: ChangeKind) {
+        let _ = self.inner.change_tx.send(change);
+    }
+
+    /// Drop the watcher for a specific workspace (so its
+    /// `ReadDirectoryChangesW` handle is released) and wait for the
+    /// confirmation ack before returning. Used by `RemoveWorkspace` before
+    /// `git worktree remove` / `fs::remove_dir_all`.
+    ///
+    /// If the monitor task has gone away (shutdown in progress) the
+    /// returned error is informational — the caller can proceed since
+    /// there is no watcher to block the delete.
+    #[allow(dead_code)] // consumed by Phase 1
+    pub async fn drop_repo_workspace(
+        &self,
+        alias: &str,
+        workspace_name: &str,
+    ) -> Result<(), &'static str> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.inner
+            .command_tx
+            .send(MonitorCommand::DropRepoWorkspace {
+                alias: alias.to_string(),
+                workspace_name: workspace_name.to_string(),
+                ack: ack_tx,
+            })
+            .map_err(|_| "monitor task is not running")?;
+        ack_rx.await.map_err(|_| "monitor dropped ack before replying")
+    }
+
+    /// Drop the repo's entire watcher (and its `RepoState` entry) and
+    /// wait for the confirmation ack before returning. Used by
+    /// `RemoveRepo` before the on-disk teardown.
+    #[allow(dead_code)] // consumed by Phase 3
+    pub async fn drop_repo(&self, alias: &str) -> Result<(), &'static str> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.inner
+            .command_tx
+            .send(MonitorCommand::DropRepo {
+                alias: alias.to_string(),
+                ack: ack_tx,
+            })
+            .map_err(|_| "monitor task is not running")?;
+        ack_rx.await.map_err(|_| "monitor dropped ack before replying")
     }
 }
 
@@ -115,17 +218,17 @@ impl MonitorHandle {
 ///
 /// The task owns all filesystem watchers and ticks; the handle provides
 /// read-only access to the latest state plus the topology-poke channel.
-pub fn spawn(
+pub(crate) fn spawn(
     daemon_state: Arc<DaemonState>,
     shutdown_rx: watch::Receiver<ShutdownMode>,
 ) -> (MonitorHandle, tokio::task::JoinHandle<()>) {
     let (change_tx, _) = broadcast::channel(CHANGE_CHANNEL_CAPACITY);
-    let (topology_tx, topology_rx) = mpsc::unbounded_channel::<Option<String>>();
+    let (command_tx, command_rx) = mpsc::unbounded_channel::<MonitorCommand>();
 
     let inner = Arc::new(MonitorInner {
         repos: RwLock::new(HashMap::new()),
         change_tx,
-        topology_tx,
+        command_tx,
     });
 
     let handle = MonitorHandle {
@@ -135,7 +238,7 @@ pub fn spawn(
     let task_state = daemon_state.clone();
     let task_inner = inner.clone();
     let task = tokio::spawn(async move {
-        let mut monitor = WorkspaceMonitor::new(task_state, task_inner, topology_rx, shutdown_rx);
+        let mut monitor = WorkspaceMonitor::new(task_state, task_inner, command_rx, shutdown_rx);
         if let Err(e) = monitor.initial_load().await {
             warn!("WorkspaceMonitor initial load failed: {e}");
         }
@@ -151,7 +254,7 @@ pub fn spawn(
 struct WorkspaceMonitor {
     daemon: Arc<DaemonState>,
     inner: Arc<MonitorInner>,
-    topology_rx: mpsc::UnboundedReceiver<Option<String>>,
+    command_rx: mpsc::UnboundedReceiver<MonitorCommand>,
     shutdown_rx: watch::Receiver<ShutdownMode>,
 
     repo_store: RepositoryStore,
@@ -182,7 +285,7 @@ impl WorkspaceMonitor {
     fn new(
         daemon: Arc<DaemonState>,
         inner: Arc<MonitorInner>,
-        topology_rx: mpsc::UnboundedReceiver<Option<String>>,
+        command_rx: mpsc::UnboundedReceiver<MonitorCommand>,
         shutdown_rx: watch::Receiver<ShutdownMode>,
     ) -> Self {
         let (notify_tx, notify_rx) = mpsc::unbounded_channel();
@@ -191,7 +294,7 @@ impl WorkspaceMonitor {
         Self {
             daemon,
             inner,
-            topology_rx,
+            command_rx,
             shutdown_rx,
             repo_store,
             ws_store,
@@ -366,9 +469,9 @@ impl WorkspaceMonitor {
                     return;
                 }
 
-                // Topology changes (repo/workspace add/remove).
-                Some(alias) = self.topology_rx.recv() => {
-                    self.handle_topology_change(alias).await;
+                // Typed commands from daemon mutation handlers.
+                Some(cmd) = self.command_rx.recv() => {
+                    self.handle_command(cmd).await;
                 }
 
                 // Debounced filesystem events.
@@ -387,6 +490,94 @@ impl WorkspaceMonitor {
                 }
             }
         }
+    }
+
+    async fn handle_command(&mut self, cmd: MonitorCommand) {
+        match cmd {
+            MonitorCommand::PokeTopology { repo_alias } => {
+                self.handle_topology_change(repo_alias).await;
+            }
+            MonitorCommand::DropRepoWorkspace {
+                alias,
+                workspace_name,
+                ack,
+            } => {
+                self.handle_drop_repo_workspace(alias, workspace_name, ack)
+                    .await;
+            }
+            MonitorCommand::DropRepo { alias, ack } => {
+                self.handle_drop_repo(alias, ack).await;
+            }
+        }
+    }
+
+    /// Drop the repo's debouncer + RepoState entry and ack only after
+    /// the `Debouncer` has been dropped on this task. Mirror of
+    /// `handle_drop_repo_workspace` without the rebuild step — the
+    /// entire repo is going away, so there are no remaining workspaces
+    /// to watch.
+    async fn handle_drop_repo(&mut self, alias: String, ack: oneshot::Sender<()>) {
+        // Drop the old debouncer explicitly — releases every
+        // `ReadDirectoryChangesW` handle it held so the caller's
+        // `RemoveDirectoryW` can proceed.
+        let prev = self.debouncers.remove(&alias);
+        drop(prev);
+        self.watched_paths.remove(&alias);
+
+        // Clear the in-memory RepoState too; if AddRepo is called again
+        // for the same alias it'll be rebuilt on the next topology poke.
+        self.inner.repos.write().await.remove(&alias);
+
+        let _ = ack.send(());
+    }
+
+    /// Drop the current debouncer for `alias` (releasing all its
+    /// `ReadDirectoryChangesW` handles), rebuild a new debouncer over the
+    /// repo's remaining workspaces (excluding `workspace_name`, which is
+    /// about to be removed from disk), then send the ack.
+    ///
+    /// Ordering is load-bearing: the ack MUST fire only after the old
+    /// `Debouncer` has been dropped. The explicit `drop(prev)` here is
+    /// what makes the ordering a property of the code rather than a
+    /// comment: the Debouncer's `Drop` impl closes the OS handle, so by
+    /// the time `ack.send(())` runs, `RemoveDirectoryW` on the workspace
+    /// path can no longer be blocked by notify's handle.
+    async fn handle_drop_repo_workspace(
+        &mut self,
+        alias: String,
+        workspace_name: String,
+        ack: oneshot::Sender<()>,
+    ) {
+        // 1. Drop the old debouncer and its watched-paths record. The
+        //    explicit `drop(prev)` is what releases the OS handles.
+        let prev = self.debouncers.remove(&alias);
+        drop(prev);
+        self.watched_paths.remove(&alias);
+
+        // 2. Rebuild the watcher over the remaining workspaces. The DB
+        //    row for `workspace_name` is still present at this point
+        //    (D5 ordering: monitor-drop ack fires BEFORE DB delete), so
+        //    filter it out explicitly rather than re-listing post-delete.
+        if let Ok(repo) = self.repo_store.get(&alias) {
+            let workspaces = match self.ws_store.list(&alias) {
+                Ok(list) => list
+                    .into_iter()
+                    .filter(|w| w.name != workspace_name)
+                    .collect::<Vec<_>>(),
+                Err(_) => Vec::new(),
+            };
+            if let Err(e) = self.start_watcher(&alias, &repo, &workspaces) {
+                warn!(
+                    "DropRepoWorkspace: watcher re-setup failed for {alias}: {e} — workspace state will still converge via 30s reconcile",
+                );
+            }
+        }
+
+        // 3. Ack after the handle drop AND after the replacement watcher
+        //    has been installed on the remaining paths (excluding the
+        //    one being deleted). The mutation handler now owns exclusive
+        //    access to the soon-to-be-removed directory.
+        let _ = ack.send(());
     }
 
     async fn handle_topology_change(&mut self, alias: Option<String>) {
@@ -540,10 +731,9 @@ impl WorkspaceMonitor {
         // Tray icon update (absorbed from heartbeat_task).
         #[cfg(windows)]
         {
-            let _ = self
-                .daemon
-                .tray_proxy
-                .send_event(TrayEvent::SessionCount(current_count));
+            if let Some(proxy) = &self.daemon.tray_proxy {
+                let _ = proxy.send_event(TrayEvent::SessionCount(current_count));
+            }
         }
         #[cfg(not(windows))]
         {

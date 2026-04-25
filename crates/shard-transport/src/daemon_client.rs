@@ -3,7 +3,40 @@
 //! Provides connect + typed frame send/receive. Does NOT handle
 //! spawn logic or exe resolution — those belong one layer up.
 
+use std::fmt;
+
 use tokio::io::{AsyncRead, AsyncWrite};
+
+/// Error from a typed request to the daemon.
+///
+/// Separates transport failures from daemon-reported errors so callers can
+/// surface different messages (e.g., "daemon not running" vs. "workspace is
+/// being deleted"). Transport errors are usually worth retrying;
+/// `DaemonReported` errors are not.
+#[derive(Debug)]
+pub enum DaemonError {
+    /// The daemon responded with an `Error { message }` frame.
+    Reported(String),
+    /// Local transport error (pipe closed, decode failure, unexpected frame).
+    Transport(std::io::Error),
+}
+
+impl fmt::Display for DaemonError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DaemonError::Reported(msg) => write!(f, "{msg}"),
+            DaemonError::Transport(e) => write!(f, "transport error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for DaemonError {}
+
+impl From<std::io::Error> for DaemonError {
+    fn from(e: std::io::Error) -> Self {
+        DaemonError::Transport(e)
+    }
+}
 
 /// Windows error code for ERROR_PIPE_BUSY (231).
 #[cfg(windows)]
@@ -83,6 +116,37 @@ impl<S: AsyncRead + AsyncWrite + Unpin> DaemonConnection<S> {
         }
     }
 
+    /// Send a control frame and extract a typed response.
+    ///
+    /// Folds the `Error { message }` response frame into `DaemonError::Reported`
+    /// so callers don't need to pattern-match on it at every call site. The
+    /// `extract` closure runs only for non-error responses; if it returns
+    /// `None`, the frame is treated as a protocol violation and surfaced as
+    /// a transport error. Typical usage:
+    ///
+    /// ```ignore
+    /// conn.request_typed(&ControlFrame::ListSessions, |f| match f {
+    ///     ControlFrame::SessionList { sessions } => Some(sessions),
+    ///     _ => None,
+    /// }).await?
+    /// ```
+    pub async fn request_typed<T>(
+        &mut self,
+        frame: &ControlFrame,
+        extract: impl FnOnce(ControlFrame) -> Result<T, ControlFrame>,
+    ) -> Result<T, DaemonError> {
+        let response = self.request(frame).await?;
+        match response {
+            ControlFrame::Error { message } => Err(DaemonError::Reported(message)),
+            other => extract(other).map_err(|bad| {
+                DaemonError::Transport(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unexpected response frame: {bad:?}"),
+                ))
+            }),
+        }
+    }
+
     /// Send a frame without waiting for a response.
     pub async fn send(&mut self, frame: &ControlFrame) -> std::io::Result<()> {
         write_control_frame(&mut self.stream, frame).await
@@ -94,19 +158,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin> DaemonConnection<S> {
     }
 }
 
-/// Try to connect to the daemon's control pipe.
+/// Try to connect to the daemon's default control pipe.
 ///
 /// Returns `Ok(connection)` if the daemon is running and the pipe exists.
 /// Returns `Err` with `NotFound` if the daemon is not running.
 #[cfg(windows)]
 pub async fn connect() -> std::io::Result<DaemonConnection<tokio::net::windows::named_pipe::NamedPipeClient>> {
+    connect_to(CONTROL_PIPE_NAME).await
+}
+
+/// Try to connect to a specific control pipe by name. Production callers
+/// should use [`connect`]; the integration test harness uses this to reach
+/// a headless daemon running on a unique per-test pipe.
+#[cfg(windows)]
+pub async fn connect_to(
+    pipe_name: &str,
+) -> std::io::Result<DaemonConnection<tokio::net::windows::named_pipe::NamedPipeClient>> {
     use tokio::net::windows::named_pipe::ClientOptions;
 
-    let client = ClientOptions::new().open(CONTROL_PIPE_NAME)?;
+    let client = ClientOptions::new().open(pipe_name)?;
     Ok(DaemonConnection::new(client))
 }
 
-/// Try to connect to the daemon's control pipe with retries.
+/// Try to connect to the daemon's default control pipe with retries.
 ///
 /// Retries for `timeout` duration with 100ms intervals.
 /// Useful after spawning the daemon to wait for it to become ready.
@@ -114,11 +188,20 @@ pub async fn connect() -> std::io::Result<DaemonConnection<tokio::net::windows::
 pub async fn connect_with_retry(
     timeout: std::time::Duration,
 ) -> std::io::Result<DaemonConnection<tokio::net::windows::named_pipe::NamedPipeClient>> {
+    connect_to_with_retry(CONTROL_PIPE_NAME, timeout).await
+}
+
+/// Like [`connect_with_retry`], but against an explicit pipe name.
+#[cfg(windows)]
+pub async fn connect_to_with_retry(
+    pipe_name: &str,
+    timeout: std::time::Duration,
+) -> std::io::Result<DaemonConnection<tokio::net::windows::named_pipe::NamedPipeClient>> {
     use tokio::net::windows::named_pipe::ClientOptions;
 
     let start = std::time::Instant::now();
     loop {
-        match ClientOptions::new().open(CONTROL_PIPE_NAME) {
+        match ClientOptions::new().open(pipe_name) {
             Ok(client) => return Ok(DaemonConnection::new(client)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if start.elapsed() >= timeout {

@@ -1,4 +1,5 @@
 pub mod daemon;
+pub mod lifecycle;
 pub mod notify;
 pub mod prune;
 pub mod repo;

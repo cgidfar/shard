@@ -10,6 +10,7 @@ use shard_transport::protocol::{self, ActivityState, Frame};
 use shard_transport::transport_windows::NamedPipeTransport;
 use shard_transport::SessionTransport;
 
+use crate::daemon_ipc;
 use crate::state::{AppState, SessionConnection, SessionWriter};
 
 #[derive(Clone, serde::Serialize)]
@@ -161,17 +162,16 @@ pub fn create_session(
 
     let command = command.unwrap_or_else(default_command);
 
-    // Best-effort: install harness hooks
-    let shardctl = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("shardctl.exe")));
-    if let Some(ref exe) = shardctl {
-        if exe.exists() && !shard_core::hooks::claude_code_hooks_installed() {
-            let _ = shard_core::hooks::install_claude_code_hooks(exe);
-        }
-    }
-
-    // Route through daemon
+    // Route through daemon. Harness-hook installation is a separate
+    // RPC so the read-modify-write on `~/.claude/settings.json` is
+    // serialized across CLI and GUI spawns (Phase 5).
+    //
+    // We always request the Claude Code installer regardless of the
+    // session's selected harness — the RPC's `harness` arg is the
+    // install target, not the session's harness. This preserves the
+    // pre-Phase-5 opportunistic-install behavior where Codex sessions
+    // still get Claude hooks bootstrapped. Changing that is a UX
+    // decision, not a plumbing change.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -187,6 +187,21 @@ pub fn create_session(
         conn.handshake()
             .await
             .map_err(|e| format!("daemon handshake failed: {e}"))?;
+
+        // Hooks install round-trip — non-fatal. A hooks failure must
+        // not block session spawn (today's behavior preserved).
+        match crate::daemon_ipc::install_harness_hooks("claude-code").await {
+            Ok((installed, skipped_reason)) => {
+                tracing::info!(
+                    installed,
+                    skipped_reason = skipped_reason.as_deref(),
+                    "hooks install ack",
+                );
+            }
+            Err(e) => {
+                tracing::warn!("hooks install failed: {e}");
+            }
+        }
 
         let response = conn
             .request(&ControlFrame::SpawnSession {
@@ -271,14 +286,20 @@ pub async fn stop_session(
     force: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let session_store = SessionStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
-    let (repo, session) = session_store.find_by_id(&id).map_err(|e| e.to_string())?;
+    // Route through the daemon's `StopSession` RPC so the daemon can drain
+    // the supervisor, clear its live-registry entry, and write the DB
+    // status in one workflow. The previous direct-pipe path hit SHA-43
+    // (supervisor silently discards stop frames sent as the first frame)
+    // and left the daemon's in-memory registry populated, which then
+    // caused `RemoveSession` to reject with "still live — stop it first".
+    let (_repo, session) = daemon_ipc::find_session_by_id(&id).await?;
 
     if session.status != "running" && session.status != "starting" {
         return Ok(());
     }
 
-    // Abort any existing monitor/attach task FIRST to avoid DB update races
+    // Abort any existing monitor/attach task before sending the stop so
+    // the daemon's drain doesn't race the Tauri reader on the same pipe.
     {
         let mut conns = state.connections.lock().await;
         if let Some(conn) = conns.remove(&id) {
@@ -286,57 +307,15 @@ pub async fn stop_session(
         }
     }
 
-    let frame = if force {
-        Frame::StopForce
-    } else {
-        Frame::StopGraceful
-    };
-
-    let transport_addr = session.transport_addr.clone();
-
-    let rpc_ok = match NamedPipeTransport::connect(&transport_addr).await {
-        Ok(mut client) => {
-            let _ = protocol::write_frame(&mut client, &frame).await;
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                loop {
-                    match protocol::read_frame(&mut client).await {
-                        // Only break on lifecycle Status (codes 0-2), not activity frames
-                        Ok(Some(Frame::Status { code })) if code <= 2 => return,
-                        Ok(None) => return,
-                        _ => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
-                    }
-                }
-            })
-            .await;
-            true
-        }
-        Err(_) => false,
-    };
-
-    if !rpc_ok {
-        use shard_supervisor::process::{PlatformProcessControl, ProcessControl};
-        if let Some(pid) = session.child_pid {
-            let _ = PlatformProcessControl::terminate(pid);
-        }
-        if let Some(pid) = session.supervisor_pid {
-            let _ = PlatformProcessControl::terminate(pid);
-        }
-    }
-
-    session_store
-        .update_status(&repo, &id, "stopped", None)
-        .map_err(|e| e.to_string())?;
+    daemon_ipc::stop_session(&id, force).await?;
     let _ = app.emit("sidebar-changed", ());
     Ok(())
 }
 
 #[tauri::command]
-pub fn remove_session(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    let session_store = SessionStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
-    let (repo, _) = session_store.find_by_id(&id).map_err(|e| e.to_string())?;
-    session_store
-        .remove(&repo, &id)
-        .map_err(|e| e.to_string())?;
+pub async fn remove_session(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let (repo, _) = daemon_ipc::find_session_by_id(&id).await?;
+    daemon_ipc::remove_session(&repo, &id).await?;
     let _ = app.emit("sidebar-changed", ());
     Ok(())
 }
@@ -348,8 +327,7 @@ pub async fn attach_session(
     channel: Channel<Response>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let session_store = SessionStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
-    let (_repo, session) = session_store.find_by_id(&id).map_err(|e| e.to_string())?;
+    let (_repo, session) = daemon_ipc::find_session_by_id(&id).await?;
 
     if session.status != "running" {
         return Err(format!(
@@ -477,16 +455,13 @@ pub async fn resize_session(
 }
 
 #[tauri::command]
-pub fn rename_session(
+pub async fn rename_session(
     app: tauri::AppHandle,
     id: String,
     label: Option<String>,
 ) -> Result<(), String> {
-    let session_store = SessionStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
-    let (repo, _) = session_store.find_by_id(&id).map_err(|e| e.to_string())?;
-    session_store
-        .rename(&repo, &id, label.as_deref())
-        .map_err(|e| e.to_string())?;
+    let (repo, _) = daemon_ipc::find_session_by_id(&id).await?;
+    daemon_ipc::rename_session(&repo, &id, label).await?;
     let _ = app.emit("sidebar-changed", ());
     Ok(())
 }
@@ -504,11 +479,14 @@ pub async fn detach_session(
             conn.abort();
         }
     }
-    // Lock released — safe to do DB I/O without blocking write_to_session/resize_session
+    // Lock released — safe to do IPC without blocking write_to_session/resize_session
 
-    // If session is still running, start a monitor so sidebar keeps getting updates
-    let session_store = SessionStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
-    if let Ok((_repo, session)) = session_store.find_by_id(&id) {
+    // Resolve through the daemon. The detach probe and the monitor-restart
+    // lookup are the same operation: a single FindSessionById tells us both
+    // whether the id is still valid and gives us the transport addr we'd
+    // need to re-monitor. Drop the redundant DetachSession probe — it
+    // returned the same answer find_session_by_id already gives us.
+    if let Ok((_repo, session)) = daemon_ipc::find_session_by_id(&id).await {
         if session.status == "running" {
             let task = start_monitor(app, id.clone(), session.transport_addr);
             let mut conns = state.connections.lock().await;

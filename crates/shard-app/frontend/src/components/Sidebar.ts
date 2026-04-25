@@ -3,7 +3,6 @@ import {
   listWorkspaces,
   listSessions,
   removeSession,
-  removeWorkspace,
   renameSession,
   stopSession,
   type Repository,
@@ -29,6 +28,7 @@ export interface SidebarCallbacks {
   onSessionClosed: (sessionId: string) => void;
   onCreateSession: (repo: string, workspace: string) => void;
   onCreateWorkspace: (repo: string) => void;
+  onRemoveWorkspace: (repo: string, workspace: string, sessionIds: string[]) => void;
   onLabelChanged?: (sessionId: string, label: string) => void;
 }
 
@@ -128,6 +128,18 @@ export class Sidebar {
       }
     }
     return false;
+  }
+
+  getSessionIdsForWorkspace(repo: string, workspace: string): string[] {
+    for (const rt of this.tree) {
+      if (rt.repo.alias !== repo) continue;
+      for (const entry of rt.workspaces) {
+        if (entry.workspace.name === workspace) {
+          return entry.sessions.map((s) => s.session.id);
+        }
+      }
+    }
+    return [];
   }
 
   setActiveSession(sessionId: string | null) {
@@ -432,9 +444,11 @@ export class Sidebar {
             `Remove workspace "${workspace.name}" from ${repo.alias}?\n\nThis only removes the record; any remaining files are left alone.`,
           );
           if (!ok) return;
-          removeWorkspace(repo.alias, workspace.name)
-            .then(() => this.refresh())
-            .catch((err) => alert(`Failed to remove workspace: ${err}`));
+          this.callbacks.onRemoveWorkspace(
+            repo.alias,
+            workspace.name,
+            sessions.map((si) => si.session.id),
+          );
         });
         wsGroup.appendChild(removeWsBtn);
 
@@ -575,7 +589,10 @@ export class Sidebar {
               closeBtn.title = "Remove session";
               closeBtn.addEventListener("click", (e) => {
                 e.stopPropagation();
-                removeSession(si.session.id).then(() => this.refresh());
+                this.callbacks.onSessionClosed(si.session.id);
+                removeSession(si.session.id)
+                  .then(() => this.refresh())
+                  .catch((err) => alert(`Failed to remove session: ${err}`));
               });
             }
 

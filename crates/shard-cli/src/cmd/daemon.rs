@@ -22,6 +22,9 @@ use tracing::{error, info, warn};
 
 use shard_core::repos::RepositoryStore;
 use shard_core::sessions::SessionStore;
+use shard_core::workspaces::{
+    self as workspaces, default_git_ops, WorkspaceGitOps, WorkspaceStore,
+};
 use shard_core::{ShardPaths, APP_EXE, APP_NAME};
 use shard_supervisor::job_object::DaemonJobGuard;
 use shard_supervisor::process::{PlatformProcessControl, ProcessControl};
@@ -49,7 +52,8 @@ use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::window::WindowId;
 
 /// In-memory record of a live supervised session.
-pub(crate) struct LiveSession {
+#[doc(hidden)]
+pub struct LiveSession {
     pub session_id: String,
     pub supervisor_pid: u32,
     pub transport_addr: String,
@@ -57,6 +61,12 @@ pub(crate) struct LiveSession {
     pub workspace: String,
     pub creation_time: u64,
 }
+
+#[cfg(windows)]
+const SESSION_MUTATION_STOP_TIMEOUT: Duration = Duration::from_secs(8);
+
+#[cfg(windows)]
+const SUPERVISOR_EXIT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Snapshot of the minimum session info the tray quit path needs,
 /// captured under the `DaemonState.sessions` lock and then released so the
@@ -71,7 +81,7 @@ struct LiveSessionSnapshot {
 
 /// Shutdown mode for the daemon.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum ShutdownMode {
+pub enum ShutdownMode {
     Running,
     Graceful,
     Force,
@@ -639,9 +649,32 @@ async fn stop_all_graceful(snapshots: Vec<LiveSessionSnapshot>, overall_deadline
     }
 }
 
-/// Send `Resume { u64::MAX }` as the connection-type probe (registers as a
-/// monitor-only client and skips log replay since `MAX > live_offset`), then
-/// send `StopGraceful`, then wait for a `Status` frame or pipe EOF.
+/// Outcome of a drain-only stop attempt.
+#[derive(Debug)]
+#[cfg(windows)]
+pub(crate) enum DrainOutcome {
+    /// Supervisor responded with a lifecycle `Status` frame (or EOF'd) before
+    /// the timeout fired.
+    Exited,
+    /// Timeout fired before the supervisor exited.
+    TimedOut,
+}
+
+/// Outcome of a stop-and-wait attempt.
+#[derive(Debug)]
+#[cfg(windows)]
+#[allow(dead_code)] // consumed by RemoveWorkspace handler in Phase 1
+pub(crate) enum StopOutcome {
+    /// Supervisor exited gracefully within the timeout window.
+    Exited,
+    /// Graceful window expired and we had to force-kill the supervisor PID
+    /// via `TerminateProcess`. The process is no longer live.
+    ForceKilled,
+}
+
+/// Connect to a session pipe, send the standard Resume+StopGraceful probe,
+/// and drain until a lifecycle `Status` frame or pipe EOF — or the timeout
+/// fires. Returns `DrainOutcome::TimedOut` on timeout; does NOT force-kill.
 ///
 /// The initial `Resume` frame is load-bearing: the supervisor's accept
 /// handler only dispatches stop frames via the *post-first-frame* recv loop
@@ -649,7 +682,10 @@ async fn stop_all_graceful(snapshots: Vec<LiveSessionSnapshot>, overall_deadline
 /// `StopGraceful` as the first frame would be silently discarded. See
 /// SHA-43 for the matching bug in the existing non-tray callers.
 #[cfg(windows)]
-async fn stop_one_graceful(transport_addr: &str) -> shard_core::Result<()> {
+async fn stop_and_drain(
+    transport_addr: &str,
+    graceful_timeout: Duration,
+) -> shard_core::Result<DrainOutcome> {
     use shard_core::ShardError;
     use shard_transport::protocol::{read_frame, write_frame, Frame};
 
@@ -670,23 +706,172 @@ async fn stop_one_graceful(transport_addr: &str) -> shard_core::Result<()> {
         .await
         .map_err(|e| ShardError::Other(format!("stop-graceful write: {e}")))?;
 
-    // Wait for a lifecycle Status frame or pipe EOF. Skip any PTY output
-    // frames that the supervisor fans out in the drain window.
-    loop {
-        match read_frame(&mut client).await {
-            Ok(Some(Frame::Status { code })) if code <= 2 => return Ok(()),
-            Ok(None) => return Ok(()),
-            Ok(Some(_)) => continue,
-            Err(e) => return Err(ShardError::Other(format!("read: {e}"))),
+    let drain = async {
+        loop {
+            match read_frame(&mut client).await {
+                Ok(Some(Frame::Status { code })) if code <= 2 => return Ok::<(), ShardError>(()),
+                Ok(None) => return Ok(()),
+                Ok(Some(_)) => continue,
+                Err(e) => return Err(ShardError::Other(format!("read: {e}"))),
+            }
+        }
+    };
+
+    match tokio::time::timeout(graceful_timeout, drain).await {
+        Ok(Ok(())) => Ok(DrainOutcome::Exited),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Ok(DrainOutcome::TimedOut),
+    }
+}
+
+/// Drain a supervisor's graceful stop and, on timeout, force-kill the PID.
+///
+/// Used by mutation workflows (e.g., `RemoveWorkspace`) that need the
+/// supervisor's child shell to actually relinquish its CWD — the open
+/// handle otherwise blocks `RemoveDirectoryW` and produces the SHA-55
+/// class of failure.
+///
+/// `creation_time` is the FILETIME captured when the daemon originally
+/// spawned (or adopted) this supervisor. It's compared against the live
+/// process's creation time before `TerminateProcess` fires, so a recycled
+/// PID is never killed. Pass `0` only when the caller explicitly trusts
+/// the PID (no recycle check) — not recommended outside legacy paths.
+#[cfg(windows)]
+#[allow(dead_code)] // consumed by RemoveWorkspace handler in Phase 1
+pub(crate) async fn stop_session_and_wait(
+    transport_addr: &str,
+    supervisor_pid: u32,
+    creation_time: u64,
+    graceful_timeout: Duration,
+) -> shard_core::Result<StopOutcome> {
+    match stop_and_drain(transport_addr, graceful_timeout).await? {
+        DrainOutcome::Exited => {
+            match shard_supervisor::process_windows::wait_for_pid_exit_checked(
+                supervisor_pid,
+                creation_time,
+                SUPERVISOR_EXIT_CONFIRM_TIMEOUT,
+            ) {
+                Ok(true) => Ok(StopOutcome::Exited),
+                Ok(false) => {
+                    warn!(
+                        "stop_session_and_wait: pid={supervisor_pid} sent status but remained live for {:?}, force-killing",
+                        SUPERVISOR_EXIT_CONFIRM_TIMEOUT
+                    );
+                    shard_supervisor::process_windows::force_kill_pid_checked(
+                        supervisor_pid,
+                        creation_time,
+                    )
+                    .map_err(|e| {
+                        shard_core::ShardError::Other(format!(
+                            "force-kill pid {supervisor_pid} after status failed: {e}"
+                        ))
+                    })?;
+                    Ok(StopOutcome::ForceKilled)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    warn!(
+                        "stop_session_and_wait: pid={supervisor_pid} sent status but failed the exit wait guard ({e}); trusting the status frame"
+                    );
+                    Ok(StopOutcome::Exited)
+                }
+                Err(e) => Err(shard_core::ShardError::Other(format!(
+                    "wait for pid {supervisor_pid} exit failed: {e}"
+                ))),
+            }
+        }
+        DrainOutcome::TimedOut => {
+            warn!(
+                "stop_session_and_wait: pid={supervisor_pid} did not exit within {:?}, force-killing",
+                graceful_timeout
+            );
+            shard_supervisor::process_windows::force_kill_pid_checked(
+                supervisor_pid,
+                creation_time,
+            )
+            .map_err(|e| {
+                shard_core::ShardError::Other(format!(
+                    "force-kill pid {supervisor_pid} failed: {e}"
+                ))
+            })?;
+            Ok(StopOutcome::ForceKilled)
         }
     }
 }
 
+/// Legacy wrapper for the tray-initiated parallel-graceful-stop path. The
+/// tray quit uses a 3s global budget and relies on the daemon's Job Object
+/// to clean up stragglers, so no per-session force-kill is issued here.
+#[cfg(windows)]
+async fn stop_one_graceful(transport_addr: &str) -> shard_core::Result<()> {
+    match stop_and_drain(transport_addr, Duration::from_secs(3)).await? {
+        DrainOutcome::Exited => Ok(()),
+        DrainOutcome::TimedOut => Ok(()),
+    }
+}
+
+/// Runtime configuration for a daemon instance. Production uses
+/// `DaemonConfig::production()` (real ShardPaths, well-known pipe name,
+/// real git). Integration tests construct a config with a `TempDir`-backed
+/// `ShardPaths`, a unique pipe name, and (optionally) a fault-injecting
+/// git-ops impl.
+#[derive(Clone)]
+pub struct DaemonConfig {
+    pub paths: ShardPaths,
+    pub control_pipe_name: String,
+    /// Git operations layer used by mutation handlers. Tests can substitute
+    /// a stub to force `worktree_remove` failures and exercise the
+    /// `broken` state transition in `RemoveWorkspace`.
+    pub git_ops: Arc<dyn WorkspaceGitOps>,
+    /// Integration-test override for the user home directory the
+    /// `InstallHarnessHooks` handler queries / writes. `None` in production
+    /// — the handler resolves `directories::UserDirs::new()` at call time.
+    ///
+    /// Explicit-path injection is deliberate: `std::env::set_var` became
+    /// `unsafe` in newer Rust toolchains and `serial_test` isn't in the
+    /// workspace, so the test seam lives in the config struct rather than
+    /// an env var.
+    pub hooks_home_override: Option<PathBuf>,
+    /// Integration-test override for `state.exe_path`. Production leaves
+    /// this `None` and the daemon uses `std::env::current_exe()` (which
+    /// IS the shardctl binary since the daemon is invoked as `shardctl
+    /// daemon start`). Tests set a fake path ending in `shardctl.exe`
+    /// because the hooks predicate identifies shard-owned entries via
+    /// a `"shardctl"` substring match on the rendered command — a test
+    /// binary path (e.g. `hooks_install-<hash>.exe`) would otherwise
+    /// masquerade as a third-party entry the installer / predicate
+    /// refuses to touch.
+    pub exe_path_override: Option<PathBuf>,
+}
+
+impl DaemonConfig {
+    /// Config that matches the production daemon: env-resolved ShardPaths +
+    /// the well-known `CONTROL_PIPE_NAME` + real git.
+    pub fn production() -> shard_core::Result<Self> {
+        Ok(Self {
+            paths: ShardPaths::new()?,
+            control_pipe_name: CONTROL_PIPE_NAME.to_string(),
+            git_ops: default_git_ops(),
+            hooks_home_override: None,
+            exe_path_override: None,
+        })
+    }
+}
+
 /// Shared daemon state.
-pub(crate) struct DaemonState {
+///
+/// Public-but-hidden so the integration-test harness can inject fake
+/// sessions and inspect internal maps. Not part of the supported API
+/// surface — external callers should use the RPC layer.
+#[doc(hidden)]
+pub struct DaemonState {
     pub(crate) sessions: Mutex<HashMap<String, LiveSession>>,
-    job_guard: DaemonJobGuard,
+    pub(crate) job_guard: DaemonJobGuard,
     pub(crate) paths: ShardPaths,
+    /// Named-pipe address the control server listens on. In production this
+    /// is the compile-time `CONTROL_PIPE_NAME`; tests override it with a
+    /// per-test unique name so the in-process daemon can run alongside a
+    /// real one on the developer's machine.
+    pub(crate) control_pipe_name: String,
     exe_path: PathBuf,
     shutdown_tx: watch::Sender<ShutdownMode>,
     /// Set to `true` the moment the user confirms a tray quit. The control
@@ -695,13 +880,65 @@ pub(crate) struct DaemonState {
     /// graceful drain window cannot spawn a new supervisor under a daemon
     /// that is about to drop its Job Object and kill everything.
     quitting: std::sync::atomic::AtomicBool,
-    /// Proxy to send events to the tray icon event loop.
+    /// Proxy to send events to the tray icon event loop. `None` in the
+    /// headless test daemon — callers must null-check before sending.
     #[cfg(windows)]
-    pub(crate) tray_proxy: EventLoopProxy<TrayEvent>,
+    pub(crate) tray_proxy: Option<EventLoopProxy<TrayEvent>>,
     /// Handle to the WorkspaceMonitor task. Set once, during
     /// `run_control_loop` startup; read by control-pipe clients that
     /// subscribe to state updates or send topology pokes.
     monitor: std::sync::OnceLock<crate::cmd::workspace_monitor::MonitorHandle>,
+    /// Per-workspace lifecycle gate (D12). Mutation RPCs use this to
+    /// serialize against concurrent operations on the same workspace and
+    /// to expose a typed "being deleted" error for spawn/create. Kept as
+    /// an `Arc` so `DeleteGuard`s can outlive the handler frame.
+    #[doc(hidden)]
+    pub lifecycle: Arc<crate::cmd::lifecycle::LifecycleRegistry>,
+    /// Per-repo mutation mutex. Serializes `CreateWorkspace` and
+    /// `RemoveWorkspace` against each other on the same repo so their
+    /// critical sections cannot interleave (Codex round-2 finding). The
+    /// lifecycle gate alone isn't enough because
+    /// `begin_delete`/`check_can_mutate` are independent atomic steps
+    /// around a non-atomic DB-plus-git workflow — a Remove for an
+    /// as-yet-absent name can still Ack while a concurrent Create is
+    /// partway through committing the row.
+    ///
+    /// Per-repo (not per-workspace) is intentional: in a single-user
+    /// app, coarse-grained blocking is cheap and keeps the state
+    /// machine simple. If concurrent mutations on different workspaces
+    /// of the same repo become a measured bottleneck, narrow later.
+    repo_mutation_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Git operations used by mutation handlers (test seam).
+    pub(crate) git_ops: Arc<dyn WorkspaceGitOps>,
+    /// Serializes `InstallHarnessHooks` across the whole query+install
+    /// sequence. User-global scope (not per-repo) because
+    /// `~/.claude/settings.json` is shared by every repo — a concurrent
+    /// install from a CLI `session create` and a GUI `Spawn` would
+    /// otherwise race the read-modify-write. Wrapping query+install
+    /// (not just install) is load-bearing: checking
+    /// `claude_code_hooks_installed` outside the lock and only grabbing
+    /// it for the write still races two installers into duplicate writes.
+    pub(crate) hooks_install_lock: tokio::sync::Mutex<()>,
+    /// Integration-test override for the user home directory the
+    /// `InstallHarnessHooks` handler operates against. `None` in
+    /// production — the handler resolves the real user dir via
+    /// `directories::UserDirs::new()`. See `DaemonConfig::hooks_home_override`.
+    pub(crate) hooks_home_override: Option<PathBuf>,
+}
+
+impl DaemonState {
+    /// Return (creating if absent) the per-repo mutation lock. Held by
+    /// `handle_create_workspace` and `handle_remove_workspace` across their
+    /// critical sections.
+    pub(crate) async fn acquire_repo_mutation_lock(
+        self: &Arc<Self>,
+        repo: &str,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.repo_mutation_locks.lock().await;
+        map.entry(repo.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
 }
 
 pub fn run(command: DaemonCommands) -> shard_core::Result<()> {
@@ -710,6 +947,129 @@ pub fn run(command: DaemonCommands) -> shard_core::Result<()> {
         DaemonCommands::Stop => stop_daemon(),
         DaemonCommands::Status => status_daemon(),
     }
+}
+
+/// Build a headless `DaemonState` for the integration test harness.
+///
+/// Separate from [`run_headless_daemon`] so tests can keep a handle to the
+/// state while the control loop runs on a spawned task — lets them inject
+/// fake sessions or inspect the lifecycle registry mid-test.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn build_headless_state(
+    config: DaemonConfig,
+    shutdown_tx: watch::Sender<ShutdownMode>,
+) -> shard_core::Result<Arc<DaemonState>> {
+    config.paths.ensure_dirs()?;
+
+    let job_guard = DaemonJobGuard::new().map_err(|e| {
+        shard_core::ShardError::Other(format!("Job Object creation failed: {e}"))
+    })?;
+
+    let hooks_home_override = config.hooks_home_override.clone();
+    let exe_path = match config.exe_path_override.clone() {
+        Some(p) => p,
+        None => std::env::current_exe()?,
+    };
+
+    Ok(Arc::new(DaemonState {
+        sessions: Mutex::new(HashMap::new()),
+        job_guard,
+        paths: config.paths,
+        control_pipe_name: config.control_pipe_name,
+        exe_path,
+        shutdown_tx,
+        quitting: std::sync::atomic::AtomicBool::new(false),
+        tray_proxy: None,
+        monitor: std::sync::OnceLock::new(),
+        lifecycle: Arc::new(crate::cmd::lifecycle::LifecycleRegistry::new()),
+        repo_mutation_locks: tokio::sync::Mutex::new(HashMap::new()),
+        git_ops: config.git_ops,
+        hooks_install_lock: tokio::sync::Mutex::new(()),
+        hooks_home_override,
+    }))
+}
+
+/// Run the headless daemon given a pre-built state.
+#[cfg(windows)]
+#[doc(hidden)]
+pub async fn run_headless_daemon_with_state(
+    state: Arc<DaemonState>,
+    shutdown_rx: watch::Receiver<ShutdownMode>,
+) -> shard_core::Result<()> {
+    adopt_orphans(state.clone()).await;
+    run_control_loop(state, shutdown_rx).await;
+    Ok(())
+}
+
+/// Headless entry point for the integration test harness.
+///
+/// Runs `adopt_orphans` + `run_control_loop` on the caller's tokio runtime,
+/// with no tray and no winit event loop. Exits cleanly once `shutdown_rx`
+/// observes a non-`Running` value.
+#[cfg(windows)]
+pub async fn run_headless_daemon(
+    config: DaemonConfig,
+    shutdown_tx: watch::Sender<ShutdownMode>,
+    shutdown_rx: watch::Receiver<ShutdownMode>,
+) -> shard_core::Result<()> {
+    let state = build_headless_state(config, shutdown_tx)?;
+    run_headless_daemon_with_state(state, shutdown_rx).await
+}
+
+// ── Test-support surface ────────────────────────────────────────────────────
+//
+// These helpers are public-but-hidden to keep the surface small. Production
+// callers never need them.
+
+/// Inject a fake `LiveSession` record into the daemon's live registry. Used
+/// by integration tests to simulate a session-bound workspace without
+/// actually spawning a supervisor child process.
+#[cfg(windows)]
+#[doc(hidden)]
+pub async fn test_inject_live_session(
+    state: &Arc<DaemonState>,
+    session_id: String,
+    supervisor_pid: u32,
+    transport_addr: String,
+    repo: String,
+    workspace: String,
+    creation_time: u64,
+) {
+    let mut sessions = state.sessions.lock().await;
+    sessions.insert(
+        session_id.clone(),
+        LiveSession {
+            session_id,
+            supervisor_pid,
+            transport_addr,
+            repo,
+            workspace,
+            creation_time,
+        },
+    );
+}
+
+/// Observe the current number of live sessions known to the daemon.
+#[cfg(windows)]
+#[doc(hidden)]
+pub async fn test_live_session_count(state: &Arc<DaemonState>) -> usize {
+    state.sessions.lock().await.len()
+}
+
+/// Check whether the lifecycle registry believes the given workspace is
+/// currently accepting mutations. Returns the error if blocked.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn test_lifecycle_check(
+    state: &Arc<DaemonState>,
+    repo: &str,
+    name: &str,
+) -> Result<(), String> {
+    state
+        .lifecycle
+        .check_can_mutate(repo, name)
+        .map_err(|e| e.to_string())
 }
 
 /// Entry point for the daemon process. Sets up logging, control pipe, and tray.
@@ -770,11 +1130,17 @@ fn run_daemon() -> shard_core::Result<()> {
         sessions: Mutex::new(HashMap::new()),
         job_guard,
         paths: paths.clone(),
+        control_pipe_name: CONTROL_PIPE_NAME.to_string(),
         exe_path,
         shutdown_tx: shutdown_tx.clone(),
         quitting: std::sync::atomic::AtomicBool::new(false),
-        tray_proxy,
+        tray_proxy: Some(tray_proxy),
         monitor: std::sync::OnceLock::new(),
+        lifecycle: Arc::new(crate::cmd::lifecycle::LifecycleRegistry::new()),
+        repo_mutation_locks: tokio::sync::Mutex::new(HashMap::new()),
+        git_ops: default_git_ops(),
+        hooks_install_lock: tokio::sync::Mutex::new(()),
+        hooks_home_override: None,
     });
 
     // Build the tokio runtime on the main thread and share it via Arc. The
@@ -820,7 +1186,9 @@ fn run_daemon() -> shard_core::Result<()> {
             // At 100ms intervals this is acceptable for a background watcher.
             loop {
                 if *watcher_rx.borrow() != ShutdownMode::Running {
-                    let _ = watcher_proxy.send_event(TrayEvent::Quit);
+                    if let Some(proxy) = &watcher_proxy {
+                        let _ = proxy.send_event(TrayEvent::Quit);
+                    }
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(100));
@@ -953,8 +1321,26 @@ fn is_daemon_running() -> bool {
 
 /// Main async loop: control pipe server + WorkspaceMonitor.
 async fn run_control_loop(state: Arc<DaemonState>, mut shutdown_rx: watch::Receiver<ShutdownMode>) {
+    // Populate the lifecycle registry with every known workspace so
+    // mutation RPCs can look them up. Cheap: a single DB scan at startup.
+    // Best-effort — if the DB is unavailable the registry stays empty and
+    // handlers fall back to on-demand registration.
+    {
+        let repo_store = RepositoryStore::new(state.paths.clone());
+        let ws_store = WorkspaceStore::new(state.paths.clone());
+        if let Ok(repos) = repo_store.list() {
+            for repo in &repos {
+                if let Ok(workspaces) = ws_store.list(&repo.alias) {
+                    for ws in &workspaces {
+                        state.lifecycle.register_active(&repo.alias, &ws.name);
+                    }
+                }
+            }
+        }
+    }
+
     // Create the first control pipe instance
-    let server = match create_pipe_instance(CONTROL_PIPE_NAME, true) {
+    let server = match create_pipe_instance(&state.control_pipe_name, true) {
         Ok(s) => s,
         Err(e) => {
             error!("Failed to create control pipe: {e}");
@@ -1019,7 +1405,7 @@ async fn accept_loop(
                     Ok(()) => {
                         // Client connected to this instance. Create next instance before handling.
                         let connected = server;
-                        server = match create_pipe_instance(CONTROL_PIPE_NAME, false) {
+                        server = match create_pipe_instance(&state.control_pipe_name, false) {
                             Ok(s) => s,
                             Err(e) => {
                                 error!("Failed to create next pipe instance: {e}");
@@ -1208,6 +1594,13 @@ async fn run_subscribe_loop(
                             return Ok(());
                         }
                     }
+                    Ok(ChangeKind::WorkspaceRemoved { repo, name }) => {
+                        let frame = ControlFrame::WorkspaceRemoved { repo, name };
+                        if let Err(e) = write_control_frame(&mut stream, &frame).await {
+                            info!("subscribe: client disconnected ({e})");
+                            return Ok(());
+                        }
+                    }
                     Err(RecvError::Lagged(n)) => {
                         // We may have dropped both State and Sessions events.
                         // Re-send a full snapshot per repo AND a SessionsChanged
@@ -1253,7 +1646,17 @@ async fn dispatch_request(state: &Arc<DaemonState>, frame: ControlFrame) -> Cont
         .load(std::sync::atomic::Ordering::Acquire)
         && matches!(
             frame,
-            ControlFrame::SpawnSession { .. } | ControlFrame::StopSession { .. }
+            ControlFrame::SpawnSession { .. }
+                | ControlFrame::StopSession { .. }
+                | ControlFrame::CreateWorkspace { .. }
+                | ControlFrame::RemoveWorkspace { .. }
+                | ControlFrame::AddRepo { .. }
+                | ControlFrame::RemoveRepo { .. }
+                | ControlFrame::SyncRepo { .. }
+                | ControlFrame::RemoveSession { .. }
+                | ControlFrame::RenameSession { .. }
+                | ControlFrame::DetachSession { .. }
+                | ControlFrame::InstallHarnessHooks { .. }
         )
     {
         return ControlFrame::Error {
@@ -1273,6 +1676,43 @@ async fn dispatch_request(state: &Arc<DaemonState>, frame: ControlFrame) -> Cont
 
         ControlFrame::StopSession { session_id, force } => {
             handle_stop(state, session_id, force).await
+        }
+
+        ControlFrame::RemoveWorkspace { repo, name } => {
+            handle_remove_workspace(state, repo, name).await
+        }
+
+        ControlFrame::CreateWorkspace {
+            repo,
+            name,
+            mode,
+            branch,
+        } => handle_create_workspace(state, repo, name, mode, branch).await,
+
+        ControlFrame::ListWorkspaces { repo } => handle_list_workspaces(state, repo).await,
+
+        ControlFrame::ListBranchInfo { repo } => handle_list_branch_info(state, repo).await,
+
+        ControlFrame::AddRepo { url, alias } => handle_add_repo(state, url, alias).await,
+
+        ControlFrame::RemoveRepo { alias } => handle_remove_repo(state, alias).await,
+
+        ControlFrame::SyncRepo { alias } => handle_sync_repo(state, alias).await,
+
+        ControlFrame::ListRepos => handle_list_repos(state).await,
+
+        ControlFrame::RemoveSession { repo, id } => handle_remove_session(state, repo, id).await,
+
+        ControlFrame::RenameSession { repo, id, label } => {
+            handle_rename_session(state, repo, id, label).await
+        }
+
+        ControlFrame::DetachSession { id } => handle_detach_session(state, id).await,
+
+        ControlFrame::FindSessionById { prefix } => handle_find_session_by_id(state, prefix).await,
+
+        ControlFrame::InstallHarnessHooks { harness } => {
+            handle_install_harness_hooks(state, harness).await
         }
 
         ControlFrame::ListSessions => {
@@ -1302,6 +1742,21 @@ async fn dispatch_request(state: &Arc<DaemonState>, frame: ControlFrame) -> Cont
 }
 
 /// Handle SpawnSession: create DB record, spawn supervisor, assign to job, wait for ready.
+///
+/// **Locking model (Codex Phase 3 finding):** the per-repo mutation lock
+/// is held across the gate re-check, DB row creation, supervisor spawn,
+/// and live-registry insert. Releasing the lock only after `state.sessions`
+/// is populated closes the window where `RemoveRepo` could snapshot
+/// `state.sessions`, miss an in-flight spawn, and then tear down the
+/// repo while the supervisor is still coming up. The 10s ready-file
+/// wait happens *outside* the lock so a slow supervisor startup doesn't
+/// block unrelated AddRepo/RemoveRepo/SyncRepo traffic.
+///
+/// On ready-wait failure the handler cleans up the live-registry entry
+/// and marks the DB row `failed` so the session doesn't linger as a
+/// ghost. Force-kill against the dead / stuck PID is handled by the
+/// 5s fast-tick + Job Object on daemon exit; explicit kill here would
+/// be redundant and could fight a supervisor that's almost-ready.
 async fn handle_spawn(
     state: &Arc<DaemonState>,
     repo: String,
@@ -1309,141 +1764,291 @@ async fn handle_spawn(
     command: Vec<String>,
     harness: Option<String>,
 ) -> ControlFrame {
-    let harness_parsed = harness.as_deref().and_then(|h| h.parse().ok());
     let session_store = SessionStore::new(state.paths.clone());
+    let harness_parsed = harness.as_deref().and_then(|h| h.parse().ok());
 
-    // Derive transport addr and create DB record
-    let session = match session_store.create(&repo, &workspace, &command, "", harness_parsed) {
-        Ok(s) => s,
-        Err(e) => {
-            return ControlFrame::Error {
-                message: format!("failed to create session record: {e}"),
-            }
+    // ── Phase 1: under the per-repo mutation lock ─────────────────────────
+    //
+    // Everything a concurrent RemoveRepo/RemoveWorkspace needs to see
+    // happens inside this block. On success it returns the session
+    // metadata; on any failure it returns an Error frame directly.
+    let spawn_result: Result<(String, u32, String), ControlFrame> = async {
+        let repo_lock = state.acquire_repo_mutation_lock(&repo).await;
+        let _guard = repo_lock.lock().await;
+
+        // Gate check under the lock. Keep this here (not before the
+        // lock) so a RemoveWorkspace that flipped the workspace to
+        // Deleting between our arrival and the lock acquisition is
+        // still caught.
+        if let Err(e) = state.lifecycle.check_can_mutate(&repo, &workspace) {
+            return Err(ControlFrame::Error {
+                message: e.to_string(),
+            });
         }
-    };
 
-    let transport_addr = shard_transport::transport_windows::session_pipe_name(&session.id);
-
-    // Update transport addr in DB
-    if let Err(e) = session_store.update_transport_addr(&repo, &session.id, &transport_addr) {
-        return ControlFrame::Error {
-            message: format!("failed to update transport addr: {e}"),
+        // Derive transport addr and create DB record.
+        let session = match session_store.create(&repo, &workspace, &command, "", harness_parsed)
+        {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(ControlFrame::Error {
+                    message: format!("failed to create session record: {e}"),
+                })
+            }
         };
-    }
 
-    // Build supervisor args
-    let mut args: Vec<String> = vec![
-        "session".to_string(),
-        "serve".to_string(),
-        "--repo".to_string(),
-        repo.clone(),
-        "--workspace".to_string(),
-        workspace.clone(),
-        "--session-id".to_string(),
-        session.id.clone(),
-        "--transport-addr".to_string(),
-        transport_addr.clone(),
-        "--".to_string(),
-    ];
-    args.extend(command);
+        let transport_addr = shard_transport::transport_windows::session_pipe_name(&session.id);
 
-    // Spawn supervisor and assign to job
-    let (pid, handle) = match spawn_detached_with_handle(&state.exe_path, &args) {
-        Ok(result) => result,
-        Err(e) => {
-            return ControlFrame::Error {
-                message: format!("failed to spawn supervisor: {e}"),
-            }
+        if let Err(e) = session_store.update_transport_addr(&repo, &session.id, &transport_addr) {
+            return Err(ControlFrame::Error {
+                message: format!("failed to update transport addr: {e}"),
+            });
         }
+
+        // Build supervisor args.
+        let mut args: Vec<String> = vec![
+            "session".to_string(),
+            "serve".to_string(),
+            "--repo".to_string(),
+            repo.clone(),
+            "--workspace".to_string(),
+            workspace.clone(),
+            "--session-id".to_string(),
+            session.id.clone(),
+            "--transport-addr".to_string(),
+            transport_addr.clone(),
+            "--".to_string(),
+        ];
+        args.extend(command.clone());
+
+        // Spawn supervisor + assign to Job Object.
+        let (pid, handle) = match spawn_detached_with_handle(&state.exe_path, &args) {
+            Ok(result) => result,
+            Err(e) => {
+                // DB row exists but no supervisor — mark it failed so
+                // orphan adoption on next daemon start doesn't trip.
+                let _ = session_store.update_status(&repo, &session.id, "failed", None);
+                return Err(ControlFrame::Error {
+                    message: format!("failed to spawn supervisor: {e}"),
+                });
+            }
+        };
+
+        if let Err(e) = state.job_guard.assign_process(handle) {
+            warn!("Failed to assign supervisor pid={pid} to job: {e}");
+            // Non-fatal — supervisor still works, just won't be killed
+            // on daemon crash.
+        }
+
+        let creation_time = get_process_creation_time(handle).unwrap_or(0);
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+        }
+
+        let _ = session_store.set_supervisor_pid(&repo, &session.id, pid);
+
+        // Register BEFORE releasing the lock so RemoveRepo's snapshot
+        // of state.sessions always sees an in-flight spawn on this
+        // repo. Registered state is authoritative from this point
+        // even though the supervisor hasn't written the ready file
+        // yet — fast-tick will prune the entry if the process dies.
+        {
+            let mut sessions = state.sessions.lock().await;
+            sessions.insert(
+                session.id.clone(),
+                LiveSession {
+                    session_id: session.id.clone(),
+                    supervisor_pid: pid,
+                    transport_addr: transport_addr.clone(),
+                    repo: repo.clone(),
+                    workspace: workspace.clone(),
+                    creation_time,
+                },
+            );
+        }
+
+        Ok((session.id, pid, transport_addr))
+    }
+    .await;
+
+    let (session_id, pid, transport_addr) = match spawn_result {
+        Ok(v) => v,
+        Err(frame) => return frame,
     };
 
-    // Assign to daemon's Job Object
-    if let Err(e) = state.job_guard.assign_process(handle) {
-        warn!("Failed to assign supervisor pid={pid} to job: {e}");
-        // Non-fatal — supervisor still works, just won't be killed on daemon crash
+    // Capture the creation_time we registered so the timeout path can
+    // force-kill safely via the PID-reuse guard.
+    let creation_time: u64 = {
+        let sessions = state.sessions.lock().await;
+        sessions.get(&session_id).map(|s| s.creation_time).unwrap_or(0)
+    };
+
+    // ── Phase 2: ready-file wait outside the lock ─────────────────────────
+    //
+    // The supervisor writes `ready` after binding its pipe. Releasing
+    // the repo mutex here means concurrent AddRepo/SyncRepo on unrelated
+    // operations don't block on slow supervisor startup; a concurrent
+    // RemoveRepo will still see our session in state.sessions and stop
+    // it correctly (graceful via the pipe once it's bound, otherwise
+    // force-kill against the recorded PID+creation_time).
+    enum ReadyOutcome {
+        Ok,
+        /// Process is still alive but didn't write the ready file in time.
+        /// Force-kill required so it doesn't zombie on and later flip the
+        /// DB row back to `running` after we've already marked it failed
+        /// (Codex Phase 3 round-2 finding).
+        Timeout,
+        /// Process died before the ready file appeared. No kill needed.
+        Died,
     }
 
-    // Get creation time for PID reuse detection
-    let creation_time = get_process_creation_time(handle).unwrap_or(0);
-
-    // Close the handle now that we've assigned it
-    unsafe {
-        windows_sys::Win32::Foundation::CloseHandle(handle);
-    }
-
-    // Update DB with supervisor PID
-    let _ = session_store.set_supervisor_pid(&repo, &session.id, pid);
-
-    // Wait for ready file
-    let ready_path = state.paths.session_dir(&repo, &session.id).join("ready");
+    let ready_path = state.paths.session_dir(&repo, &session_id).join("ready");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
+    let outcome = loop {
         if ready_path.exists() {
-            break;
+            break ReadyOutcome::Ok;
         }
         if tokio::time::Instant::now() >= deadline {
-            return ControlFrame::Error {
-                message: format!("supervisor did not become ready within 10s (pid={pid})"),
-            };
+            break ReadyOutcome::Timeout;
         }
         if !PlatformProcessControl::is_alive(pid) {
-            return ControlFrame::Error {
-                message: "supervisor died before becoming ready".to_string(),
-            };
+            break ReadyOutcome::Died;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    };
 
-    // Register in live sessions
-    {
-        let mut sessions = state.sessions.lock().await;
-        sessions.insert(
-            session.id.clone(),
-            LiveSession {
-                session_id: session.id.clone(),
-                supervisor_pid: pid,
-                transport_addr: transport_addr.clone(),
-                repo: repo.clone(),
-                workspace: workspace.clone(),
-                creation_time,
-            },
-        );
+    if let ReadyOutcome::Ok = outcome {
+        // fallthrough — success path below
+    } else {
+        // Failure path. Order matters:
+        //   1. Force-kill the PID (Timeout only — `Died` means no
+        //      process). The creation_time guard refuses if the PID
+        //      has been recycled.
+        //   2. Confirm the process is actually dead (`!is_alive`).
+        //      If the kill failed and the process is still alive, we
+        //      MUST keep the live-registry entry — a still-bound
+        //      supervisor that's invisible to the registry would let
+        //      RemoveSession / RemoveRepo race remove_dir_all against
+        //      the supervisor's open handles (the SHA-55 class via
+        //      the ready-timeout vector).
+        //   3. Remove the registry entry so StopSession / RemoveRepo
+        //      no longer see it.
+        //   4. Mark the DB row failed so orphan adoption on next
+        //      daemon start doesn't try to re-adopt a ghost.
+        let kill_failed = match &outcome {
+            ReadyOutcome::Timeout => {
+                if let Err(e) = shard_supervisor::process_windows::force_kill_pid_checked(
+                    pid,
+                    creation_time,
+                ) {
+                    warn!(
+                        "handle_spawn: ready-timeout force-kill failed for pid={pid}: {e}"
+                    );
+                    true
+                } else {
+                    false
+                }
+            }
+            ReadyOutcome::Died => false,
+            ReadyOutcome::Ok => unreachable!(),
+        };
+
+        // Belt-and-suspenders: even if force-kill returned Ok, the
+        // process may not have fully torn down yet. Re-check liveness
+        // before we trust the registry-cleanup path.
+        let still_alive = kill_failed && PlatformProcessControl::is_alive(pid);
+
+        if still_alive {
+            // Don't unregister — leave the entry so subsequent
+            // RemoveSession / RemoveRepo can still see and stop the
+            // live supervisor. The DB row stays `starting` so a later
+            // operator-driven StopSession can transition it cleanly.
+            return ControlFrame::Error {
+                message: format!(
+                    "supervisor did not become ready and force-kill failed (pid={pid}); session left live for retry"
+                ),
+            };
+        }
+
+        let message = match outcome {
+            ReadyOutcome::Timeout => {
+                format!("supervisor did not become ready within 10s (pid={pid})")
+            }
+            ReadyOutcome::Died => "supervisor died before becoming ready".to_string(),
+            ReadyOutcome::Ok => unreachable!(),
+        };
+
+        {
+            let mut sessions = state.sessions.lock().await;
+            sessions.remove(&session_id);
+        }
+        let _ = session_store.update_status(&repo, &session_id, "failed", None);
+        return ControlFrame::Error { message };
     }
 
     info!(
         "Spawned session {} [{}:{}] pid={}",
-        &session.id[..8],
+        &session_id[..8.min(session_id.len())],
         repo,
         workspace,
         pid
     );
 
     ControlFrame::SpawnAck {
-        session_id: session.id,
+        session_id,
         supervisor_pid: pid,
         transport_addr,
     }
 }
 
-/// Handle StopSession: connect to the session pipe and send stop frame.
+/// Handle StopSession: stop the supervisor, wait for exit, and clean up
+/// daemon-owned state.
+///
+/// The pre-migration shape wrote a raw `StopGraceful` as the first frame
+/// on the session pipe and returned `StopAck` on the write. Two problems
+/// surfaced in use: (1) SHA-43 — the supervisor's accept handler only
+/// dispatches stop frames via the post-first-frame recv loop, so the
+/// opening frame was silently discarded; clients thought the session was
+/// stopped but the supervisor kept running. (2) The daemon's in-memory
+/// live registry never dropped the entry, which then caused `RemoveSession`
+/// to reject with "still live — stop it first" on the retry.
+///
+/// The fixed shape delegates to `stop_session_and_wait`, which sends the
+/// required `Resume` preamble, drains until a lifecycle `Status` frame or
+/// pipe EOF, and force-kills on timeout. On success we drop the live
+/// registry entry, write `"stopped"` to the DB as a backstop (the
+/// supervisor's own final-status write races client-side refreshes, and
+/// GUI clients that abort their monitor before calling stop never see the
+/// Status frame), and broadcast `SessionsChanged` so subscribers
+/// invalidate cached lists.
 async fn handle_stop(state: &Arc<DaemonState>, session_id: String, force: bool) -> ControlFrame {
-    let transport_addr = {
+    let (full_id, repo, transport_addr, pid, creation_time) = {
         let sessions = state.sessions.lock().await;
-        match sessions.get(&session_id) {
-            Some(s) => s.transport_addr.clone(),
+        let entry = match sessions.get(&session_id) {
+            Some(s) => Some((
+                s.session_id.clone(),
+                s.repo.clone(),
+                s.transport_addr.clone(),
+                s.supervisor_pid,
+                s.creation_time,
+            )),
             None => {
-                // Try prefix match
                 let matches: Vec<_> = sessions
                     .values()
                     .filter(|s| s.session_id.starts_with(&session_id))
+                    .map(|s| {
+                        (
+                            s.session_id.clone(),
+                            s.repo.clone(),
+                            s.transport_addr.clone(),
+                            s.supervisor_pid,
+                            s.creation_time,
+                        )
+                    })
                     .collect();
                 match matches.len() {
-                    0 => {
-                        return ControlFrame::Error {
-                            message: format!("session '{session_id}' not found in live registry"),
-                        }
-                    }
-                    1 => matches[0].transport_addr.clone(),
+                    0 => None,
+                    1 => Some(matches.into_iter().next().unwrap()),
                     n => {
                         return ControlFrame::Error {
                             message: format!(
@@ -1453,28 +2058,1065 @@ async fn handle_stop(state: &Arc<DaemonState>, session_id: String, force: bool) 
                     }
                 }
             }
+        };
+        match entry {
+            Some(e) => e,
+            None => {
+                return ControlFrame::Error {
+                    message: format!("session '{session_id}' not found in live registry"),
+                }
+            }
         }
     };
 
-    // Connect to the session's transport pipe and send stop
-    match shard_transport::PlatformTransport::connect(&transport_addr).await {
-        Ok(mut client) => {
-            use shard_transport::protocol::{write_frame, Frame};
-            let frame = if force {
-                Frame::StopForce
-            } else {
-                Frame::StopGraceful
-            };
-            if let Err(e) = write_frame(&mut client, &frame).await {
-                return ControlFrame::Error {
-                    message: format!("failed to send stop frame: {e}"),
-                };
+    let stop_result: shard_core::Result<()> = if force {
+        // Explicit force: skip the graceful window and terminate directly.
+        // `force_kill_pid_checked` refuses on a PID-recycle mismatch.
+        shard_supervisor::process_windows::force_kill_pid_checked(pid, creation_time).map_err(
+            |e| shard_core::ShardError::Other(format!("force-kill pid {pid} failed: {e}")),
+        )
+    } else {
+        stop_session_and_wait(
+            &transport_addr,
+            pid,
+            creation_time,
+            SESSION_MUTATION_STOP_TIMEOUT,
+        )
+        .await
+        .map(|_| ())
+    };
+
+    match stop_result {
+        Ok(()) => {
+            {
+                let mut sessions = state.sessions.lock().await;
+                sessions.remove(&full_id);
             }
-            info!("Sent stop to session {}", &session_id[..8.min(session_id.len())]);
+            let store = SessionStore::new(state.paths.clone());
+            if let Err(e) = store.update_status(&repo, &full_id, "stopped", None) {
+                warn!(
+                    "StopSession: DB status update failed for {} ({e}); proceeding",
+                    &full_id[..8.min(full_id.len())]
+                );
+            }
+            if let Some(monitor) = state.monitor.get() {
+                monitor.broadcast(crate::cmd::workspace_monitor::ChangeKind::Sessions(
+                    repo.clone(),
+                ));
+            }
+            info!(
+                "StopSession: {} [{}] stopped{}",
+                &full_id[..8.min(full_id.len())],
+                repo,
+                if force { " (forced)" } else { "" }
+            );
             ControlFrame::StopAck
         }
         Err(e) => ControlFrame::Error {
-            message: format!("failed to connect to session pipe: {e}"),
+            message: format!("failed to stop session: {e}"),
+        },
+    }
+}
+
+/// Handle `RemoveWorkspace` — the D5 atomic workflow.
+///
+///  1. Acquire the per-workspace lifecycle gate (`Active`/`Broken` →
+///     `Deleting`). Concurrent `RemoveWorkspace` on the same target joins
+///     via the lifecycle notifier; `NotFound` means the row is already
+///     gone and we return success idempotently.
+///  2. Stop every session currently bound to `repo:name` via
+///     `stop_session_and_wait` with a 5s graceful budget (force-kill on
+///     timeout). The supervisor's child shell holds the workspace CWD
+///     open; its exit is what releases the handle.
+///  3. `MonitorCommand::DropRepoWorkspace` — the monitor drops its
+///     `ReadDirectoryChangesW` handle for this workspace and acks BEFORE
+///     we proceed to `RemoveDirectoryW`. This closes the SHA-55 race.
+///  4. `remove_worktree_fs` via the injected git-ops — `git worktree
+///     remove --force` with prune + `remove_dir_all` fallback for broken
+///     rows. On failure we transition to `broken` and preserve the DB
+///     row so a retried `RemoveWorkspace` can resume.
+///  5. `WorkspaceStore::delete_row` — DB side. If this fails after the
+///     filesystem delete succeeded, the row becomes an orphan; reconcile
+///     will re-surface it and the user can retry.
+///  6. `commit_gone()` releases the lifecycle gate, fires any joiners.
+///  7. `poke_topology` + broadcast `WorkspaceRemoved` so subscribers
+///     invalidate cached state and the UI drops the row.
+///
+/// `is_base=true` workspaces skip the git step entirely (see D11 /
+/// SHA-56): they refer to the user's own checkout, not a managed
+/// worktree. The DB row is still deleted.
+async fn handle_remove_workspace(
+    state: &Arc<DaemonState>,
+    repo: String,
+    name: String,
+) -> ControlFrame {
+    use crate::cmd::lifecycle::BeginDelete;
+
+    // Serialize against concurrent `CreateWorkspace` on this repo (Codex
+    // round-2 finding). The lifecycle gate alone can't prevent the race
+    // where an absent name triggers `commit_gone` while a Create is
+    // partway through committing the same name to the DB.
+    let repo_lock = state.acquire_repo_mutation_lock(&repo).await;
+    let _guard = repo_lock.lock().await;
+
+    // 1. Lifecycle gate. `begin_delete` is atomic over absent/Active/Broken
+    //    → Deleting. If another delete is already in flight, wait on its
+    //    completion notifier and then re-loop: if the first caller
+    //    rolled back the workspace is back to Active and we retry; if it
+    //    committed Gone (absent from the map), `begin_delete` will insert
+    //    Deleting for us and we own the (now best-effort) cleanup; if it
+    //    committed Broken, we pick up the retry per D12.
+    let guard = loop {
+        match state.lifecycle.begin_delete(&repo, &name) {
+            BeginDelete::Started(g) => break g,
+            BeginDelete::AlreadyDeleting(notifier) => {
+                notifier.notified().await;
+                // Loop: the joiner either owns the retry now, or the
+                // original succeeded and the workspace is Gone — which
+                // `begin_delete` will treat as absent and re-Start. The
+                // subsequent `ws_store.get` call returns WorkspaceNotFound
+                // and we commit_gone idempotently.
+            }
+        }
+    };
+
+    // Fetch workspace info up front. If the row doesn't exist, release the
+    // gate and return success idempotently.
+    let ws_store = WorkspaceStore::new(state.paths.clone());
+    let workspace = match ws_store.get(&repo, &name) {
+        Ok(w) => w,
+        Err(shard_core::ShardError::WorkspaceNotFound(_)) => {
+            guard.commit_gone();
+            return ControlFrame::RemoveWorkspaceAck;
+        }
+        Err(e) => {
+            guard.rollback();
+            return ControlFrame::Error {
+                message: format!("failed to look up workspace: {e}"),
+            };
+        }
+    };
+
+    // 2. Stop every bound session.
+    let bound_sessions: Vec<(String, String, u32, u64)> = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .values()
+            .filter(|s| s.repo == repo && s.workspace == name)
+            .map(|s| {
+                (
+                    s.session_id.clone(),
+                    s.transport_addr.clone(),
+                    s.supervisor_pid,
+                    s.creation_time,
+                )
+            })
+            .collect()
+    };
+    let session_store = SessionStore::new(state.paths.clone());
+
+    for (session_id, transport_addr, pid, creation_time) in &bound_sessions {
+        match stop_session_and_wait(
+            transport_addr,
+            *pid,
+            *creation_time,
+            SESSION_MUTATION_STOP_TIMEOUT,
+        )
+        .await
+        {
+            Ok(_) => {
+                info!(
+                    "RemoveWorkspace: stopped session {} [{}:{}]",
+                    &session_id[..8.min(session_id.len())],
+                    repo,
+                    name
+                );
+                // Only drop from the registry when the process is confirmed
+                // gone. If stop failed (including the PID-reuse refusal or
+                // OpenProcess failure), the supervisor may still be alive;
+                // leaving the entry in keeps fast_tick + retry handlers
+                // able to see and act on it.
+                let mut sessions = state.sessions.lock().await;
+                sessions.remove(session_id);
+                drop(sessions);
+                if let Err(e) = session_store.update_status(&repo, session_id, "stopped", None) {
+                    warn!(
+                        "RemoveWorkspace: DB status update failed for {} ({e}); proceeding",
+                        &session_id[..8.min(session_id.len())]
+                    );
+                }
+                // Delete the session row so the workspace FK can drop. Without
+                // this, ws_store.delete_row below fails with a FOREIGN KEY
+                // constraint and the workspace is left in Broken state.
+                // SessionNotFound is fine — registry-only entries (tests, or
+                // a session never persisted) have nothing to delete.
+                match session_store.remove(&repo, session_id) {
+                    Ok(()) => {}
+                    Err(shard_core::ShardError::SessionNotFound(_)) => {}
+                    Err(e) => {
+                        warn!(
+                            "RemoveWorkspace: session row delete failed for {} ({e}); aborting delete",
+                            &session_id[..8.min(session_id.len())]
+                        );
+                        guard.commit_broken();
+                        return ControlFrame::Error {
+                            message: format!(
+                                "failed to remove session row {}: {e}",
+                                &session_id[..8.min(session_id.len())]
+                            ),
+                        };
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "RemoveWorkspace: failed to stop session {} cleanly ({e}); aborting delete",
+                    &session_id[..8.min(session_id.len())]
+                );
+                // Give up on this delete — the directory is still pinned
+                // by a live shell's CWD, so RemoveDirectoryW would fail
+                // anyway. Commit Broken so a retry can pick up once the
+                // session is dealt with.
+                guard.commit_broken();
+                return ControlFrame::Error {
+                    message: format!(
+                        "failed to stop bound session {}: {e}",
+                        &session_id[..8.min(session_id.len())]
+                    ),
+                };
+            }
+        }
+    }
+
+    if !bound_sessions.is_empty() {
+        if let Some(monitor) = state.monitor.get() {
+            monitor.broadcast(crate::cmd::workspace_monitor::ChangeKind::Sessions(
+                repo.clone(),
+            ));
+        }
+    }
+
+    // Remove any persisted terminal-status sessions that were not in the
+    // live registry. Otherwise the workspace row delete below can still fail
+    // its sessions.workspace_name foreign key.
+    match session_store.list(&repo, Some(&name)) {
+        Ok(sessions) => {
+            for session in sessions {
+                match session_store.remove(&repo, &session.id) {
+                    Ok(()) => {}
+                    Err(shard_core::ShardError::SessionNotFound(_)) => {}
+                    Err(e) => {
+                        warn!(
+                            "RemoveWorkspace: persisted session row delete failed for {} ({e}); aborting delete",
+                            &session.id[..8.min(session.id.len())]
+                        );
+                        guard.commit_broken();
+                        return ControlFrame::Error {
+                            message: format!(
+                                "failed to remove persisted session row {}: {e}",
+                                &session.id[..8.min(session.id.len())]
+                            ),
+                        };
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            warn!("RemoveWorkspace: failed to list persisted sessions for {repo}:{name}: {e}");
+            guard.commit_broken();
+            return ControlFrame::Error {
+                message: format!("failed to list persisted sessions for workspace: {e}"),
+            };
+        }
+    }
+
+    // 3. Drop watcher ack-after-drop.
+    if !workspace.is_base {
+        if let Some(monitor) = state.monitor.get() {
+            if let Err(e) = monitor.drop_repo_workspace(&repo, &name).await {
+                warn!(
+                    "RemoveWorkspace: monitor watcher drop failed ({e}); proceeding",
+                );
+                // Fall through. Worst case the fs delete fails because
+                // the watcher still holds the handle; we'll surface that
+                // as a Broken state below.
+            }
+        }
+    }
+
+    // 4. Filesystem side.
+    if !workspace.is_base {
+        let repo_store = RepositoryStore::new(state.paths.clone());
+        let repo_rec = match repo_store.get(&repo) {
+            Ok(r) => r,
+            Err(e) => {
+                guard.commit_broken();
+                return ControlFrame::Error {
+                    message: format!("repo lookup failed mid-delete: {e}"),
+                };
+            }
+        };
+
+        let source_dir = state
+            .paths
+            .repo_source_for_repo(&repo, repo_rec.local_path.as_deref());
+        let ws_dir = std::path::PathBuf::from(&workspace.path);
+
+        if let Err(e) = workspaces::remove_worktree_fs(
+            state.git_ops.as_ref(),
+            &source_dir,
+            &ws_dir,
+        ) {
+            warn!(
+                "RemoveWorkspace: filesystem delete failed ({}:{}): {e}",
+                repo, name
+            );
+            guard.commit_broken();
+            return ControlFrame::Error {
+                message: format!("workspace removal failed, marked broken: {e}"),
+            };
+        }
+    }
+
+    // 5. DB row delete.
+    if let Err(e) = ws_store.delete_row(&repo, &name) {
+        warn!(
+            "RemoveWorkspace: DB row delete failed after fs delete ({}:{}): {e}",
+            repo, name
+        );
+        guard.commit_broken();
+        return ControlFrame::Error {
+            message: format!("DB delete failed after fs removal: {e}"),
+        };
+    }
+
+    // 6. Release the gate.
+    guard.commit_gone();
+
+    // 7. Refresh monitor state + broadcast fine-grained event.
+    if let Some(monitor) = state.monitor.get() {
+        monitor.poke_topology(Some(repo.clone()));
+        monitor.broadcast(crate::cmd::workspace_monitor::ChangeKind::WorkspaceRemoved {
+            repo: repo.clone(),
+            name: name.clone(),
+        });
+    }
+
+    info!("RemoveWorkspace: {}:{} removed", repo, name);
+    ControlFrame::RemoveWorkspaceAck
+}
+
+/// Handle `CreateWorkspace` (Phase 2 of the daemon-broker migration).
+///
+/// Mirrors the D5 pattern but is far simpler than remove because create has
+/// no cleanup steps to serialize. Resolves the effective workspace name
+/// up-front via `WorkspaceStore::resolve_workspace_name` so the lifecycle
+/// gate check applies uniformly — otherwise an implicit name (e.g. from
+/// `WorkspaceMode::NewBranch` + no explicit `name`) that happens to match
+/// a workspace currently in `Deleting`/`Broken` would bypass the gate and
+/// fail deep inside `create` with a generic DB error.
+async fn handle_create_workspace(
+    state: &Arc<DaemonState>,
+    repo: String,
+    name: Option<String>,
+    mode: shard_core::workspaces::WorkspaceMode,
+    branch: Option<String>,
+) -> ControlFrame {
+    // Serialize against concurrent `RemoveWorkspace` on this repo so the
+    // two handlers' critical sections can't interleave. Without this, a
+    // Remove of an as-yet-absent name could slip in between our gate
+    // check and the DB INSERT and return a vacuous Ack to its caller.
+    let repo_lock = state.acquire_repo_mutation_lock(&repo).await;
+    let _guard = repo_lock.lock().await;
+
+    let ws_store = WorkspaceStore::new(state.paths.clone());
+
+    // Resolve the effective name before any side effects so the gate check
+    // covers both explicit and implicit-name callers. Resolution mirrors
+    // the logic in `WorkspaceStore::create` — if the two diverge we'll
+    // gate-check one name and write a different one, so the helper is
+    // deliberately narrow.
+    let resolved_name = match ws_store.resolve_workspace_name(
+        &repo,
+        name.as_deref(),
+        mode,
+        branch.as_deref(),
+    ) {
+        Ok(n) => n,
+        Err(e) => {
+            return ControlFrame::Error {
+                message: format!("resolve workspace name failed: {e}"),
+            }
+        }
+    };
+
+    // Pre-mutation gate check — mirrors `handle_spawn`. Rejects
+    // `Deleting`/`Broken` targets regardless of whether the caller
+    // spelled the name or let it default.
+    if let Err(e) = state.lifecycle.check_can_mutate(&repo, &resolved_name) {
+        return ControlFrame::Error {
+            message: e.to_string(),
+        };
+    }
+
+    let ws = match ws_store.create(&repo, name.as_deref(), mode, branch.as_deref(), false) {
+        Ok(w) => w,
+        Err(e) => {
+            return ControlFrame::Error {
+                message: format!("create workspace failed: {e}"),
+            }
+        }
+    };
+
+    // Register the resolved name in the lifecycle map so subsequent
+    // `RemoveWorkspace` / `SpawnSession` calls see a concrete `Active`
+    // entry rather than falling through the "absent" branch. See plan
+    // starter-kit note for Phase 2.
+    state.lifecycle.register_active(&repo, &ws.name);
+
+    // Poke the monitor so the repo's next StateSnapshot includes the new
+    // workspace. Subscribers pick this up through the existing
+    // `ChangeKind::State(repo)` path — no new fine-grained event needed
+    // per D10.
+    if let Some(monitor) = state.monitor.get() {
+        monitor.poke_topology(Some(repo.clone()));
+    }
+
+    info!(
+        "CreateWorkspace: {}:{} on branch '{}'",
+        repo, ws.name, ws.branch
+    );
+    ControlFrame::CreateWorkspaceAck { workspace: ws }
+}
+
+/// Handle `ListWorkspaces` — enriched list of workspaces for a repo.
+///
+/// Reads the DB through `WorkspaceStore::list`, then joins each row against
+/// the monitor's cached `RepoState` so the caller gets both halves in one
+/// round trip. `status` is `None` when the monitor has not yet produced a
+/// snapshot (e.g. immediately after `AddRepo`) or when a workspace is newer
+/// than the last monitor tick.
+async fn handle_list_workspaces(state: &Arc<DaemonState>, repo: String) -> ControlFrame {
+    let ws_store = WorkspaceStore::new(state.paths.clone());
+    let workspaces = match ws_store.list(&repo) {
+        Ok(w) => w,
+        Err(e) => {
+            return ControlFrame::Error {
+                message: format!("list workspaces failed: {e}"),
+            }
+        }
+    };
+
+    let repo_state = match state.monitor.get() {
+        Some(monitor) => monitor.get(&repo).await,
+        None => None,
+    };
+
+    let items = workspaces
+        .into_iter()
+        .map(|ws| {
+            let status = repo_state
+                .as_ref()
+                .and_then(|s| s.workspaces.get(&ws.name).cloned());
+            shard_core::workspaces::WorkspaceWithStatus {
+                workspace: ws,
+                status,
+            }
+        })
+        .collect();
+
+    ControlFrame::WorkspaceList { items }
+}
+
+/// Handle `ListBranchInfo` — branch/worktree occupancy for a repo.
+///
+/// On-demand git read (`git branch`, `git worktree list --porcelain`)
+/// cross-referenced with the DB's workspace rows. Routed through the
+/// daemon so all callers agree on a single serialization point; not
+/// cached against the monitor's snapshot because the monitor walks the
+/// worktree list on its own cadence for a different purpose and callers
+/// of this RPC want fresh data (e.g. the new-workspace wizard picking a
+/// branch). Per D4: this is a "live view" read that migrates alongside
+/// its corresponding mutation in the same batch.
+async fn handle_list_branch_info(state: &Arc<DaemonState>, repo: String) -> ControlFrame {
+    let ws_store = WorkspaceStore::new(state.paths.clone());
+    match ws_store.list_branch_info(&repo) {
+        Ok(branches) => ControlFrame::BranchInfoList { branches },
+        Err(e) => ControlFrame::Error {
+            message: format!("list branch info failed: {e}"),
+        },
+    }
+}
+
+/// Handle `AddRepo` — registers a repo (bare clone for URLs, direct
+/// reference for local paths) and auto-creates a base workspace on the
+/// detected default branch.
+///
+/// Resolves the effective alias via `RepositoryStore::resolve_alias`
+/// up front (side-effect-free), then takes the per-repo mutation lock
+/// BEFORE `add` runs. This closes the Codex Phase 3 race where an
+/// alias-less AddRepo could commit the DB row and release briefly
+/// before re-acquiring the lock; a concurrent `RemoveRepo` for that
+/// derived alias would slip into the gap and leave AddRepo returning
+/// an `Ack` for a row that no longer existed.
+async fn handle_add_repo(
+    state: &Arc<DaemonState>,
+    url: String,
+    alias: Option<String>,
+) -> ControlFrame {
+    let resolved_alias = match RepositoryStore::resolve_alias(&url, alias.as_deref()) {
+        Ok(a) => a,
+        Err(e) => {
+            return ControlFrame::Error {
+                message: format!("resolve alias failed: {e}"),
+            }
+        }
+    };
+
+    // Acquire the per-repo mutation lock keyed by the resolved alias —
+    // held across the DB write and the auto-workspace step so no other
+    // handler can observe (or teardown) the row mid-flight.
+    let repo_lock = state.acquire_repo_mutation_lock(&resolved_alias).await;
+    let _guard = repo_lock.lock().await;
+
+    let repo_store = RepositoryStore::new(state.paths.clone());
+    let repo = match repo_store.add(&url, Some(&resolved_alias)) {
+        Ok(r) => r,
+        Err(e) => {
+            return ControlFrame::Error {
+                message: format!("add repo failed: {e}"),
+            }
+        }
+    };
+
+    // Auto-create the base workspace on the detected default branch.
+    // Mirrors the old direct-path behaviour in `commands/repo.rs` /
+    // `cmd/repo.rs`. Failures here are logged but don't abort AddRepo
+    // — the repo row is usable without the base workspace; the user
+    // can create one manually via CreateWorkspace.
+    let ws_store = WorkspaceStore::new(state.paths.clone());
+    let source_dir = state
+        .paths
+        .repo_source_for_repo(&repo.alias, repo.local_path.as_deref());
+    let is_local = repo.local_path.is_some();
+    match shard_core::git::default_branch(&source_dir) {
+        Ok(branch) => match ws_store.create(
+            &repo.alias,
+            Some(&branch),
+            shard_core::workspaces::WorkspaceMode::NewBranch,
+            Some(&branch),
+            is_local,
+        ) {
+            Ok(ws) => {
+                state.lifecycle.register_active(&repo.alias, &ws.name);
+            }
+            Err(e) => warn!(
+                "AddRepo: could not auto-create default workspace for {}: {e}",
+                repo.alias
+            ),
+        },
+        Err(e) => warn!(
+            "AddRepo: could not detect default branch for {}: {e}",
+            repo.alias
+        ),
+    }
+
+    // Let the monitor pick up the new repo so StateSnapshot subscribers
+    // see a row on the next tick.
+    if let Some(monitor) = state.monitor.get() {
+        monitor.poke_topology(Some(repo.alias.clone()));
+    }
+
+    info!(
+        "AddRepo: {} (url='{}', local={})",
+        repo.alias, repo.url, is_local
+    );
+    ControlFrame::AddRepoAck { repo }
+}
+
+/// Handle `RemoveRepo` — full repo teardown.
+///
+/// Serialization model:
+/// 1. Acquire the per-repo mutation lock (blocks concurrent
+///    `CreateWorkspace` / `RemoveWorkspace` / `AddRepo` with the same
+///    alias).
+/// 2. Mark every workspace under this repo `Deleting` via the
+///    lifecycle registry so concurrent `SpawnSession` fails fast.
+/// 3. Stop and drain every bound session with the same 5s / force-kill
+///    budget used by `RemoveWorkspace`.
+/// 4. Drop the monitor's watcher for this repo (releases all
+///    `ReadDirectoryChangesW` handles) and wait for the ack.
+/// 5. Call `RepositoryStore::remove` — handles git worktree removal,
+///    `.shard/` cleanup, and DB deletion.
+/// 6. `lifecycle.clear_repo` — drop every stale `Deleting`/`Active`
+///    entry for this repo so AddRepo-then-RemoveRepo-then-AddRepo
+///    under the same alias doesn't carry phantom state.
+/// 7. `poke_topology(Some(alias))` — the monitor sees the repo is
+///    gone from the DB and drops its state entry.
+///
+/// If any step after lifecycle-transition fails, we leave each
+/// workspace in `Deleting` (no rollback to Active — the repo is partly
+/// torn down and a retry via `RemoveRepo` is the sanctioned path).
+async fn handle_remove_repo(state: &Arc<DaemonState>, alias: String) -> ControlFrame {
+    let repo_lock = state.acquire_repo_mutation_lock(&alias).await;
+    let _guard = repo_lock.lock().await;
+
+    // Confirm the repo exists before doing any work.
+    let repo_store = RepositoryStore::new(state.paths.clone());
+    match repo_store.get(&alias) {
+        Ok(_) => {}
+        Err(shard_core::ShardError::RepoNotFound(_)) => {
+            // Idempotent: already gone.
+            return ControlFrame::RemoveRepoAck;
+        }
+        Err(e) => {
+            return ControlFrame::Error {
+                message: format!("repo lookup failed: {e}"),
+            }
+        }
+    }
+
+    // 1. Lifecycle-gate every workspace. We hold the per-repo mutex so
+    //    no new workspaces can land while we iterate. `begin_delete`
+    //    against an Active or absent entry transitions to Deleting and
+    //    returns a DeleteGuard. Against an AlreadyDeleting entry we
+    //    wait and retry (the peer is from the same repo; under the
+    //    mutex it must have started before we acquired it).
+    let ws_store = WorkspaceStore::new(state.paths.clone());
+    let workspaces = match ws_store.list(&alias) {
+        Ok(w) => w,
+        Err(e) => {
+            return ControlFrame::Error {
+                message: format!("list workspaces during repo remove: {e}"),
+            }
+        }
+    };
+
+    let mut guards: Vec<crate::cmd::lifecycle::DeleteGuard> = Vec::new();
+    for ws in &workspaces {
+        loop {
+            match state.lifecycle.begin_delete(&alias, &ws.name) {
+                crate::cmd::lifecycle::BeginDelete::Started(g) => {
+                    guards.push(g);
+                    break;
+                }
+                crate::cmd::lifecycle::BeginDelete::AlreadyDeleting(notifier) => {
+                    notifier.notified().await;
+                }
+            }
+        }
+    }
+
+    // 2. Stop every session bound to this repo. Snapshot the relevant
+    //    entries up front so we can release the sessions lock before
+    //    the potentially long per-session stop-and-wait.
+    let bound_sessions: Vec<(String, String, u32, u64)> = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .values()
+            .filter(|s| s.repo == alias)
+            .map(|s| {
+                (
+                    s.session_id.clone(),
+                    s.transport_addr.clone(),
+                    s.supervisor_pid,
+                    s.creation_time,
+                )
+            })
+            .collect()
+    };
+    let session_store = SessionStore::new(state.paths.clone());
+
+    for (session_id, transport_addr, pid, creation_time) in &bound_sessions {
+        match stop_session_and_wait(
+            transport_addr,
+            *pid,
+            *creation_time,
+            SESSION_MUTATION_STOP_TIMEOUT,
+        )
+        .await
+        {
+            Ok(_) => {
+                let mut sessions = state.sessions.lock().await;
+                sessions.remove(session_id);
+                drop(sessions);
+                if let Err(e) = session_store.update_status(&alias, session_id, "stopped", None) {
+                    warn!(
+                        "RemoveRepo: DB status update failed for {} ({e}); proceeding",
+                        &session_id[..8.min(session_id.len())]
+                    );
+                }
+                // Delete the session row so the workspace FK can drop later.
+                // SessionNotFound is fine (registry-only entries have nothing
+                // to delete in the DB).
+                match session_store.remove(&alias, session_id) {
+                    Ok(()) => {}
+                    Err(shard_core::ShardError::SessionNotFound(_)) => {}
+                    Err(e) => {
+                        warn!(
+                            "RemoveRepo: session row delete failed for {} ({e}); aborting",
+                            &session_id[..8.min(session_id.len())]
+                        );
+                        for g in guards {
+                            g.rollback();
+                        }
+                        return ControlFrame::Error {
+                            message: format!(
+                                "failed to remove session row {}: {e}",
+                                &session_id[..8.min(session_id.len())]
+                            ),
+                        };
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "RemoveRepo: failed to stop session {} ({e}); aborting",
+                    &session_id[..8.min(session_id.len())]
+                );
+                // Leave lifecycle entries in Deleting — a retried
+                // RemoveRepo can pick up where we left off. The
+                // guards drop without commit and roll back to Active
+                // here, which is the right thing: the repo is still
+                // intact on disk.
+                for g in guards {
+                    g.rollback();
+                }
+                return ControlFrame::Error {
+                    message: format!(
+                        "failed to stop bound session {}: {e}",
+                        &session_id[..8.min(session_id.len())]
+                    ),
+                };
+            }
+        }
+    }
+
+    if !bound_sessions.is_empty() {
+        if let Some(monitor) = state.monitor.get() {
+            monitor.broadcast(crate::cmd::workspace_monitor::ChangeKind::Sessions(
+                alias.clone(),
+            ));
+        }
+    }
+
+    // 3. Drop the monitor's watcher for this repo — releases every
+    //    ReadDirectoryChangesW handle before we invoke
+    //    RemoveDirectoryW. Non-fatal on error: reconcile will clean up
+    //    stale RepoState entries if the ack path falters.
+    if let Some(monitor) = state.monitor.get() {
+        if let Err(e) = monitor.drop_repo(&alias).await {
+            warn!("RemoveRepo: monitor drop failed ({e}); proceeding");
+        }
+    }
+
+    // 4. Filesystem + DB via the existing store. Preserves the local
+    //    vs. remote asymmetry (local checkouts are never deleted).
+    if let Err(e) = repo_store.remove(&alias) {
+        warn!("RemoveRepo: store.remove failed for {alias}: {e}");
+        for g in guards {
+            g.commit_broken();
+        }
+        // We already dropped the monitor's watcher + RepoState entry
+        // in step 3. The DB row is still present, so subscribers must
+        // see the repo as still-existing-but-broken rather than
+        // silently missing until the 30s reconcile. Poke the monitor
+        // to reload from the DB; `handle_topology_change` will fetch
+        // the row, rebuild the watcher, and emit a fresh
+        // `ChangeKind::State(alias)`.
+        if let Some(monitor) = state.monitor.get() {
+            monitor.poke_topology(Some(alias.clone()));
+        }
+        return ControlFrame::Error {
+            message: format!("repo remove failed: {e}"),
+        };
+    }
+
+    // 5. Commit every lifecycle guard and mop up any strays from before
+    //    our snapshot (e.g. a Broken entry from a previous failed
+    //    RemoveWorkspace on a workspace whose row no longer existed).
+    for g in guards {
+        g.commit_gone();
+    }
+    let _cleared = state.lifecycle.clear_repo(&alias);
+
+    // 6. Poke the monitor so the repo drops out of the RepoState map
+    //    and the next StateSnapshot reflects the removal.
+    if let Some(monitor) = state.monitor.get() {
+        monitor.poke_topology(Some(alias.clone()));
+    }
+
+    info!("RemoveRepo: {} removed", alias);
+    ControlFrame::RemoveRepoAck
+}
+
+/// Handle `SyncRepo` — `git fetch --all --prune`. No DB mutation, no
+/// watcher coordination. Takes the per-repo mutation lock anyway so a
+/// concurrent RemoveRepo can't pull the repo out from under us.
+async fn handle_sync_repo(state: &Arc<DaemonState>, alias: String) -> ControlFrame {
+    let repo_lock = state.acquire_repo_mutation_lock(&alias).await;
+    let _guard = repo_lock.lock().await;
+
+    let repo_store = RepositoryStore::new(state.paths.clone());
+    match repo_store.sync(&alias) {
+        Ok(()) => ControlFrame::SyncRepoAck,
+        Err(e) => ControlFrame::Error {
+            message: format!("sync repo failed: {e}"),
+        },
+    }
+}
+
+/// Handle `ListRepos` — delegates to `RepositoryStore::list` under no
+/// lock (read-only path, per D4 live-view read routed through the
+/// daemon for topology-event consistency).
+async fn handle_list_repos(state: &Arc<DaemonState>) -> ControlFrame {
+    let repo_store = RepositoryStore::new(state.paths.clone());
+    match repo_store.list() {
+        Ok(repos) => ControlFrame::RepoList { repos },
+        Err(e) => ControlFrame::Error {
+            message: format!("list repos failed: {e}"),
+        },
+    }
+}
+
+// ── Phase 4: session-lifecycle tail ─────────────────────────────────────────
+//
+// RemoveSession / RenameSession / DetachSession / FindSessionById land here
+// to finish the D5 "daemon owns every mutation" invariant for sessions.
+// `SpawnSession` / `StopSession` / `ListSessions` arrived in earlier phases
+// and are unchanged.
+
+/// Handle `RemoveSession` — drop a terminal-status session row and its
+/// on-disk artefacts.
+///
+/// `SessionStore::remove` guards on `running`/`starting` itself; we re-check
+/// the live registry here so a session whose DB row was flipped stale but
+/// whose supervisor is still in the in-memory map can't slip past the DB
+/// guard. Holds the per-repo mutation lock so concurrent `RemoveRepo`
+/// can't yank the repo DB out while we're mid-delete.
+async fn handle_remove_session(
+    state: &Arc<DaemonState>,
+    repo: String,
+    id: String,
+) -> ControlFrame {
+    let repo_lock = state.acquire_repo_mutation_lock(&repo).await;
+    let _guard = repo_lock.lock().await;
+
+    // Live-registry guard: if we still track a supervisor for this id, the
+    // caller must `StopSession` first. Without this check the DB row could
+    // show `stopped` (e.g. from a prior failed stop path) while the actual
+    // supervisor process is still bound to the workspace CWD, and removing
+    // the session dir would race the supervisor's log writer.
+    {
+        let sessions = state.sessions.lock().await;
+        if sessions.contains_key(&id) {
+            return ControlFrame::Error {
+                message: format!(
+                    "session '{}' is still live — stop it first",
+                    &id[..8.min(id.len())]
+                ),
+            };
+        }
+    }
+
+    let session_store = SessionStore::new(state.paths.clone());
+    match session_store.remove(&repo, &id) {
+        Ok(()) => {
+            info!(
+                "RemoveSession: {}:{}",
+                repo,
+                &id[..8.min(id.len())]
+            );
+            // Broadcast SessionsChanged so subscribers drop the row from
+            // their cached list. Cheap + matches the existing coarse-event
+            // policy (D10).
+            if let Some(monitor) = state.monitor.get() {
+                monitor.broadcast(
+                    crate::cmd::workspace_monitor::ChangeKind::Sessions(repo.clone()),
+                );
+            }
+            ControlFrame::RemoveSessionAck
+        }
+        Err(e) => ControlFrame::Error {
+            message: format!("remove session failed: {e}"),
+        },
+    }
+}
+
+/// Handle `RenameSession` — pure DB label update. No filesystem or
+/// supervisor involvement. Held under the per-repo mutation lock so a
+/// concurrent `RemoveSession` / `RemoveRepo` can't flip the row out from
+/// under the UPDATE.
+async fn handle_rename_session(
+    state: &Arc<DaemonState>,
+    repo: String,
+    id: String,
+    label: Option<String>,
+) -> ControlFrame {
+    let repo_lock = state.acquire_repo_mutation_lock(&repo).await;
+    let _guard = repo_lock.lock().await;
+
+    let session_store = SessionStore::new(state.paths.clone());
+    match session_store.rename(&repo, &id, label.as_deref()) {
+        Ok(()) => {
+            if let Some(monitor) = state.monitor.get() {
+                monitor.broadcast(
+                    crate::cmd::workspace_monitor::ChangeKind::Sessions(repo.clone()),
+                );
+            }
+            ControlFrame::RenameSessionAck
+        }
+        Err(e) => ControlFrame::Error {
+            message: format!("rename session failed: {e}"),
+        },
+    }
+}
+
+/// Handle `DetachSession` — probe that the session still exists.
+///
+/// The actual attach/detach connection lives between the Tauri backend
+/// and the supervisor's session pipe (per migration non-goals: terminal
+/// I/O stays direct). This RPC is a daemon-visible hook so CLI and GUI
+/// detach flows look identical end-to-end — useful for telemetry and as
+/// the seam the future multi-window subscription path will plug into.
+/// Today it just validates the id resolves, so a frontend that calls
+/// detach on a stale id gets a typed error rather than silently losing
+/// state.
+async fn handle_detach_session(state: &Arc<DaemonState>, id: String) -> ControlFrame {
+    let session_store = SessionStore::new(state.paths.clone());
+    match session_store.find_by_id(&id) {
+        Ok(_) => ControlFrame::DetachSessionAck,
+        Err(e) => ControlFrame::Error {
+            message: format!("detach: {e}"),
+        },
+    }
+}
+
+/// Handle `FindSessionById` — walk the global session index and return
+/// the unique match. Read-only, no locks: the index DB and per-repo DBs
+/// are both opened in WAL mode so the walk is safe against concurrent
+/// writes (Session writes are short; reading under WAL never blocks).
+///
+/// Ambiguous or absent ids surface as an `Error` frame carrying the same
+/// message shape `SessionStore::find_by_id` returns — callers can match
+/// on substrings if they need typed handling (see `handle_stop`'s
+/// in-memory prefix-match logic for the pattern).
+async fn handle_find_session_by_id(
+    state: &Arc<DaemonState>,
+    prefix: String,
+) -> ControlFrame {
+    let session_store = SessionStore::new(state.paths.clone());
+    match session_store.find_by_id(&prefix) {
+        Ok((repo, session)) => ControlFrame::FoundSession { repo, session },
+        Err(e) => ControlFrame::Error {
+            message: format!("find session: {e}"),
+        },
+    }
+}
+
+// ── Phase 5: harness-hook installation ──────────────────────────────────────
+//
+// Centralizes the best-effort per-session `install_claude_code_hooks` that
+// used to run independently in the CLI and Tauri spawn paths. Routing
+// through one RPC + one global mutex gives us:
+//   - a single source of truth for the "did it install / why was it skipped"
+//     ack, which today's call sites discard with `let _ = ...`.
+//   - serialized read-modify-write on `~/.claude/settings.json`, which is
+//     user-global (not per-repo).
+//   - a forward-compat seam for future harnesses (currently only Claude
+//     Code has an installer; Codex returns a skipped ack).
+
+/// Handle `InstallHarnessHooks` — install or verify hook integration for
+/// the given harness.
+///
+/// The `installed` bool in the returned ack is a **postcondition** — `true`
+/// means hooks are in place after this call, not that bytes were written.
+/// See the ack matrix in `docs/daemon-broker-migration.md` Phase 5 section.
+///
+/// Held under `hooks_install_lock` for the full query+install sequence so
+/// two concurrent calls can't both see "not installed" and both perform a
+/// write (Codex review round 1 medium). Wrapping only the write would still
+/// race duplicate entries into settings.json.
+async fn handle_install_harness_hooks(
+    state: &Arc<DaemonState>,
+    harness: String,
+) -> ControlFrame {
+    // Parse outside the lock — pure string work, and an unknown harness
+    // doesn't need to serialize against anything.
+    let parsed: Option<shard_core::harness::Harness> = harness.parse().ok();
+
+    let Some(parsed) = parsed else {
+        // Unknown harness: soft-skip, matching `handle_spawn`'s
+        // degrade-to-None policy so an older daemon stays quiet when a
+        // future client adds a new harness variant.
+        return ControlFrame::InstallHarnessHooksAck {
+            installed: false,
+            skipped_reason: Some(format!("unknown harness '{harness}'")),
+        };
+    };
+
+    match parsed {
+        shard_core::harness::Harness::ClaudeCode => {
+            install_claude_code_under_lock(state).await
+        }
+        shard_core::harness::Harness::Codex => ControlFrame::InstallHarnessHooksAck {
+            installed: false,
+            skipped_reason: Some("codex hooks not yet implemented".to_string()),
+        },
+    }
+}
+
+async fn install_claude_code_under_lock(state: &Arc<DaemonState>) -> ControlFrame {
+    let _guard = state.hooks_install_lock.lock().await;
+
+    let home: PathBuf = match &state.hooks_home_override {
+        Some(home) => home.clone(),
+        None => match shard_core::hooks::default_hooks_home() {
+            Some(home) => home,
+            None => {
+                return ControlFrame::Error {
+                    message: "cannot determine home directory".to_string(),
+                };
+            }
+        },
+    };
+
+    let claude_dir = home.join(".claude");
+    if !claude_dir.exists() {
+        // Postcondition is "hooks not present" — report false + reason.
+        // Matches today's `install_claude_code_hooks` Ok-but-no-op
+        // behavior without ever claiming installed=true.
+        tracing::info!(
+            "InstallHarnessHooks: {} missing; skipping Claude Code install",
+            claude_dir.display()
+        );
+        return ControlFrame::InstallHarnessHooksAck {
+            installed: false,
+            skipped_reason: Some("claude code not installed".to_string()),
+        };
+    }
+
+    // Predicate takes shardctl_path so it compares against what the
+    // install would actually write (see Codex round 2 finding + hooks
+    // module docs). Stale/partial state falls into the install branch
+    // which converges to the correct 4-event shape.
+    if shard_core::hooks::claude_code_hooks_installed_in_home(&home, &state.exe_path) {
+        return ControlFrame::InstallHarnessHooksAck {
+            installed: true,
+            skipped_reason: Some("already configured".to_string()),
+        };
+    }
+
+    match shard_core::hooks::install_claude_code_hooks_in_home(&home, &state.exe_path) {
+        Ok(()) => {
+            tracing::info!("InstallHarnessHooks: Claude Code hooks written");
+            ControlFrame::InstallHarnessHooksAck {
+                installed: true,
+                skipped_reason: None,
+            }
+        }
+        Err(e) => ControlFrame::Error {
+            message: format!("install claude code hooks: {e}"),
         },
     }
 }
@@ -1576,6 +3218,8 @@ async fn adopt_orphans(state: Arc<DaemonState>) {
     #[cfg(windows)]
     {
         let count = state.sessions.lock().await.len();
-        let _ = state.tray_proxy.send_event(TrayEvent::SessionCount(count));
+        if let Some(proxy) = &state.tray_proxy {
+            let _ = proxy.send_event(TrayEvent::SessionCount(count));
+        }
     }
 }

@@ -1,59 +1,32 @@
-use shard_core::repos::{Repository, RepositoryStore};
-use shard_core::workspaces::WorkspaceStore;
-use shard_core::ShardPaths;
+use shard_core::repos::Repository;
 use tauri::Emitter;
 
-use crate::daemon_ipc::spawn_topology_poke;
+use crate::daemon_ipc;
 
 #[tauri::command]
-pub fn list_repos() -> Result<Vec<Repository>, String> {
-    let store = RepositoryStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
-    store.list().map_err(|e| e.to_string())
+pub async fn list_repos() -> Result<Vec<Repository>, String> {
+    daemon_ipc::list_repos().await
 }
 
 #[tauri::command]
-pub fn add_repo(app: tauri::AppHandle, url: String, alias: Option<String>) -> Result<Repository, String> {
-    let paths = ShardPaths::new().map_err(|e| e.to_string())?;
-    let store = RepositoryStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
-    let repo = store.add(&url, alias.as_deref()).map_err(|e| e.to_string())?;
-
-    // Auto-create a workspace for the default branch
-    let ws_store = WorkspaceStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
-    let is_local = repo.local_path.is_some();
-    let source_dir = paths.repo_source_for_repo(&repo.alias, repo.local_path.as_deref());
-    match shard_core::git::default_branch(&source_dir) {
-        Ok(branch) => {
-            if let Err(e) = ws_store.create(
-                &repo.alias,
-                Some(&branch),
-                shard_core::workspaces::WorkspaceMode::NewBranch,
-                Some(&branch),
-                is_local,
-            ) {
-                tracing::warn!("auto-create default workspace failed: {e}");
-            }
-        }
-        Err(e) => {
-            tracing::warn!("could not detect default branch: {e}");
-        }
-    }
-
-    spawn_topology_poke(Some(repo.alias.clone()));
+pub async fn add_repo(
+    app: tauri::AppHandle,
+    url: String,
+    alias: Option<String>,
+) -> Result<Repository, String> {
+    let repo = daemon_ipc::add_repo(&url, alias).await?;
     let _ = app.emit("sidebar-changed", ());
     Ok(repo)
 }
 
 #[tauri::command]
-pub fn sync_repo(alias: String) -> Result<(), String> {
-    let store = RepositoryStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
-    store.sync(&alias).map_err(|e| e.to_string())
+pub async fn sync_repo(alias: String) -> Result<(), String> {
+    daemon_ipc::sync_repo(&alias).await
 }
 
 #[tauri::command]
-pub fn remove_repo(app: tauri::AppHandle, alias: String) -> Result<(), String> {
-    let store = RepositoryStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
-    store.remove(&alias).map_err(|e| e.to_string())?;
-    spawn_topology_poke(Some(alias));
+pub async fn remove_repo(app: tauri::AppHandle, alias: String) -> Result<(), String> {
+    daemon_ipc::remove_repo(&alias).await?;
     let _ = app.emit("sidebar-changed", ());
     Ok(())
 }

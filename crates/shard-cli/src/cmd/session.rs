@@ -41,15 +41,15 @@ fn create(target: String, harness: Option<shard_core::Harness>, command: Vec<Str
         command
     };
 
-    // Best-effort: install harness hooks so agents can report activity state
-    let exe = std::env::current_exe()?;
-    if !shard_core::hooks::claude_code_hooks_installed() {
-        if let Err(e) = shard_core::hooks::install_claude_code_hooks(&exe) {
-            tracing::warn!("failed to install Claude Code hooks: {e}");
-        }
-    }
-
-    // Route through daemon: connect-or-spawn, then send SpawnSession RPC
+    // Route through daemon: connect-or-spawn, install harness hooks
+    // (daemon-centralized per Phase 5), then send SpawnSession RPC.
+    //
+    // Phase 5 note: callers always request the Claude Code installer
+    // regardless of the session's selected harness. The RPC's `harness`
+    // arg is the install *target*, not the session's harness — this
+    // preserves today's opportunistic-install behavior where Codex
+    // sessions still get Claude hooks bootstrapped, so switching
+    // harnesses mid-session doesn't strand the user.
     let rt = tokio::runtime::Runtime::new()?;
     let result = rt.block_on(async {
         use shard_transport::control_protocol::ControlFrame;
@@ -58,6 +58,43 @@ fn create(target: String, harness: Option<shard_core::Harness>, command: Vec<Str
         conn.handshake().await.map_err(|e| {
             shard_core::ShardError::Other(format!("daemon handshake failed: {e}"))
         })?;
+
+        // Hooks install round-trip — non-fatal. A hooks failure must
+        // not block the session from spawning; the daemon centralizes
+        // the serialized read-modify-write, so there's no cleanup to
+        // unwind here. Print a one-line summary mapped from the ack
+        // matrix so the operator can tell whether hooks are in place.
+        match conn
+            .request(&ControlFrame::InstallHarnessHooks {
+                harness: "claude-code".to_string(),
+            })
+            .await
+        {
+            Ok(ControlFrame::InstallHarnessHooksAck {
+                installed,
+                skipped_reason,
+            }) => match (installed, skipped_reason.as_deref()) {
+                (true, None) => println!("Installed Claude Code hooks."),
+                (true, Some(_already_configured)) => {
+                    tracing::debug!("Claude Code hooks already configured");
+                }
+                (false, Some(reason)) => {
+                    eprintln!("Claude Code hooks skipped: {reason}");
+                }
+                (false, None) => {
+                    tracing::debug!("Claude Code hooks skipped with no reason");
+                }
+            },
+            Ok(ControlFrame::Error { message }) => {
+                eprintln!("warning: hooks install failed: {message}");
+            }
+            Ok(other) => {
+                tracing::warn!("hooks install: unexpected response {other:?}");
+            }
+            Err(e) => {
+                tracing::warn!("hooks install: request failed: {e}");
+            }
+        }
 
         let response = conn
             .request(&ControlFrame::SpawnSession {
@@ -203,8 +240,7 @@ fn list(target: Option<String>, json: bool) -> shard_core::Result<()> {
 }
 
 fn attach(id: String) -> shard_core::Result<()> {
-    let session_store = SessionStore::new(ShardPaths::new()?);
-    let (_repo, session) = session_store.find_by_id(&id)?;
+    let (_repo, session) = find_session_via_daemon(&id)?;
 
     if session.status != "running" {
         return Err(shard_core::ShardError::Other(format!(
@@ -221,8 +257,8 @@ fn attach(id: String) -> shard_core::Result<()> {
 }
 
 fn stop(id: String, force: bool) -> shard_core::Result<()> {
+    let (repo, session) = find_session_via_daemon(&id)?;
     let session_store = SessionStore::new(ShardPaths::new()?);
-    let (repo, session) = session_store.find_by_id(&id)?;
 
     if session.status != "running" && session.status != "starting" {
         println!("Session {} is already '{}'", id, session.status);
@@ -313,11 +349,67 @@ fn stop(id: String, force: bool) -> shard_core::Result<()> {
 }
 
 fn remove(id: String) -> shard_core::Result<()> {
-    let session_store = SessionStore::new(ShardPaths::new()?);
-    let (repo, _session) = session_store.find_by_id(&id)?;
-    session_store.remove(&repo, &id)?;
-    println!("Removed session {}", &id[..8]);
+    use shard_transport::control_protocol::ControlFrame;
+
+    let (repo, session) = find_session_via_daemon(&id)?;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        use shard_transport::daemon_client;
+
+        let mut conn = daemon_client::connect()
+            .await
+            .map_err(|e| shard_core::ShardError::Other(format!("daemon not running: {e}")))?;
+        conn.handshake()
+            .await
+            .map_err(|e| shard_core::ShardError::Other(format!("daemon handshake: {e}")))?;
+        conn.request_typed(
+            &ControlFrame::RemoveSession {
+                repo: repo.clone(),
+                id: session.id.clone(),
+            },
+            |f| match f {
+                ControlFrame::RemoveSessionAck => Ok(()),
+                other => Err(other),
+            },
+        )
+        .await
+        .map_err(|e| shard_core::ShardError::Other(e.to_string()))
+    })?;
+
+    println!("Removed session {}", &session.id[..8.min(session.id.len())]);
     Ok(())
+}
+
+/// Resolve a session id (or prefix) through the daemon's global session
+/// index. Same shape CLI repo / workspace subcommands use for their
+/// daemon round-trips (see `cmd/repo.rs::run_daemon_rpc`). Per Phase 4
+/// D4, all session lookups route through the daemon so CLI and GUI
+/// agree on the source of truth.
+fn find_session_via_daemon(id: &str) -> shard_core::Result<(String, shard_core::sessions::Session)> {
+    use shard_transport::control_protocol::ControlFrame;
+    use shard_transport::daemon_client;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let mut conn = daemon_client::connect()
+            .await
+            .map_err(|e| shard_core::ShardError::Other(format!("daemon not running: {e}")))?;
+        conn.handshake()
+            .await
+            .map_err(|e| shard_core::ShardError::Other(format!("daemon handshake: {e}")))?;
+        conn.request_typed(
+            &ControlFrame::FindSessionById {
+                prefix: id.to_string(),
+            },
+            |f| match f {
+                ControlFrame::FoundSession { repo, session } => Ok((repo, session)),
+                other => Err(other),
+            },
+        )
+        .await
+        .map_err(|e| shard_core::ShardError::Other(e.to_string()))
+    })
 }
 
 fn serve(

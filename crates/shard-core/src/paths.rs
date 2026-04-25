@@ -26,6 +26,14 @@ impl ShardPaths {
         Ok(Self { data_dir })
     }
 
+    /// Construct paths rooted at an explicit data directory, bypassing the
+    /// `SHARD_DATA_DIR` env var and `ProjectDirs`. Used by the integration
+    /// test harness so parallel tests never share state through the process
+    /// environment.
+    pub fn from_data_dir(data_dir: PathBuf) -> Self {
+        Self { data_dir }
+    }
+
     /// Root data directory (e.g., `%LOCALAPPDATA%\shard\data\`)
     pub fn data_dir(&self) -> &PathBuf {
         &self.data_dir
