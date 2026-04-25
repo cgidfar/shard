@@ -122,6 +122,9 @@ const sidebar = new Sidebar(sidebarEl, {
       alert(`Failed to create workspace: ${err}`);
     }
   },
+  onRemoveWorkspace(repo: string, workspace: string, sessionIds: string[]) {
+    doRemoveWorkspace(repo, workspace, sessionIds);
+  },
 });
 
 function openSession(repo: string, workspace: string, sessionId: string, sessionLabel: string) {
@@ -137,12 +140,35 @@ function openSession(repo: string, workspace: string, sessionId: string, session
 }
 
 function closeSession(sessionId: string) {
+  const wasActive = terminalPane.getActiveId() === sessionId;
   activityStore.remove(sessionId);
   terminalPane.close(sessionId);
+  if (wasActive) {
+    sidebar.setActiveSession(null);
+  }
   if (!terminalPane.getActiveId()) {
     terminalPane.showEmpty();
     currentBreadcrumb = null;
     titleBar.setBreadcrumb(null);
+  }
+}
+
+async function doRemoveWorkspace(
+  repo: string,
+  workspace: string,
+  sessionIds = sidebar.getSessionIdsForWorkspace(repo, workspace),
+) {
+  for (const sessionId of new Set(sessionIds)) {
+    closeSession(sessionId);
+  }
+
+  try {
+    await removeWorkspace(repo, workspace);
+    await sidebar.refresh();
+    await updateEmptyState();
+  } catch (err) {
+    await sidebar.refresh();
+    alert(`Failed to remove workspace: ${err}`);
   }
 }
 
@@ -254,9 +280,7 @@ contextMenu.register(".tree-group-ws", (el): MenuItemDef[] => {
     label: "Remove Workspace",
     danger: true,
     handler() {
-      removeWorkspace(repo, workspace)
-        .then(() => sidebar.refresh())
-        .catch((err) => alert(`Failed to remove workspace: ${err}`));
+      doRemoveWorkspace(repo, workspace);
     },
   });
   return items;

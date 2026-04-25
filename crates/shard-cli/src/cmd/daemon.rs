@@ -62,6 +62,12 @@ pub struct LiveSession {
     pub creation_time: u64,
 }
 
+#[cfg(windows)]
+const SESSION_MUTATION_STOP_TIMEOUT: Duration = Duration::from_secs(8);
+
+#[cfg(windows)]
+const SUPERVISOR_EXIT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Snapshot of the minimum session info the tray quit path needs,
 /// captured under the `DaemonState.sessions` lock and then released so the
 /// lock is not held across the graceful-stop RPCs or the confirmation dialog.
@@ -739,7 +745,40 @@ pub(crate) async fn stop_session_and_wait(
     graceful_timeout: Duration,
 ) -> shard_core::Result<StopOutcome> {
     match stop_and_drain(transport_addr, graceful_timeout).await? {
-        DrainOutcome::Exited => Ok(StopOutcome::Exited),
+        DrainOutcome::Exited => {
+            match shard_supervisor::process_windows::wait_for_pid_exit_checked(
+                supervisor_pid,
+                creation_time,
+                SUPERVISOR_EXIT_CONFIRM_TIMEOUT,
+            ) {
+                Ok(true) => Ok(StopOutcome::Exited),
+                Ok(false) => {
+                    warn!(
+                        "stop_session_and_wait: pid={supervisor_pid} sent status but remained live for {:?}, force-killing",
+                        SUPERVISOR_EXIT_CONFIRM_TIMEOUT
+                    );
+                    shard_supervisor::process_windows::force_kill_pid_checked(
+                        supervisor_pid,
+                        creation_time,
+                    )
+                    .map_err(|e| {
+                        shard_core::ShardError::Other(format!(
+                            "force-kill pid {supervisor_pid} after status failed: {e}"
+                        ))
+                    })?;
+                    Ok(StopOutcome::ForceKilled)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    warn!(
+                        "stop_session_and_wait: pid={supervisor_pid} sent status but failed the exit wait guard ({e}); trusting the status frame"
+                    );
+                    Ok(StopOutcome::Exited)
+                }
+                Err(e) => Err(shard_core::ShardError::Other(format!(
+                    "wait for pid {supervisor_pid} exit failed: {e}"
+                ))),
+            }
+        }
         DrainOutcome::TimedOut => {
             warn!(
                 "stop_session_and_wait: pid={supervisor_pid} did not exit within {:?}, force-killing",
@@ -2037,9 +2076,14 @@ async fn handle_stop(state: &Arc<DaemonState>, session_id: String, force: bool) 
             |e| shard_core::ShardError::Other(format!("force-kill pid {pid} failed: {e}")),
         )
     } else {
-        stop_session_and_wait(&transport_addr, pid, creation_time, Duration::from_secs(5))
-            .await
-            .map(|_| ())
+        stop_session_and_wait(
+            &transport_addr,
+            pid,
+            creation_time,
+            SESSION_MUTATION_STOP_TIMEOUT,
+        )
+        .await
+        .map(|_| ())
     };
 
     match stop_result {
@@ -2169,13 +2213,14 @@ async fn handle_remove_workspace(
             })
             .collect()
     };
+    let session_store = SessionStore::new(state.paths.clone());
 
     for (session_id, transport_addr, pid, creation_time) in &bound_sessions {
         match stop_session_and_wait(
             transport_addr,
             *pid,
             *creation_time,
-            Duration::from_secs(5),
+            SESSION_MUTATION_STOP_TIMEOUT,
         )
         .await
         {
@@ -2193,6 +2238,35 @@ async fn handle_remove_workspace(
                 // able to see and act on it.
                 let mut sessions = state.sessions.lock().await;
                 sessions.remove(session_id);
+                drop(sessions);
+                if let Err(e) = session_store.update_status(&repo, session_id, "stopped", None) {
+                    warn!(
+                        "RemoveWorkspace: DB status update failed for {} ({e}); proceeding",
+                        &session_id[..8.min(session_id.len())]
+                    );
+                }
+                // Delete the session row so the workspace FK can drop. Without
+                // this, ws_store.delete_row below fails with a FOREIGN KEY
+                // constraint and the workspace is left in Broken state.
+                // SessionNotFound is fine — registry-only entries (tests, or
+                // a session never persisted) have nothing to delete.
+                match session_store.remove(&repo, session_id) {
+                    Ok(()) => {}
+                    Err(shard_core::ShardError::SessionNotFound(_)) => {}
+                    Err(e) => {
+                        warn!(
+                            "RemoveWorkspace: session row delete failed for {} ({e}); aborting delete",
+                            &session_id[..8.min(session_id.len())]
+                        );
+                        guard.commit_broken();
+                        return ControlFrame::Error {
+                            message: format!(
+                                "failed to remove session row {}: {e}",
+                                &session_id[..8.min(session_id.len())]
+                            ),
+                        };
+                    }
+                }
             }
             Err(e) => {
                 warn!(
@@ -2211,6 +2285,48 @@ async fn handle_remove_workspace(
                     ),
                 };
             }
+        }
+    }
+
+    if !bound_sessions.is_empty() {
+        if let Some(monitor) = state.monitor.get() {
+            monitor.broadcast(crate::cmd::workspace_monitor::ChangeKind::Sessions(
+                repo.clone(),
+            ));
+        }
+    }
+
+    // Remove any persisted terminal-status sessions that were not in the
+    // live registry. Otherwise the workspace row delete below can still fail
+    // its sessions.workspace_name foreign key.
+    match session_store.list(&repo, Some(&name)) {
+        Ok(sessions) => {
+            for session in sessions {
+                match session_store.remove(&repo, &session.id) {
+                    Ok(()) => {}
+                    Err(shard_core::ShardError::SessionNotFound(_)) => {}
+                    Err(e) => {
+                        warn!(
+                            "RemoveWorkspace: persisted session row delete failed for {} ({e}); aborting delete",
+                            &session.id[..8.min(session.id.len())]
+                        );
+                        guard.commit_broken();
+                        return ControlFrame::Error {
+                            message: format!(
+                                "failed to remove persisted session row {}: {e}",
+                                &session.id[..8.min(session.id.len())]
+                            ),
+                        };
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            warn!("RemoveWorkspace: failed to list persisted sessions for {repo}:{name}: {e}");
+            guard.commit_broken();
+            return ControlFrame::Error {
+                message: format!("failed to list persisted sessions for workspace: {e}"),
+            };
         }
     }
 
@@ -2609,19 +2725,49 @@ async fn handle_remove_repo(state: &Arc<DaemonState>, alias: String) -> ControlF
             })
             .collect()
     };
+    let session_store = SessionStore::new(state.paths.clone());
 
     for (session_id, transport_addr, pid, creation_time) in &bound_sessions {
         match stop_session_and_wait(
             transport_addr,
             *pid,
             *creation_time,
-            Duration::from_secs(5),
+            SESSION_MUTATION_STOP_TIMEOUT,
         )
         .await
         {
             Ok(_) => {
                 let mut sessions = state.sessions.lock().await;
                 sessions.remove(session_id);
+                drop(sessions);
+                if let Err(e) = session_store.update_status(&alias, session_id, "stopped", None) {
+                    warn!(
+                        "RemoveRepo: DB status update failed for {} ({e}); proceeding",
+                        &session_id[..8.min(session_id.len())]
+                    );
+                }
+                // Delete the session row so the workspace FK can drop later.
+                // SessionNotFound is fine (registry-only entries have nothing
+                // to delete in the DB).
+                match session_store.remove(&alias, session_id) {
+                    Ok(()) => {}
+                    Err(shard_core::ShardError::SessionNotFound(_)) => {}
+                    Err(e) => {
+                        warn!(
+                            "RemoveRepo: session row delete failed for {} ({e}); aborting",
+                            &session_id[..8.min(session_id.len())]
+                        );
+                        for g in guards {
+                            g.rollback();
+                        }
+                        return ControlFrame::Error {
+                            message: format!(
+                                "failed to remove session row {}: {e}",
+                                &session_id[..8.min(session_id.len())]
+                            ),
+                        };
+                    }
+                }
             }
             Err(e) => {
                 warn!(
@@ -2643,6 +2789,14 @@ async fn handle_remove_repo(state: &Arc<DaemonState>, alias: String) -> ControlF
                     ),
                 };
             }
+        }
+    }
+
+    if !bound_sessions.is_empty() {
+        if let Some(monitor) = state.monitor.get() {
+            monitor.broadcast(crate::cmd::workspace_monitor::ChangeKind::Sessions(
+                alias.clone(),
+            ));
         }
     }
 

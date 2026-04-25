@@ -151,10 +151,7 @@ impl WorkspaceStore {
                 .to_string(),
         };
 
-        Ok(match name {
-            Some(n) => n.to_string(),
-            None => branch_for_db,
-        })
+        Ok(resolve_workspace_name_from_branch(name, mode, &branch_for_db))
     }
 
     /// Create a new workspace for a repo.
@@ -223,10 +220,7 @@ impl WorkspaceStore {
             }
         };
 
-        let ws_name = match name {
-            Some(n) => n.to_string(),
-            None => branch_for_db.clone(),
-        };
+        let ws_name = resolve_workspace_name_from_branch(name, mode, &branch_for_db);
 
         // Check for duplicates in DB
         let repo_db_path = self.paths.repo_db(repo_alias);
@@ -593,6 +587,49 @@ fn external_worktree_label(path: &std::path::Path) -> String {
         "(external worktree)".into()
     } else {
         format!("(external: {name})")
+    }
+}
+
+fn resolve_workspace_name_from_branch(
+    name: Option<&str>,
+    mode: WorkspaceMode,
+    branch_for_db: &str,
+) -> String {
+    match (mode, name) {
+        (WorkspaceMode::ExistingBranch, None) => safe_workspace_name(branch_for_db),
+        (WorkspaceMode::ExistingBranch, Some(n)) if n == branch_for_db => {
+            safe_workspace_name(branch_for_db)
+        }
+        (_, Some(n)) => n.to_string(),
+        (_, None) => branch_for_db.to_string(),
+    }
+}
+
+fn safe_workspace_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut last_dash = false;
+
+    for ch in raw.chars() {
+        let safe = match ch {
+            '/' | '\\' => '-',
+            _ => ch,
+        };
+        if safe == '-' {
+            if last_dash {
+                continue;
+            }
+            last_dash = true;
+        } else {
+            last_dash = false;
+        }
+        out.push(safe);
+    }
+
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "workspace".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 

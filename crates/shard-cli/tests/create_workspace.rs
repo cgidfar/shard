@@ -330,6 +330,53 @@ async fn create_after_delete_succeeds() {
     harness.shutdown().await;
 }
 
+#[tokio::test]
+async fn create_existing_branch_with_slash_uses_single_workspace_dir() {
+    let harness = TestHarness::start().await;
+    let (_alias, repo_path) = harness.setup_local_repo("demo");
+    let branch = "feature/FD-6557-correct-projection-model";
+    let output = std::process::Command::new("git")
+        .args(["branch", branch])
+        .current_dir(&repo_path)
+        .output()
+        .expect("spawn git branch");
+    assert!(
+        output.status.success(),
+        "git branch failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    match create_workspace(
+        &harness,
+        "demo",
+        Some(branch),
+        WorkspaceMode::ExistingBranch,
+        Some(branch),
+    )
+    .await
+    {
+        ControlFrame::CreateWorkspaceAck { workspace } => {
+            assert_eq!(workspace.name, "feature-FD-6557-correct-projection-model");
+            assert_eq!(workspace.branch, branch);
+            let path = Path::new(&workspace.path);
+            assert!(path.exists(), "worktree dir must exist");
+            assert_eq!(
+                path.file_name().and_then(|s| s.to_str()),
+                Some("feature-FD-6557-correct-projection-model")
+            );
+            assert_eq!(
+                path.parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|s| s.to_str()),
+                Some(".shard")
+            );
+        }
+        other => panic!("expected Ack, got {other:?}"),
+    }
+
+    harness.shutdown().await;
+}
+
 // ── ListWorkspaces ─────────────────────────────────────────────────────────
 
 #[tokio::test]

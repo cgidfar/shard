@@ -38,7 +38,7 @@ use crate::state::AppState;
 /// `crates/shard-cli/src/cmd/daemon.rs::handle_remove_workspace` for the
 /// atomic workflow (SHA-55 fix).
 pub async fn remove_workspace(repo: &str, name: &str) -> Result<(), String> {
-    let mut conn = daemon_client::connect()
+    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
         .await
         .map_err(|e| format!("daemon connect failed: {e}"))?;
     conn.handshake()
@@ -67,7 +67,7 @@ pub async fn create_workspace(
     mode: WorkspaceMode,
     branch: Option<String>,
 ) -> Result<Workspace, String> {
-    let mut conn = daemon_client::connect()
+    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
         .await
         .map_err(|e| format!("daemon connect failed: {e}"))?;
     conn.handshake()
@@ -93,7 +93,7 @@ pub async fn create_workspace(
 /// daemon monitor. The daemon joins DB + monitor snapshot server-side so
 /// the caller sees a consistent view.
 pub async fn list_workspaces(repo: &str) -> Result<Vec<WorkspaceWithStatus>, String> {
-    let mut conn = daemon_client::connect()
+    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
         .await
         .map_err(|e| format!("daemon connect failed: {e}"))?;
     conn.handshake()
@@ -115,7 +115,7 @@ pub async fn list_workspaces(repo: &str) -> Result<Vec<WorkspaceWithStatus>, Str
 /// Enumerate branches + current worktree occupancy for `repo`. Drives the
 /// new-workspace wizard's branch picker.
 pub async fn list_branch_info(repo: &str) -> Result<Vec<BranchInfo>, String> {
-    let mut conn = daemon_client::connect()
+    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
         .await
         .map_err(|e| format!("daemon connect failed: {e}"))?;
     conn.handshake()
@@ -139,7 +139,7 @@ pub async fn list_branch_info(repo: &str) -> Result<Vec<BranchInfo>, String> {
 /// returns the persisted row. See
 /// `crates/shard-cli/src/cmd/daemon.rs::handle_add_repo`.
 pub async fn add_repo(url: &str, alias: Option<String>) -> Result<Repository, String> {
-    let mut conn = daemon_client::connect()
+    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
         .await
         .map_err(|e| format!("daemon connect failed: {e}"))?;
     conn.handshake()
@@ -163,7 +163,7 @@ pub async fn add_repo(url: &str, alias: Option<String>) -> Result<Repository, St
 /// sessions, drops the watcher, removes worktrees + DB rows, and (for
 /// remote repos) the bare clone. Local checkouts are preserved.
 pub async fn remove_repo(alias: &str) -> Result<(), String> {
-    let mut conn = daemon_client::connect()
+    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
         .await
         .map_err(|e| format!("daemon connect failed: {e}"))?;
     conn.handshake()
@@ -184,7 +184,7 @@ pub async fn remove_repo(alias: &str) -> Result<(), String> {
 
 /// `git fetch --all --prune` against a repo's source. No DB mutation.
 pub async fn sync_repo(alias: &str) -> Result<(), String> {
-    let mut conn = daemon_client::connect()
+    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
         .await
         .map_err(|e| format!("daemon connect failed: {e}"))?;
     conn.handshake()
@@ -207,7 +207,7 @@ pub async fn sync_repo(alias: &str) -> Result<(), String> {
 /// session index. Returns `(repo_alias, session)`; error on zero /
 /// ambiguous matches.
 pub async fn find_session_by_id(prefix: &str) -> Result<(String, Session), String> {
-    let mut conn = daemon_client::connect()
+    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
         .await
         .map_err(|e| format!("daemon connect failed: {e}"))?;
     conn.handshake()
@@ -230,7 +230,7 @@ pub async fn find_session_by_id(prefix: &str) -> Result<(String, Session), Strin
 /// guards on `running`/`starting` and cleans up the session directory
 /// under the per-repo mutation lock.
 pub async fn remove_session(repo: &str, id: &str) -> Result<(), String> {
-    let mut conn = daemon_client::connect()
+    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
         .await
         .map_err(|e| format!("daemon connect failed: {e}"))?;
     conn.handshake()
@@ -256,7 +256,7 @@ pub async fn rename_session(
     id: &str,
     label: Option<String>,
 ) -> Result<(), String> {
-    let mut conn = daemon_client::connect()
+    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
         .await
         .map_err(|e| format!("daemon connect failed: {e}"))?;
     conn.handshake()
@@ -284,7 +284,7 @@ pub async fn rename_session(
 /// `SessionsChanged` over the subscribe channel for any long-lived
 /// subscribers.
 pub async fn stop_session(id: &str, force: bool) -> Result<(), String> {
-    let mut conn = daemon_client::connect()
+    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
         .await
         .map_err(|e| format!("daemon connect failed: {e}"))?;
     conn.handshake()
@@ -309,7 +309,7 @@ pub async fn stop_session(id: &str, force: bool) -> Result<(), String> {
 /// connection teardown stays in the Tauri backend (terminal I/O is
 /// direct; see migration non-goals).
 pub async fn detach_session(id: &str) -> Result<(), String> {
-    let mut conn = daemon_client::connect()
+    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
         .await
         .map_err(|e| format!("daemon connect failed: {e}"))?;
     conn.handshake()
@@ -340,7 +340,7 @@ pub async fn detach_session(id: &str) -> Result<(), String> {
 pub async fn install_harness_hooks(
     harness: &str,
 ) -> Result<(bool, Option<String>), String> {
-    let mut conn = daemon_client::connect()
+    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
         .await
         .map_err(|e| format!("daemon connect failed: {e}"))?;
     conn.handshake()
@@ -365,7 +365,7 @@ pub async fn install_harness_hooks(
 /// List registered repositories via the daemon so readers agree with the
 /// event stream.
 pub async fn list_repos() -> Result<Vec<Repository>, String> {
-    let mut conn = daemon_client::connect()
+    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
         .await
         .map_err(|e| format!("daemon connect failed: {e}"))?;
     conn.handshake()

@@ -46,6 +46,15 @@ fn db_has_workspace(data_path: &Path, repo: &str, ws_name: &str) -> bool {
     store.get(repo, ws_name).is_ok()
 }
 
+fn db_workspace_sessions(data_path: &Path, repo: &str, ws_name: &str) -> usize {
+    let paths = shard_core::paths::ShardPaths::from_data_dir(data_path.to_path_buf());
+    let store = shard_core::sessions::SessionStore::new(paths);
+    store
+        .list(repo, Some(ws_name))
+        .expect("list workspace sessions")
+        .len()
+}
+
 // ── 1. Happy path ────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -168,6 +177,40 @@ async fn remove_workspace_with_live_session() {
         0
     );
     let _ = fake.await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn remove_workspace_with_stopped_persisted_session() {
+    let harness = TestHarness::start().await;
+    harness.setup_local_repo("demo");
+    let ws_path = harness.setup_workspace("demo", "feature-stopped");
+    let (_session_id, session_dir) =
+        harness.setup_terminal_session("demo", "feature-stopped", "stopped");
+
+    assert!(session_dir.exists(), "session dir should exist before remove");
+    assert_eq!(
+        db_workspace_sessions(&harness.data_path, "demo", "feature-stopped"),
+        1
+    );
+
+    match remove_workspace(&harness, "demo", "feature-stopped").await {
+        ControlFrame::RemoveWorkspaceAck => {}
+        other => panic!("expected Ack, got {other:?}"),
+    }
+
+    assert!(!ws_path.exists(), "workspace dir should be gone");
+    assert!(!session_dir.exists(), "session dir should be gone");
+    assert!(!db_has_workspace(
+        &harness.data_path,
+        "demo",
+        "feature-stopped"
+    ));
+    assert_eq!(
+        db_workspace_sessions(&harness.data_path, "demo", "feature-stopped"),
+        0
+    );
+
     harness.shutdown().await;
 }
 
