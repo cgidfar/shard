@@ -89,7 +89,6 @@ terminalPane.onTitleChange = (sessionId, title) => {
 };
 
 const titleBar = new TitleBar(titlebarEl, {
-  onAddShard: openAddShardDialog,
   onToggleSidebar() {
     sidebarEl.classList.toggle("collapsed");
   },
@@ -125,6 +124,7 @@ const sidebar = new Sidebar(sidebarEl, {
   onRemoveWorkspace(repo: string, workspace: string, sessionIds: string[]) {
     doRemoveWorkspace(repo, workspace, sessionIds);
   },
+  onAddShard: openAddShardDialog,
 });
 
 function openSession(repo: string, workspace: string, sessionId: string, sessionLabel: string) {

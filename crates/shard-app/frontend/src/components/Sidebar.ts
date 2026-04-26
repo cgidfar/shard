@@ -23,12 +23,25 @@ const ICON_HOME =
 const ICON_BRANCH =
   `<svg class="tree-icon" width="13" height="13" viewBox="0 0 14 14" fill="none" aria-hidden="true"><circle cx="4" cy="3.2" r="1.4" stroke="currentColor" stroke-width="1" fill="none"/><circle cx="4" cy="10.8" r="1.4" stroke="currentColor" stroke-width="1" fill="none"/><circle cx="10" cy="7" r="1.4" stroke="currentColor" stroke-width="1" fill="none"/><path d="M4 4.6 L4 9.4" stroke="currentColor" stroke-width="1"/><path d="M4 7 L8.6 7" stroke="currentColor" stroke-width="1"/></svg>`;
 
+const ICON_CHEVRONS_INWARD =
+  `<svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M3 2.25L6.5 4.5L10 2.25" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M3 10.75L6.5 8.5L10 10.75" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+
+const ICON_CHEVRONS_OUTWARD =
+  `<svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M3 4.25L6.5 2L10 4.25" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/><path d="M3 8.75L6.5 11L10 8.75" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+
+const ICON_FOLDER_PLUS =
+  `<svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M1.5 4a1 1 0 0 1 1-1h2.25l1 1.1H10.5a1 1 0 0 1 1 1V10.5a1 1 0 0 1-1 1h-8a1 1 0 0 1-1-1V4z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/><path d="M6.5 6.75v3M5 8.25h3" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/></svg>`;
+
+const ICON_COG =
+  `<svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><circle cx="7" cy="7" r="2" stroke="currentColor" stroke-width="1.2"/><path d="M7 1.75v1.4M7 10.85v1.4M12.25 7h-1.4M3.15 7h-1.4M10.71 3.29l-0.99 0.99M4.28 9.72l-0.99 0.99M10.71 10.71l-0.99-0.99M4.28 4.28l-0.99-0.99" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>`;
+
 export interface SidebarCallbacks {
   onSessionClick: (repo: string, workspace: string, sessionId: string, sessionLabel: string) => void;
   onSessionClosed: (sessionId: string) => void;
   onCreateSession: (repo: string, workspace: string) => void;
   onCreateWorkspace: (repo: string) => void;
   onRemoveWorkspace: (repo: string, workspace: string, sessionIds: string[]) => void;
+  onAddShard: () => void;
   onLabelChanged?: (sessionId: string, label: string) => void;
 }
 
@@ -105,11 +118,99 @@ export class Sidebar {
   private draftLabel: string = "";
   private dynamicTitles: Map<string, string> = new Map();
   private pendingRefresh = false;
+  private treeEl!: HTMLElement;
+  private collapseAllBtn!: HTMLButtonElement;
 
   constructor(el: HTMLElement, callbacks: SidebarCallbacks) {
     this.el = el;
     this.callbacks = callbacks;
+    this.buildChrome();
     activityStore.onChange((id, state) => this.updateActivityIndicator(id, state));
+  }
+
+  private buildChrome() {
+    this.el.innerHTML = "";
+
+    // Header — Projects label + collapse-all + new-project
+    const header = document.createElement("div");
+    header.className = "sidebar-header";
+
+    const title = document.createElement("span");
+    title.className = "sidebar-header-title";
+    title.textContent = "Projects";
+    header.appendChild(title);
+
+    this.collapseAllBtn = document.createElement("button");
+    this.collapseAllBtn.className = "sidebar-header-btn";
+    this.collapseAllBtn.title = "Collapse all";
+    this.collapseAllBtn.innerHTML = ICON_CHEVRONS_INWARD;
+    this.collapseAllBtn.addEventListener("click", () => this.toggleCollapseAll());
+    header.appendChild(this.collapseAllBtn);
+
+    const newProjectBtn = document.createElement("button");
+    newProjectBtn.className = "sidebar-header-btn";
+    newProjectBtn.title = "New project";
+    newProjectBtn.innerHTML = ICON_FOLDER_PLUS;
+    newProjectBtn.addEventListener("click", () => this.callbacks.onAddShard());
+    header.appendChild(newProjectBtn);
+
+    this.el.appendChild(header);
+
+    // Tree area — flex-grows, holds repo/workspace/session rows
+    this.treeEl = document.createElement("div");
+    this.treeEl.className = "sidebar-tree";
+    this.el.appendChild(this.treeEl);
+
+    // Footer — Settings row pinned to bottom
+    const footer = document.createElement("div");
+    footer.className = "sidebar-footer";
+
+    const settingsBtn = document.createElement("button");
+    settingsBtn.className = "sidebar-settings";
+    settingsBtn.disabled = true;
+    settingsBtn.title = "Settings";
+    settingsBtn.innerHTML = `${ICON_COG}<span>Settings</span>`;
+    footer.appendChild(settingsBtn);
+
+    this.el.appendChild(footer);
+  }
+
+  private isAnyExpanded(): boolean {
+    for (const rt of this.tree) {
+      const repoKey = `repo:${rt.repo.alias}`;
+      const repoOpen = this.expandState.get(repoKey);
+      if (repoOpen ?? true) return true;
+      for (const entry of rt.workspaces) {
+        const wsKey = `ws:${rt.repo.alias}:${entry.workspace.name}`;
+        const wsDefault = entry.sessions.length > 0;
+        const wsOpen = this.expandState.get(wsKey) ?? wsDefault;
+        if (wsOpen) return true;
+      }
+    }
+    return false;
+  }
+
+  private toggleCollapseAll() {
+    const collapsing = this.isAnyExpanded();
+    for (const rt of this.tree) {
+      this.expandState.set(`repo:${rt.repo.alias}`, !collapsing);
+      for (const entry of rt.workspaces) {
+        this.expandState.set(
+          `ws:${rt.repo.alias}:${entry.workspace.name}`,
+          !collapsing,
+        );
+      }
+    }
+    this.render();
+  }
+
+  private syncCollapseAllIcon() {
+    const anyExpanded = this.isAnyExpanded();
+    this.collapseAllBtn.innerHTML = anyExpanded
+      ? ICON_CHEVRONS_INWARD
+      : ICON_CHEVRONS_OUTWARD;
+    this.collapseAllBtn.title = anyExpanded ? "Collapse all" : "Expand all";
+    this.collapseAllBtn.disabled = this.tree.length === 0;
   }
 
   expandWorkspace(repo: string, workspace: string) {
@@ -320,7 +421,7 @@ export class Sidebar {
   }
 
   private render() {
-    this.el.innerHTML = "";
+    this.treeEl.innerHTML = "";
 
     if (this.tree.length === 0) {
       const empty = document.createElement("div");
@@ -329,7 +430,8 @@ export class Sidebar {
         <span class="sidebar-empty-title">No shards yet</span>
         <span class="sidebar-empty-hint">Add a local folder or clone a remote repo to get started</span>
       `;
-      this.el.appendChild(empty);
+      this.treeEl.appendChild(empty);
+      this.syncCollapseAllIcon();
       return;
     }
 
@@ -382,9 +484,10 @@ export class Sidebar {
         this.expandState.set(repoKey, open);
         repoChildren.className = open ? "tree-children open" : "tree-children";
         repoArrow.textContent = open ? "▼" : "▶";
+        this.syncCollapseAllIcon();
       });
 
-      this.el.appendChild(repoGroup);
+      this.treeEl.appendChild(repoGroup);
 
       // Sort workspaces: base first, then alphabetical
       const sortedWs = [...workspaces].sort((a, b) => {
@@ -461,6 +564,7 @@ export class Sidebar {
           this.expandState.set(wsKey, open);
           wsChildren.className = open ? "tree-children open" : "tree-children";
           wsArrow.textContent = open ? "▼" : "▶";
+          this.syncCollapseAllIcon();
         });
 
         repoChildren.appendChild(wsGroup);
@@ -605,7 +709,9 @@ export class Sidebar {
         repoChildren.appendChild(wsChildren);
       }
 
-      this.el.appendChild(repoChildren);
+      this.treeEl.appendChild(repoChildren);
     }
+
+    this.syncCollapseAllIcon();
   }
 }

@@ -2,7 +2,6 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { createStatusIndicator } from "../lib/statusIndicator";
 
 export interface TitleBarCallbacks {
-  onAddShard: () => void;
   onToggleSidebar: () => void;
 }
 
@@ -12,6 +11,18 @@ export interface Breadcrumb {
   session: string;
   status: string;
 }
+
+const ICON_TOGGLE_SIDEBAR =
+  `<svg width="14" height="14" viewBox="0 0 14 14"><rect x="1" y="2" width="12" height="10" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.2"/><line x1="5" y1="2" x2="5" y2="12" stroke="currentColor" stroke-width="1.2"/></svg>`;
+
+const ICON_BACK =
+  `<svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M8 3L4.5 6.5L8 10" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+
+const ICON_FORWARD =
+  `<svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M5 3L8.5 6.5L5 10" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+
+const ICON_SEARCH =
+  `<svg width="13" height="13" viewBox="0 0 13 13" fill="none"><circle cx="5.75" cy="5.75" r="3.25" stroke="currentColor" stroke-width="1.2"/><path d="M8.25 8.25L10.5 10.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>`;
 
 export class TitleBar {
   private el: HTMLElement;
@@ -61,31 +72,38 @@ export class TitleBar {
   private render() {
     this.el.innerHTML = "";
 
-    // Left: toggle + branding + add
     const left = document.createElement("div");
     left.className = "titlebar-left";
 
     const toggleBtn = document.createElement("button");
     toggleBtn.className = "titlebar-btn";
     toggleBtn.title = "Toggle sidebar";
-    toggleBtn.innerHTML = `<svg width="14" height="14" viewBox="0 0 14 14"><rect x="1" y="2" width="12" height="10" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.2"/><line x1="5" y1="2" x2="5" y2="12" stroke="currentColor" stroke-width="1.2"/></svg>`;
+    toggleBtn.innerHTML = ICON_TOGGLE_SIDEBAR;
     toggleBtn.addEventListener("click", () => this.callbacks.onToggleSidebar());
 
     const brand = document.createElement("span");
     brand.className = "titlebar-brand";
     brand.textContent = "Shard";
 
-    const addBtn = document.createElement("button");
-    addBtn.className = "titlebar-add";
-    addBtn.title = "Add shard";
-    addBtn.textContent = "+";
-    addBtn.addEventListener("click", () => this.callbacks.onAddShard());
+    const navGroup = document.createElement("div");
+    navGroup.className = "titlebar-nav";
+    for (const { icon, title, cls } of [
+      { icon: ICON_BACK, title: "Back", cls: "" },
+      { icon: ICON_FORWARD, title: "Forward", cls: "is-disabled" },
+      { icon: ICON_SEARCH, title: "Search", cls: "" },
+    ]) {
+      const btn = document.createElement("button");
+      btn.className = `titlebar-btn titlebar-btn-placeholder ${cls}`.trim();
+      btn.title = title;
+      btn.disabled = true;
+      btn.innerHTML = icon;
+      navGroup.appendChild(btn);
+    }
 
     left.appendChild(toggleBtn);
     left.appendChild(brand);
-    left.appendChild(addBtn);
+    left.appendChild(navGroup);
 
-    // Right: window controls
     const right = document.createElement("div");
     right.className = "titlebar-controls";
 
