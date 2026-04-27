@@ -563,7 +563,11 @@ pub async fn detach_session(
         if session.status == "running" {
             let task = start_monitor(app, id.clone(), session.transport_addr);
             let mut conns = state.connections.lock().await;
-            conns.insert(id, SessionConnection::Monitored { task });
+            if conns.contains_key(&id) {
+                task.abort();
+            } else {
+                conns.insert(id, SessionConnection::Monitored { task });
+            }
         }
     }
 
