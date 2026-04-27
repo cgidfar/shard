@@ -281,6 +281,10 @@ Goal: remove stale UI states and races without large UI rewrites.
 - Handle `WorkspaceRemoved` in `run_state_subscriber`.
 - Add pending-refresh coalescing while `Sidebar.refresh()` is already running.
 
+Implementation note:
+
+- Implemented by restoring the background monitor if app attach fails after aborting the old monitor, gating terminal input/resize behind attach completion, emitting `terminal-ended` on supervisor `Status`, clearing stale attached state when the attach reader exits, handling `WorkspaceRemoved` in the daemon subscriber, and coalescing `Sidebar.refresh()` calls that arrive while a refresh is already in flight.
+
 ### Batch 5: Deletion/Consolidation Sweep
 
 Goal: shrink surface area after correctness fixes.

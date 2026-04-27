@@ -377,6 +377,15 @@ init();
 // Refresh sidebar when backend structural state changes (add/remove)
 listen("sidebar-changed", () => sidebar.refresh());
 
+listen<{ id: string; status: string; code: number }>("terminal-ended", ({ payload }) => {
+  activityStore.remove(payload.id);
+  if (payload.id === terminalPane.getActiveId() && currentBreadcrumb) {
+    currentBreadcrumb = { ...currentBreadcrumb, status: payload.status };
+    titleBar.setBreadcrumb(currentBreadcrumb);
+  }
+  sidebar.refresh();
+});
+
 // Targeted workspace-status patch: the daemon WorkspaceMonitor has observed
 // external git activity (branch flip, worktree deletion) or completed a
 // reconcile pass. Apply a single-row update instead of a full refresh so

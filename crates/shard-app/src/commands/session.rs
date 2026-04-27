@@ -25,6 +25,13 @@ struct SessionActivityEvent {
     state: &'static str, // "active" | "idle" | "blocked"
 }
 
+#[derive(Clone, serde::Serialize)]
+struct TerminalEndedEvent {
+    id: String,
+    status: &'static str,
+    code: u8,
+}
+
 /// Handle ActivityUpdate and Status frames — shared by monitors and attach readers.
 /// Returns `true` if the caller should break its read loop (session ended).
 fn handle_supervisor_frame(app: &tauri::AppHandle, session_id: &str, frame: &Frame) -> bool {
@@ -57,6 +64,14 @@ fn handle_supervisor_frame(app: &tauri::AppHandle, session_id: &str, frame: &Fra
                     let _ = store.update_status(&repo, session_id, status, Some(*code as i32));
                 }
             }
+            let _ = app.emit(
+                "terminal-ended",
+                TerminalEndedEvent {
+                    id: session_id.to_string(),
+                    status,
+                    code: *code,
+                },
+            );
             let _ = app.emit("sidebar-changed", ());
             true
         }
@@ -344,17 +359,35 @@ pub async fn attach_session(
         }
     }
 
-    let client = NamedPipeTransport::connect(&session.transport_addr)
-        .await
-        .map_err(|e| e.to_string())?;
+    let client = match NamedPipeTransport::connect(&session.transport_addr).await {
+        Ok(client) => client,
+        Err(e) => {
+            restore_monitor_if_absent(
+                &app,
+                &state,
+                id.clone(),
+                session.transport_addr.clone(),
+            )
+            .await;
+            return Err(e.to_string());
+        }
+    };
 
     let (mut reader, writer) = tokio::io::split(client);
 
     // Send Resume frame
     let mut writer = writer;
-    protocol::write_frame(&mut writer, &Frame::Resume { last_seen_offset: 0 })
-        .await
-        .map_err(|e| e.to_string())?;
+    if let Err(e) = protocol::write_frame(
+        &mut writer,
+        &Frame::Resume {
+            last_seen_offset: 0,
+        },
+    )
+    .await
+    {
+        restore_monitor_if_absent(&app, &state, id.clone(), session.transport_addr.clone()).await;
+        return Err(e.to_string());
+    }
 
     // Spawn reader task that forwards terminal output AND relays activity/status events
     let session_id = id.clone();
@@ -373,14 +406,11 @@ pub async fn attach_session(
                 Ok(Some(ref frame @ Frame::Status { .. })) => {
                     handle_supervisor_frame(&app_clone, &session_id, frame);
                     // Drain any trailing TerminalOutput (defensive)
-                    let deadline = tokio::time::Instant::now()
-                        + std::time::Duration::from_millis(500);
+                    let deadline =
+                        tokio::time::Instant::now() + std::time::Duration::from_millis(500);
                     loop {
-                        match tokio::time::timeout_at(
-                            deadline,
-                            protocol::read_frame(&mut reader),
-                        )
-                        .await
+                        match tokio::time::timeout_at(deadline, protocol::read_frame(&mut reader))
+                            .await
                         {
                             Ok(Ok(Some(Frame::TerminalOutput { data, .. }))) => {
                                 let _ = channel.send(Response::new(data));
@@ -395,6 +425,9 @@ pub async fn attach_session(
                 Err(_) => break,
             }
         }
+        let state = app_clone.state::<AppState>();
+        let mut conns = state.connections.lock().await;
+        conns.remove(&session_id);
         tracing::debug!("attach reader ended for session {session_id}");
     });
 
@@ -411,6 +444,21 @@ pub async fn attach_session(
     }
 
     Ok(())
+}
+
+async fn restore_monitor_if_absent(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, AppState>,
+    id: String,
+    transport_addr: String,
+) {
+    let task = start_monitor(app.clone(), id.clone(), transport_addr);
+    let mut conns = state.connections.lock().await;
+    if conns.contains_key(&id) {
+        task.abort();
+    } else {
+        conns.insert(id, SessionConnection::Monitored { task });
+    }
 }
 
 #[tauri::command]

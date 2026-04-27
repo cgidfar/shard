@@ -452,6 +452,24 @@ async fn connect_and_subscribe(app: &AppHandle) -> std::io::Result<()> {
                 // is cheap and sidebar.refresh() reloads everything.
                 let _ = app.emit("sidebar-changed", ());
             }
+            ControlFrame::WorkspaceRemoved { repo, name } => {
+                {
+                    let app_state = app.state::<AppState>();
+                    let mut cache = app_state.repo_states.lock().await;
+                    if let Some(state) = cache.get_mut(&repo) {
+                        state.workspaces.remove(&name);
+                    }
+                }
+                let _ = app.emit(
+                    "workspace-status-changed",
+                    WorkspaceStatusChanged {
+                        repo: &repo,
+                        workspace: &name,
+                        status: None,
+                    },
+                );
+                let _ = app.emit("sidebar-changed", ());
+            }
             ControlFrame::Error { message } => {
                 warn!("state subscriber: daemon error: {message}");
                 return Ok(());
