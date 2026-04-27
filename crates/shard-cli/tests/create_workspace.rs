@@ -272,6 +272,79 @@ async fn create_workspace_duplicate_name_errors() {
     harness.shutdown().await;
 }
 
+#[tokio::test]
+async fn create_workspace_rejects_path_like_names() {
+    let harness = TestHarness::start().await;
+    let (_alias, _repo_path) = harness.setup_local_repo("demo");
+    let absolute_name = harness
+        .data_path
+        .join("workspace-escape")
+        .to_string_lossy()
+        .to_string();
+
+    for name in [&absolute_name, "..\\escape", "name:stream"] {
+        match create_workspace(
+            &harness,
+            "demo",
+            Some(name),
+            WorkspaceMode::NewBranch,
+            Some("main"),
+        )
+        .await
+        {
+            ControlFrame::Error { message } => {
+                assert!(
+                    message.contains("invalid workspace name"),
+                    "unexpected message for {name:?}: {message}"
+                );
+            }
+            other => panic!("expected Error for invalid workspace name {name:?}, got {other:?}"),
+        }
+    }
+
+    assert!(
+        !Path::new(&absolute_name).exists(),
+        "absolute workspace name target should not be created"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn implicit_existing_branch_name_is_sanitized_before_validation() {
+    let harness = TestHarness::start().await;
+    let (_alias, repo_path) = harness.setup_local_repo("demo");
+    let branch = "feature/path-like-name";
+    let output = std::process::Command::new("git")
+        .args(["branch", branch])
+        .current_dir(&repo_path)
+        .output()
+        .expect("spawn git branch");
+    assert!(
+        output.status.success(),
+        "git branch failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    match create_workspace(
+        &harness,
+        "demo",
+        Some(branch),
+        WorkspaceMode::ExistingBranch,
+        Some(branch),
+    )
+    .await
+    {
+        ControlFrame::CreateWorkspaceAck { workspace } => {
+            assert_eq!(workspace.name, "feature-path-like-name");
+            assert_eq!(workspace.branch, branch);
+        }
+        other => panic!("expected Ack, got {other:?}"),
+    }
+
+    harness.shutdown().await;
+}
+
 // ── Create after committed delete succeeds (lifecycle entry removed) ───────
 
 #[tokio::test]

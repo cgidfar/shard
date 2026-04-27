@@ -165,6 +165,36 @@ async fn add_repo_duplicate_alias_errors() {
 }
 
 #[tokio::test]
+async fn add_repo_rejects_path_like_aliases() {
+    let harness = TestHarness::start().await;
+    let checkout = harness.create_bare_checkout("unsafe-alias-source");
+    let absolute_alias = harness
+        .data_path
+        .join("escape-target")
+        .to_string_lossy()
+        .to_string();
+
+    for alias in [&absolute_alias, "..\\escape", "name:stream"] {
+        match add_repo(&harness, checkout.to_str().unwrap(), Some(alias)).await {
+            ControlFrame::Error { message } => {
+                assert!(
+                    message.contains("invalid repo alias"),
+                    "unexpected message for {alias:?}: {message}"
+                );
+            }
+            other => panic!("expected Error for invalid alias {alias:?}, got {other:?}"),
+        }
+    }
+
+    assert!(
+        !std::path::Path::new(&absolute_alias).exists(),
+        "absolute alias target should not be created"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn add_repo_concurrent_same_alias_serializes() {
     // Codex Phase 3 fix: before the resolve_alias + lock-first refactor,
     // two AddRepo calls racing on the same explicit alias could slip
@@ -454,6 +484,62 @@ async fn remove_repo_stops_live_session() {
     }
 
     assert!(!db_has_repo(&harness.data_path, "demo"));
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn stop_session_racing_remove_repo_does_not_recreate_repo_dir() {
+    let harness = TestHarness::start().await;
+    let checkout = harness.create_bare_checkout("demo");
+    add_repo(&harness, checkout.to_str().unwrap(), Some("demo")).await;
+
+    let session_id = "01992222-2222-7222-8222-222222222222".to_string();
+    let pipe_name = format!(
+        r"\\.\pipe\shard-test-stop-remove-race-{}",
+        std::process::id()
+    );
+    let _supervisor = spawn_fake_supervisor(pipe_name.clone()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    shard_cli::cmd::daemon::test_inject_live_session(
+        &harness.state,
+        session_id.clone(),
+        std::process::id(),
+        pipe_name,
+        "demo".to_string(),
+        "main".to_string(),
+        1,
+    )
+    .await;
+
+    let stop = async {
+        let mut conn = harness.connect().await;
+        conn.request(&ControlFrame::StopSession {
+            session_id: session_id.clone(),
+            force: false,
+        })
+        .await
+        .expect("StopSession RPC")
+    };
+    let remove = async { remove_repo(&harness, "demo").await };
+    let (stop_r, remove_r) = tokio::join!(stop, remove);
+
+    assert!(
+        matches!(stop_r, ControlFrame::StopAck | ControlFrame::Error { .. }),
+        "StopSession outcome: {stop_r:?}"
+    );
+    assert!(
+        matches!(remove_r, ControlFrame::RemoveRepoAck),
+        "RemoveRepo outcome: {remove_r:?}"
+    );
+    assert!(!db_has_repo(&harness.data_path, "demo"));
+    assert!(
+        !shard_core::paths::ShardPaths::from_data_dir(harness.data_path.clone())
+            .repo_dir("demo")
+            .exists(),
+        "StopSession must not recreate repo dir/repo.db after RemoveRepo"
+    );
 
     harness.shutdown().await;
 }

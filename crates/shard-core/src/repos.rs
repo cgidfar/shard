@@ -5,6 +5,7 @@ use serde::Serialize;
 
 use crate::db;
 use crate::git;
+use crate::identifiers::validate_repo_alias;
 use crate::paths::ShardPaths;
 use crate::{Result, ShardError};
 
@@ -45,14 +46,16 @@ impl RepositoryStore {
     /// Mirror of the alias-resolution branch at the top of `add` —
     /// kept narrow so the two can't diverge.
     pub fn resolve_alias(url: &str, alias: Option<&str>) -> Result<String> {
-        match alias {
-            Some(a) => Ok(a.to_string()),
+        let resolved = match alias {
+            Some(a) => a.to_string(),
             None => git::default_alias(url).ok_or_else(|| {
                 ShardError::Other(format!(
                     "cannot derive alias from '{url}', please provide --alias"
                 ))
-            }),
-        }
+            })?,
+        };
+        validate_repo_alias(&resolved)?;
+        Ok(resolved)
     }
 
     /// Add a new repository by URL or local path.
@@ -171,6 +174,7 @@ impl RepositoryStore {
 
     /// Get a repository by alias.
     pub fn get(&self, alias: &str) -> Result<Repository> {
+        validate_repo_alias(alias)?;
         let conn = self.open_index()?;
         conn.query_row(
             "SELECT id, url, alias, host, owner, name, local_path, created_at FROM repos WHERE alias = ?1",
@@ -192,6 +196,7 @@ impl RepositoryStore {
 
     /// Fetch latest changes for a repository.
     pub fn sync(&self, alias: &str) -> Result<()> {
+        validate_repo_alias(alias)?;
         let repo = self.get(alias)?;
         let source_dir = self.paths.repo_source_for_repo(alias, repo.local_path.as_deref());
         tracing::info!("syncing {}", alias);
@@ -205,6 +210,7 @@ impl RepositoryStore {
     /// and DB records, but NEVER deletes the original checkout.
     /// For remote repos: deletes the entire repo directory (bare clone + worktrees).
     pub fn remove(&self, alias: &str) -> Result<()> {
+        validate_repo_alias(alias)?;
         let repo = self.get(alias)?;
 
         if repo.local_path.is_some() {
@@ -212,39 +218,44 @@ impl RepositoryStore {
 
             // Remove non-base worktrees via git worktree remove
             let ws_store = crate::workspaces::WorkspaceStore::new(self.paths.clone());
-            if let Ok(workspaces) = ws_store.list(alias) {
-                for ws in workspaces {
-                    if !ws.is_base {
-                        let ws_dir = std::path::PathBuf::from(&ws.path);
-                        if ws_dir.exists() {
-                            let _ = git::worktree_remove(local_path, &ws_dir);
-                        }
+            let workspaces = ws_store.list(alias)?;
+            for ws in workspaces {
+                if !ws.is_base {
+                    let ws_dir = std::path::PathBuf::from(&ws.path);
+                    if ws_dir.exists() {
+                        crate::workspaces::remove_worktree_fs(
+                            &crate::workspaces::RealGitOps,
+                            local_path,
+                            &ws_dir,
+                        )?;
                     }
                 }
             }
 
             // Prune stale worktree admin entries
-            let _ = git::worktree_prune(local_path);
+            git::worktree_prune(local_path)?;
 
             // Remove .shard/ directory if it exists
             let shard_dir = local_path.join(".shard");
             if shard_dir.exists() {
-                let _ = std::fs::remove_dir_all(&shard_dir);
+                std::fs::remove_dir_all(&shard_dir)?;
             }
 
             // Clean up .git/info/exclude entry
-            let _ = git::remove_from_exclude(local_path, ".shard/");
+            git::remove_from_exclude(local_path, ".shard/")?;
+        }
+
+        // Remove repo data directory (DB, bare clone for remote, sessions).
+        // Do this before deleting the index row so cleanup failure preserves
+        // the retry handle.
+        let repo_dir = self.paths.repo_dir(alias);
+        if repo_dir.exists() {
+            std::fs::remove_dir_all(&repo_dir)?;
         }
 
         // Remove from index
         let conn = self.open_index()?;
         conn.execute("DELETE FROM repos WHERE alias = ?1", params![alias])?;
-
-        // Remove repo data directory (DB, bare clone for remote, sessions)
-        let repo_dir = self.paths.repo_dir(alias);
-        if repo_dir.exists() {
-            let _ = std::fs::remove_dir_all(&repo_dir);
-        }
 
         Ok(())
     }

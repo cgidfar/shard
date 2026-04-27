@@ -2022,29 +2022,15 @@ async fn handle_spawn(
 /// Status frame), and broadcast `SessionsChanged` so subscribers
 /// invalidate cached lists.
 async fn handle_stop(state: &Arc<DaemonState>, session_id: String, force: bool) -> ControlFrame {
-    let (full_id, repo, transport_addr, pid, creation_time) = {
+    let (full_id, repo) = {
         let sessions = state.sessions.lock().await;
         let entry = match sessions.get(&session_id) {
-            Some(s) => Some((
-                s.session_id.clone(),
-                s.repo.clone(),
-                s.transport_addr.clone(),
-                s.supervisor_pid,
-                s.creation_time,
-            )),
+            Some(s) => Some((s.session_id.clone(), s.repo.clone())),
             None => {
                 let matches: Vec<_> = sessions
                     .values()
                     .filter(|s| s.session_id.starts_with(&session_id))
-                    .map(|s| {
-                        (
-                            s.session_id.clone(),
-                            s.repo.clone(),
-                            s.transport_addr.clone(),
-                            s.supervisor_pid,
-                            s.creation_time,
-                        )
-                    })
+                    .map(|s| (s.session_id.clone(), s.repo.clone()))
                     .collect();
                 match matches.len() {
                     0 => None,
@@ -2067,6 +2053,32 @@ async fn handle_stop(state: &Arc<DaemonState>, session_id: String, force: bool) 
                 }
             }
         }
+    };
+
+    // Serialize explicit StopSession against RemoveRepo / RemoveWorkspace.
+    // Otherwise StopSession can stop a supervisor, then reopen repo.db for
+    // the status backstop after a concurrent RemoveRepo has already deleted
+    // the repo directory.
+    let repo_lock = state.acquire_repo_mutation_lock(&repo).await;
+    let _repo_guard = repo_lock.lock().await;
+
+    let (transport_addr, pid, creation_time) = {
+        let sessions = state.sessions.lock().await;
+        let Some(entry) = sessions.get(&full_id) else {
+            return ControlFrame::Error {
+                message: format!("session '{session_id}' not found in live registry"),
+            };
+        };
+        if entry.repo != repo {
+            return ControlFrame::Error {
+                message: format!("session '{session_id}' moved repos during stop"),
+            };
+        }
+        (
+            entry.transport_addr.clone(),
+            entry.supervisor_pid,
+            entry.creation_time,
+        )
     };
 
     let stop_result: shard_core::Result<()> = if force {

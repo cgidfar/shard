@@ -3,6 +3,7 @@ pub mod error;
 pub mod git;
 pub mod harness;
 pub mod hooks;
+pub mod identifiers;
 pub mod paths;
 pub mod repos;
 pub mod sessions;

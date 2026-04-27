@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db;
 use crate::git;
+use crate::identifiers::{safe_workspace_name, validate_repo_alias, validate_workspace_name};
 use crate::paths::ShardPaths;
 use crate::repos::RepositoryStore;
 use crate::{Result, ShardError};
@@ -133,6 +134,7 @@ impl WorkspaceStore {
         mode: WorkspaceMode,
         branch: Option<&str>,
     ) -> Result<String> {
+        validate_repo_alias(repo_alias)?;
         let repo_store = RepositoryStore::new(self.paths.clone());
         let repo = repo_store.get(repo_alias)?;
         let source_dir = self
@@ -151,7 +153,9 @@ impl WorkspaceStore {
                 .to_string(),
         };
 
-        Ok(resolve_workspace_name_from_branch(name, mode, &branch_for_db))
+        let resolved = resolve_workspace_name_from_branch(name, mode, &branch_for_db);
+        validate_workspace_name(&resolved)?;
+        Ok(resolved)
     }
 
     /// Create a new workspace for a repo.
@@ -174,6 +178,7 @@ impl WorkspaceStore {
         branch: Option<&str>,
         is_base: bool,
     ) -> Result<Workspace> {
+        validate_repo_alias(repo_alias)?;
         let repo_store = RepositoryStore::new(self.paths.clone());
         let repo = repo_store.get(repo_alias)?;
 
@@ -221,6 +226,7 @@ impl WorkspaceStore {
         };
 
         let ws_name = resolve_workspace_name_from_branch(name, mode, &branch_for_db);
+        validate_workspace_name(&ws_name)?;
 
         // Check for duplicates in DB
         let repo_db_path = self.paths.repo_db(repo_alias);
@@ -310,6 +316,7 @@ impl WorkspaceStore {
     /// workspace rows so each occupied branch is labeled with the
     /// workspace name rather than a raw path.
     pub fn list_branch_info(&self, repo_alias: &str) -> Result<Vec<BranchInfo>> {
+        validate_repo_alias(repo_alias)?;
         let repo_store = RepositoryStore::new(self.paths.clone());
         let repo = repo_store.get(repo_alias)?;
         let source_dir = self.paths.repo_source_for_repo(
@@ -372,6 +379,7 @@ impl WorkspaceStore {
         source_dir: &std::path::Path,
         branch: &str,
     ) -> Result<Option<String>> {
+        validate_repo_alias(repo_alias)?;
         let entries = git::worktree_list_porcelain(source_dir)?;
         let match_entry = entries
             .iter()
@@ -390,6 +398,7 @@ impl WorkspaceStore {
 
     /// List all workspaces for a repo.
     pub fn list(&self, repo_alias: &str) -> Result<Vec<Workspace>> {
+        validate_repo_alias(repo_alias)?;
         // Verify the repo exists
         let repo_store = RepositoryStore::new(self.paths.clone());
         let _repo = repo_store.get(repo_alias)?;
@@ -420,6 +429,8 @@ impl WorkspaceStore {
 
     /// Get a specific workspace by repo alias and workspace name.
     pub fn get(&self, repo_alias: &str, ws_name: &str) -> Result<Workspace> {
+        validate_repo_alias(repo_alias)?;
+        validate_workspace_name(ws_name)?;
         let repo_db_path = self.paths.repo_db(repo_alias);
         let conn = db::open_connection(&repo_db_path)?;
 
@@ -459,6 +470,8 @@ impl WorkspaceStore {
     ///   the user's only path to clean up a broken row is to manually
     ///   delete files then re-run remove, which the UI doesn't expose.
     pub fn remove(&self, repo_alias: &str, ws_name: &str) -> Result<()> {
+        validate_repo_alias(repo_alias)?;
+        validate_workspace_name(ws_name)?;
         let ws = self.get(repo_alias, ws_name)?;
 
         if !ws.is_base {
@@ -510,6 +523,8 @@ impl WorkspaceStore {
     /// workflow after the filesystem side (via [`remove_worktree_fs`]) has
     /// already succeeded.
     pub fn delete_row(&self, repo_alias: &str, ws_name: &str) -> Result<()> {
+        validate_repo_alias(repo_alias)?;
+        validate_workspace_name(ws_name)?;
         let repo_db_path = self.paths.repo_db(repo_alias);
         let conn = db::open_connection(&repo_db_path)?;
         conn.execute(
@@ -602,34 +617,6 @@ fn resolve_workspace_name_from_branch(
         }
         (_, Some(n)) => n.to_string(),
         (_, None) => branch_for_db.to_string(),
-    }
-}
-
-fn safe_workspace_name(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut last_dash = false;
-
-    for ch in raw.chars() {
-        let safe = match ch {
-            '/' | '\\' => '-',
-            _ => ch,
-        };
-        if safe == '-' {
-            if last_dash {
-                continue;
-            }
-            last_dash = true;
-        } else {
-            last_dash = false;
-        }
-        out.push(safe);
-    }
-
-    let trimmed = out.trim_matches('-');
-    if trimmed.is_empty() {
-        "workspace".to_string()
-    } else {
-        trimmed.to_string()
     }
 }
 
