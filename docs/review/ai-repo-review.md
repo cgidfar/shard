@@ -252,6 +252,10 @@ Goal: remove lifecycle paths that bypass daemon registry and PID-reuse checks.
 - Define the daemon-dead behavior before deleting the fallback: either "daemon must be running; start it and retry" or a separate explicit recovery command with different guarantees.
 - Add fallback-removal tests where daemon stop returns an error and CLI does not unchecked-terminate DB PIDs or write DB status itself.
 
+Implementation note:
+
+- Implemented by routing CLI `session stop` through `FindSessionById` + `StopSession` on the daemon control pipe only. If the daemon is absent or rejects the stop, the CLI now returns an explicit daemon error and does not write session status, connect to the DB transport pipe, or terminate DB PIDs. Daemon-dead recovery is intentionally a separate future command/policy, not an implicit direct cleanup path.
+
 ### Batch 3: Bounded Protocol Decode
 
 Goal: make local IPC robust against malformed clients.

@@ -370,6 +370,89 @@ async fn find_session_by_id_unknown_errors() {
     harness.shutdown().await;
 }
 
+// ── CLI StopSession routing ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn cli_stop_does_not_fallback_to_session_pipe_or_db_status() {
+    let harness = TestHarness::start().await;
+    harness.setup_local_repo("demo");
+    harness.setup_workspace("demo", "feature-stop");
+
+    let paths = ShardPaths::from_data_dir(harness.data_path.clone());
+    let store = SessionStore::new(paths);
+    let fallback_pipe = format!(
+        r"\\.\pipe\shard-test-cli-stop-fallback-{}-{}",
+        std::process::id(),
+        next_seq()
+    );
+    let session = store
+        .create(
+            "demo",
+            "feature-stop",
+            &["pwsh".to_string()],
+            &fallback_pipe,
+            None,
+        )
+        .expect("create session");
+    store
+        .update_status("demo", &session.id, "running", None)
+        .expect("mark running");
+
+    let missing_live_pipe = format!(
+        r"\\.\pipe\shard-test-cli-stop-missing-live-{}-{}",
+        std::process::id(),
+        next_seq()
+    );
+    shard_cli::cmd::daemon::test_inject_live_session(
+        &harness.state,
+        session.id.clone(),
+        std::process::id(),
+        missing_live_pipe,
+        "demo".to_string(),
+        "feature-stop".to_string(),
+        1,
+    )
+    .await;
+
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let probe_pipe = fallback_pipe.clone();
+    let fallback_probe = tokio::spawn(async move {
+        let server =
+            shard_transport::transport_windows::create_pipe_instance(&probe_pipe, true)
+                .expect("create fallback probe pipe");
+        let _ = ready_tx.send(());
+        tokio::time::timeout(Duration::from_millis(350), server.connect())
+            .await
+            .is_ok()
+    });
+    ready_rx.await.expect("fallback probe ready");
+
+    let err = shard_cli::cmd::session::test_stop_with_control_pipe(
+        &session.id,
+        false,
+        &harness.control_pipe_name,
+    )
+    .await
+    .expect_err("daemon StopSession failure should surface to CLI");
+    assert!(
+        err.to_string().contains("daemon failed to stop session")
+            || err.to_string().contains("daemon stop request failed"),
+        "unexpected error: {err}"
+    );
+
+    let session_after = store.get("demo", &session.id).expect("session still exists");
+    assert_eq!(
+        session_after.status, "running",
+        "CLI stop must not write DB status when daemon stop fails"
+    );
+    assert!(
+        !fallback_probe.await.expect("fallback probe task"),
+        "CLI stop must not connect directly to the DB session pipe after daemon failure"
+    );
+
+    harness.shutdown().await;
+}
+
 // ── Cross-RPC flow: find → remove ──────────────────────────────────────────
 
 #[tokio::test]
