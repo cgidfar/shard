@@ -1655,7 +1655,6 @@ async fn dispatch_request(state: &Arc<DaemonState>, frame: ControlFrame) -> Cont
                 | ControlFrame::SyncRepo { .. }
                 | ControlFrame::RemoveSession { .. }
                 | ControlFrame::RenameSession { .. }
-                | ControlFrame::DetachSession { .. }
                 | ControlFrame::InstallHarnessHooks { .. }
         )
     {
@@ -1706,8 +1705,6 @@ async fn dispatch_request(state: &Arc<DaemonState>, frame: ControlFrame) -> Cont
         ControlFrame::RenameSession { repo, id, label } => {
             handle_rename_session(state, repo, id, label).await
         }
-
-        ControlFrame::DetachSession { id } => handle_detach_session(state, id).await,
 
         ControlFrame::FindSessionById { prefix } => handle_find_session_by_id(state, prefix).await,
 
@@ -2893,8 +2890,8 @@ async fn handle_list_repos(state: &Arc<DaemonState>) -> ControlFrame {
 
 // ── Phase 4: session-lifecycle tail ─────────────────────────────────────────
 //
-// RemoveSession / RenameSession / DetachSession / FindSessionById land here
-// to finish the D5 "daemon owns every mutation" invariant for sessions.
+// RemoveSession / RenameSession / FindSessionById land here to finish the D5
+// "daemon owns every mutation" invariant for sessions.
 // `SpawnSession` / `StopSession` / `ListSessions` arrived in earlier phases
 // and are unchanged.
 
@@ -2980,26 +2977,6 @@ async fn handle_rename_session(
         }
         Err(e) => ControlFrame::Error {
             message: format!("rename session failed: {e}"),
-        },
-    }
-}
-
-/// Handle `DetachSession` — probe that the session still exists.
-///
-/// The actual attach/detach connection lives between the Tauri backend
-/// and the supervisor's session pipe (per migration non-goals: terminal
-/// I/O stays direct). This RPC is a daemon-visible hook so CLI and GUI
-/// detach flows look identical end-to-end — useful for telemetry and as
-/// the seam the future multi-window subscription path will plug into.
-/// Today it just validates the id resolves, so a frontend that calls
-/// detach on a stale id gets a typed error rather than silently losing
-/// state.
-async fn handle_detach_session(state: &Arc<DaemonState>, id: String) -> ControlFrame {
-    let session_store = SessionStore::new(state.paths.clone());
-    match session_store.find_by_id(&id) {
-        Ok(_) => ControlFrame::DetachSessionAck,
-        Err(e) => ControlFrame::Error {
-            message: format!("detach: {e}"),
         },
     }
 }

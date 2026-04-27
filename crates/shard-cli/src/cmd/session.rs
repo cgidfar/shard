@@ -5,6 +5,7 @@ use shard_core::sessions::SessionStore;
 use shard_core::workspaces::WorkspaceStore;
 use shard_core::ShardPaths;
 use shard_supervisor::process::{PlatformProcessControl, ProcessControl};
+use shard_transport::daemon_client::NamedPipeDaemonConnection;
 
 use crate::opts::{parse_target, SessionCommands};
 
@@ -130,45 +131,21 @@ fn create(target: String, harness: Option<shard_core::Harness>, command: Vec<Str
 }
 
 /// Connect to the daemon, spawning it if not running.
-async fn connect_or_spawn_daemon() -> shard_core::Result<
-    shard_transport::daemon_client::DaemonConnection<tokio::net::windows::named_pipe::NamedPipeClient>,
-> {
+async fn connect_or_spawn_daemon() -> shard_core::Result<NamedPipeDaemonConnection> {
     use shard_transport::daemon_client;
 
-    // Try connecting first
-    match daemon_client::connect().await {
-        Ok(conn) => return Ok(conn),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Daemon not running — spawn it
-        }
-        Err(e) if e.raw_os_error() == Some(daemon_client::ERROR_PIPE_BUSY) => {
-            let conn = daemon_client::connect_with_retry(std::time::Duration::from_secs(5))
-                .await
-                .map_err(|e| {
-                    shard_core::ShardError::Other(format!("daemon pipe busy, retry failed: {e}"))
-                })?;
-            return Ok(conn);
-        }
-        Err(e) => {
-            return Err(shard_core::ShardError::Other(format!(
-                "cannot connect to daemon: {e}"
-            )));
-        }
-    }
-
-    // Spawn daemon
-    let exe = std::env::current_exe()?;
-    let args = vec!["daemon".to_string(), "start".to_string()];
-    PlatformProcessControl::spawn_detached(&exe, &args)?;
-
-    // Wait for it to become ready
-    let conn = daemon_client::connect_with_retry(std::time::Duration::from_secs(5))
-        .await
-        .map_err(|e| {
-            shard_core::ShardError::Other(format!("daemon did not start: {e}"))
-        })?;
-
-    Ok(conn)
+    daemon_client::connect_or_spawn(
+        || {
+            let exe = std::env::current_exe()?;
+            let args = vec!["daemon".to_string(), "start".to_string()];
+            PlatformProcessControl::spawn_detached(&exe, &args).map(|_| ())
+        },
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .map_err(|e| {
+        shard_core::ShardError::Other(format!("daemon unavailable or did not start: {e}"))
+    })
 }
 
 fn list(target: Option<String>, json: bool) -> shard_core::Result<()> {
@@ -379,29 +356,16 @@ fn remove(id: String) -> shard_core::Result<()> {
 
     let (repo, session) = find_session_via_daemon(&id)?;
 
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        use shard_transport::daemon_client;
-
-        let mut conn = daemon_client::connect()
-            .await
-            .map_err(|e| shard_core::ShardError::Other(format!("daemon not running: {e}")))?;
-        conn.handshake()
-            .await
-            .map_err(|e| shard_core::ShardError::Other(format!("daemon handshake: {e}")))?;
-        conn.request_typed(
-            &ControlFrame::RemoveSession {
-                repo: repo.clone(),
-                id: session.id.clone(),
-            },
-            |f| match f {
-                ControlFrame::RemoveSessionAck => Ok(()),
-                other => Err(other),
-            },
-        )
-        .await
-        .map_err(|e| shard_core::ShardError::Other(e.to_string()))
-    })?;
+    crate::cmd::daemon_rpc::run(
+        ControlFrame::RemoveSession {
+            repo: repo.clone(),
+            id: session.id.clone(),
+        },
+        |f| match f {
+            ControlFrame::RemoveSessionAck => Ok(()),
+            other => Err(other),
+        },
+    )?;
 
     println!("Removed session {}", &session.id[..8.min(session.id.len())]);
     Ok(())
@@ -414,28 +378,16 @@ fn remove(id: String) -> shard_core::Result<()> {
 /// agree on the source of truth.
 fn find_session_via_daemon(id: &str) -> shard_core::Result<(String, shard_core::sessions::Session)> {
     use shard_transport::control_protocol::ControlFrame;
-    use shard_transport::daemon_client;
 
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        let mut conn = daemon_client::connect()
-            .await
-            .map_err(|e| shard_core::ShardError::Other(format!("daemon not running: {e}")))?;
-        conn.handshake()
-            .await
-            .map_err(|e| shard_core::ShardError::Other(format!("daemon handshake: {e}")))?;
-        conn.request_typed(
-            &ControlFrame::FindSessionById {
-                prefix: id.to_string(),
-            },
-            |f| match f {
-                ControlFrame::FoundSession { repo, session } => Ok((repo, session)),
-                other => Err(other),
-            },
-        )
-        .await
-        .map_err(|e| shard_core::ShardError::Other(e.to_string()))
-    })
+    crate::cmd::daemon_rpc::run(
+        ControlFrame::FindSessionById {
+            prefix: id.to_string(),
+        },
+        |f| match f {
+            ControlFrame::FoundSession { repo, session } => Ok((repo, session)),
+            other => Err(other),
+        },
+    )
 }
 
 fn serve(

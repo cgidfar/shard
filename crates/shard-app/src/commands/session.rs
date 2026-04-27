@@ -6,6 +6,7 @@ use shard_core::repos::RepositoryStore;
 use shard_core::sessions::{Session, SessionStore};
 use shard_core::workspaces::WorkspaceStore;
 use shard_core::{Harness, ShardPaths};
+use shard_transport::daemon_client::NamedPipeDaemonConnection;
 use shard_transport::protocol::{self, ActivityState, Frame};
 use shard_transport::transport_windows::NamedPipeTransport;
 use shard_transport::SessionTransport;
@@ -253,37 +254,31 @@ pub fn create_session(
 }
 
 /// Connect to daemon, spawning it if not running. For use from app context.
-async fn connect_or_spawn_daemon_app() -> Result<
-    shard_transport::daemon_client::DaemonConnection<tokio::net::windows::named_pipe::NamedPipeClient>,
-    std::io::Error,
-> {
+async fn connect_or_spawn_daemon_app() -> Result<NamedPipeDaemonConnection, std::io::Error> {
     use shard_transport::daemon_client;
 
-    // Try connecting first
-    match daemon_client::connect().await {
-        Ok(conn) => return Ok(conn),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
+    daemon_client::connect_or_spawn(
+        || {
+            // Spawn daemon — find shardctl.exe relative to app exe.
+            let exe_dir = std::env::current_exe()?
+                .parent()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no exe dir"))?
+                .to_path_buf();
+            let shardctl = exe_dir.join("shardctl.exe");
+            if !shardctl.exists() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("shardctl.exe not found at {}", shardctl.display()),
+                ));
+            }
 
-    // Spawn daemon — find shardctl.exe relative to app exe
-    let exe_dir = std::env::current_exe()?
-        .parent()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no exe dir"))?
-        .to_path_buf();
-    let shardctl = exe_dir.join("shardctl.exe");
-    if !shardctl.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("shardctl.exe not found at {}", shardctl.display()),
-        ));
-    }
-
-    use shard_supervisor::process::{PlatformProcessControl, ProcessControl};
-    let args = vec!["daemon".to_string(), "start".to_string()];
-    PlatformProcessControl::spawn_detached(&shardctl, &args)?;
-
-    daemon_client::connect_with_retry(std::time::Duration::from_secs(5)).await
+            use shard_supervisor::process::{PlatformProcessControl, ProcessControl};
+            let args = vec!["daemon".to_string(), "start".to_string()];
+            PlatformProcessControl::spawn_detached(&shardctl, &args).map(|_| ())
+        },
+        std::time::Duration::from_secs(5),
+    )
+    .await
 }
 
 #[tauri::command]

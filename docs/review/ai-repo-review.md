@@ -45,7 +45,7 @@ Scope: full review of the Shard repo, with two outcomes:
 
 Commands:
 
-- `cargo check --workspace`: passes. One warning: unused `shard-app::daemon_ipc::detach_session`.
+- `cargo check --workspace`: passes with no warnings from the reviewed crates.
 - `cargo test --workspace --target-dir target\review`: passes when run with permissions that allow named pipes and child processes.
 - `npm run build` in `crates/shard-app/frontend`: passes when run with permissions that allow spawning local `esbuild`.
 
@@ -297,11 +297,18 @@ Goal: shrink surface area after correctness fixes.
 - Remove or update stale `repo_states` cache/comment.
 - Narrow `SessionTransport` to methods that match real Windows usage.
 
+Implementation note:
+
+- Removed the dead `DetachSession` control frames, daemon handler, app helper, and integration/protocol tests. `FindSessionById` remains the single daemon read path used by detach/attach flows that need session resolution.
+- Bumped the control protocol to v8 and left the old `0xA6`/`0xA7` type bytes reserved rather than renumbering later frames.
+- Added a shared app-side `request_daemon` wrapper for connect/handshake/request boilerplate, plus a CLI `cmd::daemon_rpc` helper used by repo/workspace/session read/delete RPCs.
+- Moved the shared connect-or-spawn transport decision tree into `shard_transport::daemon_client::connect_or_spawn`; CLI and Tauri still own their different executable-resolution closures.
+- Removed the unusable `SessionTransport::accept` method and the Windows placeholder that only existed to satisfy that trait shape.
+
 ## Open Questions
 
 - Which current behaviors are intentionally Windows-only versus accidental coupling?
 - Which direct SQLite read paths are still meant to remain after the daemon-broker migration?
-- Is `DetachSession` a real forward-compatibility seam or removable dead weight?
 - Should the vendored `portable-pty` remain a long-term patch or be isolated behind a narrower local wrapper?
 - For the planned Mac port, which Windows lifecycle assumptions need a portable identity model: PID creation-time checks, Job Object containment, named-pipe accept semantics, and daemon adoption of orphaned supervisors?
 - What is the intended user-facing recovery path when the daemon is genuinely dead but a supervisor/session is still running?

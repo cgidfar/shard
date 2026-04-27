@@ -12,10 +12,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current control protocol version. Bumped on breaking wire changes.
 ///
-/// v6 adds `RemoveSession`/`RenameSession`/`DetachSession`/`FindSessionById`
-/// (type bytes 0xA2–0xA9) for Phase 4 of the daemon-broker migration.
+/// v6 adds `RemoveSession`/`RenameSession`/`FindSessionById`
+/// (type bytes 0xA2–0xA5 and 0xA8–0xA9) for Phase 4 of the
+/// daemon-broker migration.
 /// v7 adds `InstallHarnessHooks` (type bytes 0xAA–0xAB) for Phase 5.
-pub const PROTOCOL_VERSION: u16 = 7;
+/// v8 removes the unused `DetachSession` control frames; type bytes
+/// 0xA6–0xA7 remain reserved.
+pub const PROTOCOL_VERSION: u16 = 8;
 
 /// Maximum accepted daemon control frame size, including the type byte.
 pub const MAX_CONTROL_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -217,17 +220,6 @@ pub enum ControlFrame {
     /// Daemon → Client: rename succeeded.
     RenameSessionAck,
 
-    /// Client → Daemon: validate a session id. The daemon's handler is
-    /// effectively a "does this session still exist" probe — the actual
-    /// attach/detach connection management stays in the Tauri backend
-    /// (per migration non-goals: terminal I/O stays direct). Provides a
-    /// symmetric RPC surface so CLI and GUI detach flows run the same
-    /// daemon round-trip for telemetry and future multi-window work.
-    DetachSession { id: String },
-
-    /// Daemon → Client: detach acknowledged.
-    DetachSessionAck,
-
     /// Client → Daemon: resolve a full-or-prefix session id against the
     /// daemon's global session index. Walks every repo DB and returns
     /// the unique match, or an `Error` frame on zero / ambiguous matches.
@@ -306,8 +298,7 @@ const TYPE_REMOVE_SESSION: u8 = 0xA2;
 const TYPE_REMOVE_SESSION_ACK: u8 = 0xA3;
 const TYPE_RENAME_SESSION: u8 = 0xA4;
 const TYPE_RENAME_SESSION_ACK: u8 = 0xA5;
-const TYPE_DETACH_SESSION: u8 = 0xA6;
-const TYPE_DETACH_SESSION_ACK: u8 = 0xA7;
+// 0xA6 and 0xA7 were the removed DetachSession request/ack frames.
 const TYPE_FIND_SESSION_BY_ID: u8 = 0xA8;
 const TYPE_FOUND_SESSION: u8 = 0xA9;
 const TYPE_INSTALL_HARNESS_HOOKS: u8 = 0xAA;
@@ -523,11 +514,6 @@ pub async fn write_control_frame<W: AsyncWrite + Unpin>(
             TYPE_RENAME_SESSION
         }
         ControlFrame::RenameSessionAck => TYPE_RENAME_SESSION_ACK,
-        ControlFrame::DetachSession { id } => {
-            write_str(&mut payload, id);
-            TYPE_DETACH_SESSION
-        }
-        ControlFrame::DetachSessionAck => TYPE_DETACH_SESSION_ACK,
         ControlFrame::FindSessionById { prefix } => {
             write_str(&mut payload, prefix);
             TYPE_FIND_SESSION_BY_ID
@@ -879,11 +865,6 @@ pub async fn read_control_frame<R: AsyncRead + Unpin>(
             (ControlFrame::RenameSession { repo, id, label }, offset)
         }
         TYPE_RENAME_SESSION_ACK => (ControlFrame::RenameSessionAck, 0),
-        TYPE_DETACH_SESSION => {
-            let (id, n) = read_str(payload)?;
-            (ControlFrame::DetachSession { id }, n)
-        }
-        TYPE_DETACH_SESSION_ACK => (ControlFrame::DetachSessionAck, 0),
         TYPE_FIND_SESSION_BY_ID => {
             let (prefix, n) = read_str(payload)?;
             (ControlFrame::FindSessionById { prefix }, n)
@@ -1590,6 +1571,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_retired_detach_session_types() {
+        for type_byte in [0xA6, 0xA7] {
+            let mut cursor = std::io::Cursor::new(framed(type_byte, Vec::new()));
+            let err = read_control_frame(&mut cursor).await.unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[tokio::test]
     async fn rejects_string_length_past_payload() {
         let mut payload = Vec::new();
         payload.extend_from_slice(&5u16.to_be_bytes());
@@ -2021,18 +2011,6 @@ mod tests {
         assert_eq!(
             roundtrip(ControlFrame::RenameSessionAck).await,
             ControlFrame::RenameSessionAck
-        );
-    }
-
-    #[tokio::test]
-    async fn roundtrip_detach_session() {
-        let frame = ControlFrame::DetachSession {
-            id: "019d5a15".to_string(),
-        };
-        assert_eq!(roundtrip(frame.clone()).await, frame);
-        assert_eq!(
-            roundtrip(ControlFrame::DetachSessionAck).await,
-            ControlFrame::DetachSessionAck
         );
     }
 

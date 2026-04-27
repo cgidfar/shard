@@ -13,9 +13,6 @@ pub trait SessionTransport: Send + Sync + 'static {
     /// Create a server that listens for client connections.
     async fn bind(address: &str) -> std::io::Result<Self::Server>;
 
-    /// Accept a new client connection.
-    async fn accept(server: &Self::Server) -> std::io::Result<Self::Client>;
-
     /// Connect as a client.
     async fn connect(address: &str) -> std::io::Result<Self::Client>;
 

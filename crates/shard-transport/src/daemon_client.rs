@@ -49,6 +49,10 @@ use crate::control_protocol::{
 #[cfg(windows)]
 use crate::control_protocol::CONTROL_PIPE_NAME;
 
+#[cfg(windows)]
+pub type NamedPipeDaemonConnection =
+    DaemonConnection<tokio::net::windows::named_pipe::NamedPipeClient>;
+
 /// A connected control-pipe client.
 ///
 /// Wraps an async read/write stream and provides typed frame operations.
@@ -163,17 +167,38 @@ impl<S: AsyncRead + AsyncWrite + Unpin> DaemonConnection<S> {
 /// Returns `Ok(connection)` if the daemon is running and the pipe exists.
 /// Returns `Err` with `NotFound` if the daemon is not running.
 #[cfg(windows)]
-pub async fn connect() -> std::io::Result<DaemonConnection<tokio::net::windows::named_pipe::NamedPipeClient>> {
+pub async fn connect() -> std::io::Result<NamedPipeDaemonConnection> {
     connect_to(CONTROL_PIPE_NAME).await
+}
+
+/// Connect to the daemon, running `spawn` only when the control pipe is absent.
+///
+/// Callers own executable resolution and process creation; this helper owns the
+/// transport decision tree so CLI and app callers handle `NotFound`, busy
+/// pipes, and post-spawn readiness the same way.
+#[cfg(windows)]
+pub async fn connect_or_spawn(
+    spawn: impl FnOnce() -> std::io::Result<()>,
+    startup_timeout: std::time::Duration,
+) -> std::io::Result<NamedPipeDaemonConnection> {
+    match connect().await {
+        Ok(conn) => return Ok(conn),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+            return connect_with_retry(startup_timeout).await;
+        }
+        Err(e) => return Err(e),
+    }
+
+    spawn()?;
+    connect_with_retry(startup_timeout).await
 }
 
 /// Try to connect to a specific control pipe by name. Production callers
 /// should use [`connect`]; the integration test harness uses this to reach
 /// a headless daemon running on a unique per-test pipe.
 #[cfg(windows)]
-pub async fn connect_to(
-    pipe_name: &str,
-) -> std::io::Result<DaemonConnection<tokio::net::windows::named_pipe::NamedPipeClient>> {
+pub async fn connect_to(pipe_name: &str) -> std::io::Result<NamedPipeDaemonConnection> {
     use tokio::net::windows::named_pipe::ClientOptions;
 
     let client = ClientOptions::new().open(pipe_name)?;
@@ -187,7 +212,7 @@ pub async fn connect_to(
 #[cfg(windows)]
 pub async fn connect_with_retry(
     timeout: std::time::Duration,
-) -> std::io::Result<DaemonConnection<tokio::net::windows::named_pipe::NamedPipeClient>> {
+) -> std::io::Result<NamedPipeDaemonConnection> {
     connect_to_with_retry(CONTROL_PIPE_NAME, timeout).await
 }
 
@@ -196,7 +221,7 @@ pub async fn connect_with_retry(
 pub async fn connect_to_with_retry(
     pipe_name: &str,
     timeout: std::time::Duration,
-) -> std::io::Result<DaemonConnection<tokio::net::windows::named_pipe::NamedPipeClient>> {
+) -> std::io::Result<NamedPipeDaemonConnection> {
     use tokio::net::windows::named_pipe::ClientOptions;
 
     let start = std::time::Instant::now();

@@ -4,8 +4,7 @@
 //!   - **Mutation RPC helpers** (`remove_workspace`, `add_repo`, …) —
 //!     request/response wrappers that hide the connect/handshake/extract-ack
 //!     boilerplate. Tauri command handlers become thin translators:
-//!     one-line RPC call, one-line event emit. The shape is copied
-//!     per-batch as the migration progresses.
+//!     one-line RPC call, one-line event emit.
 //!   - `run_state_subscriber` — long-lived background task that subscribes
 //!     to daemon state updates and re-emits them as Tauri events. Handles
 //!     reconnect-with-backoff on daemon drop so the UI never wedges.
@@ -26,26 +25,27 @@ use crate::state::AppState;
 
 // ── Mutation RPCs ───────────────────────────────────────────────────────────
 //
-// Shape copied by every future mutation-RPC helper:
-//   1. `connect` + `handshake` — surface any transport failure as an error
-//      string the frontend can render.
-//   2. `request_typed` — one closure extracts the success variant, the
-//      helper folds `ControlFrame::Error { message }` into `Err`.
-//   3. Return plain `Result<T, String>` so Tauri commands don't need to
-//      translate between `DaemonError` / `io::Error` / etc.
-
-/// Ask the daemon to remove a workspace. See
-/// `crates/shard-cli/src/cmd/daemon.rs::handle_remove_workspace` for the
-/// atomic workflow (SHA-55 fix).
-pub async fn remove_workspace(repo: &str, name: &str) -> Result<(), String> {
+async fn request_daemon<T>(
+    frame: ControlFrame,
+    extract: impl FnOnce(ControlFrame) -> Result<T, ControlFrame>,
+) -> Result<T, String> {
     let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
         .await
         .map_err(|e| format!("daemon connect failed: {e}"))?;
     conn.handshake()
         .await
         .map_err(|e| format!("daemon handshake failed: {e}"))?;
-    conn.request_typed(
-        &ControlFrame::RemoveWorkspace {
+    conn.request_typed(&frame, extract)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Ask the daemon to remove a workspace. See
+/// `crates/shard-cli/src/cmd/daemon.rs::handle_remove_workspace` for the
+/// atomic workflow (SHA-55 fix).
+pub async fn remove_workspace(repo: &str, name: &str) -> Result<(), String> {
+    request_daemon(
+        ControlFrame::RemoveWorkspace {
             repo: repo.to_string(),
             name: name.to_string(),
         },
@@ -55,7 +55,6 @@ pub async fn remove_workspace(repo: &str, name: &str) -> Result<(), String> {
         },
     )
     .await
-    .map_err(|e| e.to_string())
 }
 
 /// Create a workspace via the daemon RPC. See
@@ -67,14 +66,8 @@ pub async fn create_workspace(
     mode: WorkspaceMode,
     branch: Option<String>,
 ) -> Result<Workspace, String> {
-    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
-        .await
-        .map_err(|e| format!("daemon connect failed: {e}"))?;
-    conn.handshake()
-        .await
-        .map_err(|e| format!("daemon handshake failed: {e}"))?;
-    conn.request_typed(
-        &ControlFrame::CreateWorkspace {
+    request_daemon(
+        ControlFrame::CreateWorkspace {
             repo: repo.to_string(),
             name,
             mode,
@@ -86,21 +79,14 @@ pub async fn create_workspace(
         },
     )
     .await
-    .map_err(|e| e.to_string())
 }
 
 /// List workspaces for `repo`, enriched with live `WorkspaceStatus` from the
 /// daemon monitor. The daemon joins DB + monitor snapshot server-side so
 /// the caller sees a consistent view.
 pub async fn list_workspaces(repo: &str) -> Result<Vec<WorkspaceWithStatus>, String> {
-    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
-        .await
-        .map_err(|e| format!("daemon connect failed: {e}"))?;
-    conn.handshake()
-        .await
-        .map_err(|e| format!("daemon handshake failed: {e}"))?;
-    conn.request_typed(
-        &ControlFrame::ListWorkspaces {
+    request_daemon(
+        ControlFrame::ListWorkspaces {
             repo: repo.to_string(),
         },
         |f| match f {
@@ -109,20 +95,13 @@ pub async fn list_workspaces(repo: &str) -> Result<Vec<WorkspaceWithStatus>, Str
         },
     )
     .await
-    .map_err(|e| e.to_string())
 }
 
 /// Enumerate branches + current worktree occupancy for `repo`. Drives the
 /// new-workspace wizard's branch picker.
 pub async fn list_branch_info(repo: &str) -> Result<Vec<BranchInfo>, String> {
-    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
-        .await
-        .map_err(|e| format!("daemon connect failed: {e}"))?;
-    conn.handshake()
-        .await
-        .map_err(|e| format!("daemon handshake failed: {e}"))?;
-    conn.request_typed(
-        &ControlFrame::ListBranchInfo {
+    request_daemon(
+        ControlFrame::ListBranchInfo {
             repo: repo.to_string(),
         },
         |f| match f {
@@ -131,7 +110,6 @@ pub async fn list_branch_info(repo: &str) -> Result<Vec<BranchInfo>, String> {
         },
     )
     .await
-    .map_err(|e| e.to_string())
 }
 
 /// Register a repo via the daemon RPC. The daemon clones (remote) or
@@ -139,14 +117,8 @@ pub async fn list_branch_info(repo: &str) -> Result<Vec<BranchInfo>, String> {
 /// returns the persisted row. See
 /// `crates/shard-cli/src/cmd/daemon.rs::handle_add_repo`.
 pub async fn add_repo(url: &str, alias: Option<String>) -> Result<Repository, String> {
-    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
-        .await
-        .map_err(|e| format!("daemon connect failed: {e}"))?;
-    conn.handshake()
-        .await
-        .map_err(|e| format!("daemon handshake failed: {e}"))?;
-    conn.request_typed(
-        &ControlFrame::AddRepo {
+    request_daemon(
+        ControlFrame::AddRepo {
             url: url.to_string(),
             alias,
         },
@@ -156,21 +128,14 @@ pub async fn add_repo(url: &str, alias: Option<String>) -> Result<Repository, St
         },
     )
     .await
-    .map_err(|e| e.to_string())
 }
 
 /// Tear down a repo via the daemon RPC. The daemon stops all bound
 /// sessions, drops the watcher, removes worktrees + DB rows, and (for
 /// remote repos) the bare clone. Local checkouts are preserved.
 pub async fn remove_repo(alias: &str) -> Result<(), String> {
-    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
-        .await
-        .map_err(|e| format!("daemon connect failed: {e}"))?;
-    conn.handshake()
-        .await
-        .map_err(|e| format!("daemon handshake failed: {e}"))?;
-    conn.request_typed(
-        &ControlFrame::RemoveRepo {
+    request_daemon(
+        ControlFrame::RemoveRepo {
             alias: alias.to_string(),
         },
         |f| match f {
@@ -179,19 +144,12 @@ pub async fn remove_repo(alias: &str) -> Result<(), String> {
         },
     )
     .await
-    .map_err(|e| e.to_string())
 }
 
 /// `git fetch --all --prune` against a repo's source. No DB mutation.
 pub async fn sync_repo(alias: &str) -> Result<(), String> {
-    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
-        .await
-        .map_err(|e| format!("daemon connect failed: {e}"))?;
-    conn.handshake()
-        .await
-        .map_err(|e| format!("daemon handshake failed: {e}"))?;
-    conn.request_typed(
-        &ControlFrame::SyncRepo {
+    request_daemon(
+        ControlFrame::SyncRepo {
             alias: alias.to_string(),
         },
         |f| match f {
@@ -200,21 +158,14 @@ pub async fn sync_repo(alias: &str) -> Result<(), String> {
         },
     )
     .await
-    .map_err(|e| e.to_string())
 }
 
 /// Resolve a full-or-prefix session id against the daemon's global
 /// session index. Returns `(repo_alias, session)`; error on zero /
 /// ambiguous matches.
 pub async fn find_session_by_id(prefix: &str) -> Result<(String, Session), String> {
-    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
-        .await
-        .map_err(|e| format!("daemon connect failed: {e}"))?;
-    conn.handshake()
-        .await
-        .map_err(|e| format!("daemon handshake failed: {e}"))?;
-    conn.request_typed(
-        &ControlFrame::FindSessionById {
+    request_daemon(
+        ControlFrame::FindSessionById {
             prefix: prefix.to_string(),
         },
         |f| match f {
@@ -223,21 +174,14 @@ pub async fn find_session_by_id(prefix: &str) -> Result<(String, Session), Strin
         },
     )
     .await
-    .map_err(|e| e.to_string())
 }
 
 /// Remove a terminal-status session via the daemon RPC. The daemon
 /// guards on `running`/`starting` and cleans up the session directory
 /// under the per-repo mutation lock.
 pub async fn remove_session(repo: &str, id: &str) -> Result<(), String> {
-    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
-        .await
-        .map_err(|e| format!("daemon connect failed: {e}"))?;
-    conn.handshake()
-        .await
-        .map_err(|e| format!("daemon handshake failed: {e}"))?;
-    conn.request_typed(
-        &ControlFrame::RemoveSession {
+    request_daemon(
+        ControlFrame::RemoveSession {
             repo: repo.to_string(),
             id: id.to_string(),
         },
@@ -247,23 +191,12 @@ pub async fn remove_session(repo: &str, id: &str) -> Result<(), String> {
         },
     )
     .await
-    .map_err(|e| e.to_string())
 }
 
 /// Set or clear a session's label via the daemon RPC. Pure DB update.
-pub async fn rename_session(
-    repo: &str,
-    id: &str,
-    label: Option<String>,
-) -> Result<(), String> {
-    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
-        .await
-        .map_err(|e| format!("daemon connect failed: {e}"))?;
-    conn.handshake()
-        .await
-        .map_err(|e| format!("daemon handshake failed: {e}"))?;
-    conn.request_typed(
-        &ControlFrame::RenameSession {
+pub async fn rename_session(repo: &str, id: &str, label: Option<String>) -> Result<(), String> {
+    request_daemon(
+        ControlFrame::RenameSession {
             repo: repo.to_string(),
             id: id.to_string(),
             label,
@@ -274,7 +207,6 @@ pub async fn rename_session(
         },
     )
     .await
-    .map_err(|e| e.to_string())
 }
 
 /// Ask the daemon to stop a running session. See
@@ -284,14 +216,8 @@ pub async fn rename_session(
 /// `SessionsChanged` over the subscribe channel for any long-lived
 /// subscribers.
 pub async fn stop_session(id: &str, force: bool) -> Result<(), String> {
-    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
-        .await
-        .map_err(|e| format!("daemon connect failed: {e}"))?;
-    conn.handshake()
-        .await
-        .map_err(|e| format!("daemon handshake failed: {e}"))?;
-    conn.request_typed(
-        &ControlFrame::StopSession {
+    request_daemon(
+        ControlFrame::StopSession {
             session_id: id.to_string(),
             force,
         },
@@ -301,31 +227,6 @@ pub async fn stop_session(id: &str, force: bool) -> Result<(), String> {
         },
     )
     .await
-    .map_err(|e| e.to_string())
-}
-
-/// Probe that a session still exists, routed through the daemon for a
-/// consistent attach/detach signal across CLI and GUI. The actual
-/// connection teardown stays in the Tauri backend (terminal I/O is
-/// direct; see migration non-goals).
-pub async fn detach_session(id: &str) -> Result<(), String> {
-    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
-        .await
-        .map_err(|e| format!("daemon connect failed: {e}"))?;
-    conn.handshake()
-        .await
-        .map_err(|e| format!("daemon handshake failed: {e}"))?;
-    conn.request_typed(
-        &ControlFrame::DetachSession {
-            id: id.to_string(),
-        },
-        |f| match f {
-            ControlFrame::DetachSessionAck => Ok(()),
-            other => Err(other),
-        },
-    )
-    .await
-    .map_err(|e| e.to_string())
 }
 
 /// Install (or verify) harness hooks via the daemon. Centralizes today's
@@ -337,17 +238,9 @@ pub async fn detach_session(id: &str) -> Result<(), String> {
 /// ("are hooks in place after this call"), not "did this call write
 /// bytes". See the ack matrix in `docs/daemon-broker-migration.md`
 /// Phase 5 section.
-pub async fn install_harness_hooks(
-    harness: &str,
-) -> Result<(bool, Option<String>), String> {
-    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
-        .await
-        .map_err(|e| format!("daemon connect failed: {e}"))?;
-    conn.handshake()
-        .await
-        .map_err(|e| format!("daemon handshake failed: {e}"))?;
-    conn.request_typed(
-        &ControlFrame::InstallHarnessHooks {
+pub async fn install_harness_hooks(harness: &str) -> Result<(bool, Option<String>), String> {
+    request_daemon(
+        ControlFrame::InstallHarnessHooks {
             harness: harness.to_string(),
         },
         |f| match f {
@@ -359,27 +252,16 @@ pub async fn install_harness_hooks(
         },
     )
     .await
-    .map_err(|e| e.to_string())
 }
 
 /// List registered repositories via the daemon so readers agree with the
 /// event stream.
 pub async fn list_repos() -> Result<Vec<Repository>, String> {
-    let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
-        .await
-        .map_err(|e| format!("daemon connect failed: {e}"))?;
-    conn.handshake()
-        .await
-        .map_err(|e| format!("daemon handshake failed: {e}"))?;
-    conn.request_typed(
-        &ControlFrame::ListRepos,
-        |f| match f {
-            ControlFrame::RepoList { repos } => Ok(repos),
-            other => Err(other),
-        },
-    )
+    request_daemon(ControlFrame::ListRepos, |f| match f {
+        ControlFrame::RepoList { repos } => Ok(repos),
+        other => Err(other),
+    })
     .await
-    .map_err(|e| e.to_string())
 }
 
 // ── State subscriber ────────────────────────────────────────────────────────
