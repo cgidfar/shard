@@ -35,8 +35,7 @@ pub fn run(command: WorkspaceCommands) -> shard_core::Result<()> {
             // Info is a point lookup (immutable fields) — stays direct per D4.
             let paths = ShardPaths::new()?;
             let store = WorkspaceStore::new(paths);
-            let (repo, ws_name) =
-                parse_target(&target).map_err(|e| shard_core::ShardError::Other(e))?;
+            let (repo, ws_name) = parse_target(&target).map_err(shard_core::ShardError::Other)?;
             let ws = store.get(repo, ws_name)?;
             println!("Workspace: {}:{}", repo, ws.name);
             println!("  Branch: {}", ws.branch);
@@ -44,8 +43,7 @@ pub fn run(command: WorkspaceCommands) -> shard_core::Result<()> {
         }
 
         WorkspaceCommands::Remove { target } => {
-            let (repo, ws_name) =
-                parse_target(&target).map_err(|e| shard_core::ShardError::Other(e))?;
+            let (repo, ws_name) = parse_target(&target).map_err(shard_core::ShardError::Other)?;
             remove_via_daemon(repo, ws_name)?;
             println!("Removed workspace '{}:{}'", repo, ws_name);
         }
@@ -67,8 +65,8 @@ fn create_via_daemon(
             branch,
         },
         |f| match f {
-            ControlFrame::CreateWorkspaceAck { workspace } => Ok(workspace),
-            other => Err(other),
+            ControlFrame::CreateWorkspaceAck { workspace } => Some(workspace),
+            _ => None,
         },
     )
 }
@@ -80,8 +78,8 @@ fn list_via_daemon(repo: &str) -> shard_core::Result<Vec<WorkspaceWithStatus>> {
             repo: repo.to_string(),
         },
         |f| match f {
-            ControlFrame::WorkspaceList { items } => Ok(items),
-            other => Err(other),
+            ControlFrame::WorkspaceList { items } => Some(items),
+            _ => None,
         },
     )
 }
@@ -96,8 +94,8 @@ fn remove_via_daemon(repo: &str, ws_name: &str) -> shard_core::Result<()> {
             name: ws_name.to_string(),
         },
         |f| match f {
-            ControlFrame::RemoveWorkspaceAck => Ok(()),
-            other => Err(other),
+            ControlFrame::RemoveWorkspaceAck => Some(()),
+            _ => None,
         },
     )
 }

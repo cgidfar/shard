@@ -76,7 +76,10 @@ pub enum ChangeKind {
     /// Fine-grained "a workspace was removed" signal. Emitted by
     /// `RemoveWorkspace` after the full D5 workflow commits. Subscribers
     /// translate this into a `ControlFrame::WorkspaceRemoved` frame.
-    WorkspaceRemoved { repo: String, name: String },
+    WorkspaceRemoved {
+        repo: String,
+        name: String,
+    },
 }
 
 /// Typed commands sent from daemon mutation handlers to the monitor task.
@@ -166,8 +169,7 @@ impl MonitorHandle {
     /// Broadcast a change to subscribers. Used by mutation handlers that
     /// have already committed side effects and want to fan out the
     /// resulting event (e.g. `WorkspaceRemoved`) to connected clients.
-    #[allow(dead_code)] // consumed by Phase 1 handlers
-    pub fn broadcast(&self, change: ChangeKind) {
+    pub(crate) fn broadcast(&self, change: ChangeKind) {
         let _ = self.inner.change_tx.send(change);
     }
 
@@ -179,8 +181,7 @@ impl MonitorHandle {
     /// If the monitor task has gone away (shutdown in progress) the
     /// returned error is informational — the caller can proceed since
     /// there is no watcher to block the delete.
-    #[allow(dead_code)] // consumed by Phase 1
-    pub async fn drop_repo_workspace(
+    pub(crate) async fn drop_repo_workspace(
         &self,
         alias: &str,
         workspace_name: &str,
@@ -194,14 +195,15 @@ impl MonitorHandle {
                 ack: ack_tx,
             })
             .map_err(|_| "monitor task is not running")?;
-        ack_rx.await.map_err(|_| "monitor dropped ack before replying")
+        ack_rx
+            .await
+            .map_err(|_| "monitor dropped ack before replying")
     }
 
     /// Drop the repo's entire watcher (and its `RepoState` entry) and
     /// wait for the confirmation ack before returning. Used by
     /// `RemoveRepo` before the on-disk teardown.
-    #[allow(dead_code)] // consumed by Phase 3
-    pub async fn drop_repo(&self, alias: &str) -> Result<(), &'static str> {
+    pub(crate) async fn drop_repo(&self, alias: &str) -> Result<(), &'static str> {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.inner
             .command_tx
@@ -210,7 +212,9 @@ impl MonitorHandle {
                 ack: ack_tx,
             })
             .map_err(|_| "monitor task is not running")?;
-        ack_rx.await.map_err(|_| "monitor dropped ack before replying")
+        ack_rx
+            .await
+            .map_err(|_| "monitor dropped ack before replying")
     }
 }
 
@@ -410,14 +414,15 @@ impl WorkspaceMonitor {
             // events for HEAD flips, index writes, and anything else in that
             // directory; the fast-tick reconcile filters for what matters.
             match shard_core::git::resolve_gitdir(&ws_path) {
-                Ok(gitdir) => match debouncer.watch(gitdir.as_path(), RecursiveMode::NonRecursive)
-                {
-                    Ok(()) => watched.push(gitdir),
-                    Err(e) => debug!(
-                        "watch gitdir {:?} failed for {alias}/{}: {e}",
-                        gitdir, ws.name
-                    ),
-                },
+                Ok(gitdir) => {
+                    match debouncer.watch(gitdir.as_path(), RecursiveMode::NonRecursive) {
+                        Ok(()) => watched.push(gitdir),
+                        Err(e) => debug!(
+                            "watch gitdir {:?} failed for {alias}/{}: {e}",
+                            gitdir, ws.name
+                        ),
+                    }
+                }
                 Err(e) => {
                     debug!(
                         "resolve_gitdir({:?}) failed for {alias}/{}: {e}",
@@ -582,21 +587,19 @@ impl WorkspaceMonitor {
 
     async fn handle_topology_change(&mut self, alias: Option<String>) {
         match alias {
-            Some(ref alias) => {
-                match self.repo_store.get(alias) {
-                    Ok(repo) => {
-                        debug!("topology: reloading repo {alias}");
-                        self.drop_repo(alias).await;
-                        self.load_repo(&repo).await;
-                        let _ = self.inner.change_tx.send(ChangeKind::State(alias.clone()));
-                    }
-                    Err(_) => {
-                        debug!("topology: repo {alias} removed");
-                        self.drop_repo(alias).await;
-                        let _ = self.inner.change_tx.send(ChangeKind::State(alias.clone()));
-                    }
+            Some(ref alias) => match self.repo_store.get(alias) {
+                Ok(repo) => {
+                    debug!("topology: reloading repo {alias}");
+                    self.drop_repo(alias).await;
+                    self.load_repo(&repo).await;
+                    let _ = self.inner.change_tx.send(ChangeKind::State(alias.clone()));
                 }
-            }
+                Err(_) => {
+                    debug!("topology: repo {alias} removed");
+                    self.drop_repo(alias).await;
+                    let _ = self.inner.change_tx.send(ChangeKind::State(alias.clone()));
+                }
+            },
             None => {
                 // Full reload.
                 let current_aliases: Vec<String> =
@@ -638,10 +641,7 @@ impl WorkspaceMonitor {
             Ok(r) => r,
             Err(_) => return,
         };
-        let workspaces = match self.ws_store.list(alias) {
-            Ok(w) => w,
-            Err(_) => Vec::new(),
-        };
+        let workspaces = self.ws_store.list(alias).unwrap_or_default();
 
         let mut new_map: HashMap<String, WorkspaceStatus> = HashMap::new();
         for ws in &workspaces {
@@ -656,11 +656,7 @@ impl WorkspaceMonitor {
     /// Performs the read-vs-new comparison and the version bump under the
     /// write lock so concurrent reconciles for the same alias cannot
     /// clobber each other with stale data.
-    async fn commit_workspace_map(
-        &self,
-        alias: &str,
-        new_map: HashMap<String, WorkspaceStatus>,
-    ) {
+    async fn commit_workspace_map(&self, alias: &str, new_map: HashMap<String, WorkspaceStatus>) {
         let mut repos = self.inner.repos.write().await;
         let should_update = match repos.get(alias) {
             Some(existing) => existing.workspaces != new_map,
@@ -750,7 +746,10 @@ impl WorkspaceMonitor {
             Ok(r) => r,
             Err(_) => return,
         };
-        debug!("WorkspaceMonitor: reconcile tick over {} repo(s)", repos.len());
+        debug!(
+            "WorkspaceMonitor: reconcile tick over {} repo(s)",
+            repos.len()
+        );
 
         for repo in &repos {
             self.reconcile_repo_deep(repo).await;
@@ -759,10 +758,7 @@ impl WorkspaceMonitor {
 
     async fn reconcile_repo_deep(&self, repo: &Repository) {
         let alias = &repo.alias;
-        let workspaces = match self.ws_store.list(alias) {
-            Ok(w) => w,
-            Err(_) => Vec::new(),
-        };
+        let workspaces = self.ws_store.list(alias).unwrap_or_default();
 
         // Run porcelain once per repo for git's view of worktree health.
         // Pre-normalize the entry paths into a lookup table so the inner

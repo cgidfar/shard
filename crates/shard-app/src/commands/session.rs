@@ -1,3 +1,5 @@
+use std::collections::hash_map::Entry;
+
 use tauri::ipc::{Channel, Response};
 use tauri::{Emitter, Manager};
 
@@ -6,7 +8,6 @@ use shard_core::repos::RepositoryStore;
 use shard_core::sessions::{Session, SessionStore};
 use shard_core::workspaces::WorkspaceStore;
 use shard_core::{Harness, ShardPaths};
-use shard_transport::daemon_client::NamedPipeDaemonConnection;
 use shard_transport::protocol::{self, ActivityState, Frame};
 use shard_transport::transport_windows::NamedPipeTransport;
 use shard_transport::SessionTransport;
@@ -75,12 +76,19 @@ fn handle_supervisor_frame(app: &tauri::AppHandle, session_id: &str, frame: &Fra
 /// Start a lightweight monitor connection for a running session.
 /// The monitor discards terminal output but relays ActivityUpdate and Status
 /// frames as Tauri events. Returns the spawned task handle.
-pub fn start_monitor(app: tauri::AppHandle, session_id: String, transport_addr: String) -> tauri::async_runtime::JoinHandle<()> {
+pub fn start_monitor(
+    app: tauri::AppHandle,
+    session_id: String,
+    transport_addr: String,
+) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
         let client = match NamedPipeTransport::connect(&transport_addr).await {
             Ok(c) => c,
             Err(e) => {
-                tracing::debug!("monitor connect failed for {}: {e}", &session_id[..8.min(session_id.len())]);
+                tracing::debug!(
+                    "monitor connect failed for {}: {e}",
+                    &session_id[..8.min(session_id.len())]
+                );
                 return;
             }
         };
@@ -109,7 +117,10 @@ pub fn start_monitor(app: tauri::AppHandle, session_id: String, transport_addr: 
                 Err(_) => break,
             }
         }
-        tracing::debug!("monitor ended for session {}", &session_id[..8.min(session_id.len())]);
+        tracing::debug!(
+            "monitor ended for session {}",
+            &session_id[..8.min(session_id.len())]
+        );
     })
 }
 
@@ -188,7 +199,8 @@ pub fn create_session(
     let (session_id, transport_addr) = rt.block_on(async {
         use shard_transport::control_protocol::ControlFrame;
 
-        let mut conn = connect_or_spawn_daemon_app()
+        let daemon_start_timeout = std::time::Duration::from_secs(5);
+        let mut conn = daemon_ipc::connect_or_spawn(daemon_start_timeout)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -198,7 +210,35 @@ pub fn create_session(
 
         // Hooks install round-trip — non-fatal. A hooks failure must
         // not block session spawn (today's behavior preserved).
-        match crate::daemon_ipc::install_harness_hooks("claude-code").await {
+        let hooks_result: Result<(bool, Option<String>), String> = async {
+            let mut hook_conn = daemon_ipc::connect_or_spawn(daemon_start_timeout)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            hook_conn
+                .handshake()
+                .await
+                .map_err(|e| format!("daemon handshake failed: {e}"))?;
+
+            hook_conn
+                .request_typed(
+                    &ControlFrame::InstallHarnessHooks {
+                        harness: "claude-code".to_string(),
+                    },
+                    |f| match f {
+                        ControlFrame::InstallHarnessHooksAck {
+                            installed,
+                            skipped_reason,
+                        } => Some((installed, skipped_reason)),
+                        _ => None,
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())
+        }
+        .await;
+
+        match hooks_result {
             Ok((installed, skipped_reason)) => {
                 tracing::info!(
                     installed,
@@ -251,34 +291,6 @@ pub fn create_session(
 
     let _ = app.emit("sidebar-changed", ());
     Ok(result)
-}
-
-/// Connect to daemon, spawning it if not running. For use from app context.
-async fn connect_or_spawn_daemon_app() -> Result<NamedPipeDaemonConnection, std::io::Error> {
-    use shard_transport::daemon_client;
-
-    daemon_client::connect_or_spawn(
-        || {
-            // Spawn daemon — find shardctl.exe relative to app exe.
-            let exe_dir = std::env::current_exe()?
-                .parent()
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no exe dir"))?
-                .to_path_buf();
-            let shardctl = exe_dir.join("shardctl.exe");
-            if !shardctl.exists() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("shardctl.exe not found at {}", shardctl.display()),
-                ));
-            }
-
-            use shard_supervisor::process::{PlatformProcessControl, ProcessControl};
-            let args = vec!["daemon".to_string(), "start".to_string()];
-            PlatformProcessControl::spawn_detached(&shardctl, &args).map(|_| ())
-        },
-        std::time::Duration::from_secs(5),
-    )
-    .await
 }
 
 #[tauri::command]
@@ -349,13 +361,8 @@ pub async fn attach_session(
     let client = match NamedPipeTransport::connect(&session.transport_addr).await {
         Ok(client) => client,
         Err(e) => {
-            restore_monitor_if_absent(
-                &app,
-                &state,
-                id.clone(),
-                session.transport_addr.clone(),
-            )
-            .await;
+            restore_monitor_if_absent(&app, &state, id.clone(), session.transport_addr.clone())
+                .await;
             return Err(e.to_string());
         }
     };
@@ -405,15 +412,10 @@ pub async fn attach_session(
                     // Drain any trailing TerminalOutput (defensive)
                     let deadline =
                         tokio::time::Instant::now() + std::time::Duration::from_millis(500);
-                    loop {
-                        match tokio::time::timeout_at(deadline, protocol::read_frame(&mut reader))
-                            .await
-                        {
-                            Ok(Ok(Some(Frame::TerminalOutput { data, .. }))) => {
-                                let _ = channel.send(Response::new(data));
-                            }
-                            _ => break,
-                        }
+                    while let Ok(Ok(Some(Frame::TerminalOutput { data, .. }))) =
+                        tokio::time::timeout_at(deadline, protocol::read_frame(&mut reader)).await
+                    {
+                        let _ = channel.send(Response::new(data));
                     }
                     break;
                 }
@@ -449,18 +451,19 @@ pub async fn attach_session(
     // Store writer + reader task as Attached connection
     {
         let mut conns = state.connections.lock().await;
-        if conns.contains_key(&id) {
-            task.abort();
-            return Err("session connection changed while attaching".into());
+        match conns.entry(id) {
+            Entry::Vacant(entry) => {
+                entry.insert(SessionConnection::Attached {
+                    token,
+                    writer: SessionWriter { writer },
+                    task,
+                });
+            }
+            Entry::Occupied(_) => {
+                task.abort();
+                return Err("session connection changed while attaching".into());
+            }
         }
-        conns.insert(
-            id.clone(),
-            SessionConnection::Attached {
-                token,
-                writer: SessionWriter { writer },
-                task,
-            },
-        );
     }
 
     Ok(())
@@ -474,10 +477,11 @@ async fn restore_monitor_if_absent(
 ) {
     let task = start_monitor(app.clone(), id.clone(), transport_addr);
     let mut conns = state.connections.lock().await;
-    if conns.contains_key(&id) {
-        task.abort();
-    } else {
-        conns.insert(id, SessionConnection::Monitored { task });
+    match conns.entry(id) {
+        Entry::Vacant(entry) => {
+            entry.insert(SessionConnection::Monitored { task });
+        }
+        Entry::Occupied(_) => task.abort(),
     }
 }
 
@@ -558,10 +562,11 @@ pub async fn detach_session(
         if session.status == "running" {
             let task = start_monitor(app, id.clone(), session.transport_addr);
             let mut conns = state.connections.lock().await;
-            if conns.contains_key(&id) {
-                task.abort();
-            } else {
-                conns.insert(id, SessionConnection::Monitored { task });
+            match conns.entry(id) {
+                Entry::Vacant(entry) => {
+                    entry.insert(SessionConnection::Monitored { task });
+                }
+                Entry::Occupied(_) => task.abort(),
             }
         }
     }

@@ -18,31 +18,7 @@ fn ensure_daemon_running() {
     };
 
     rt.block_on(async {
-        use shard_transport::daemon_client;
-
-        let _ = daemon_client::connect_or_spawn(
-            || {
-                let exe_dir = std::env::current_exe()?
-                    .parent()
-                    .ok_or_else(|| {
-                        std::io::Error::new(std::io::ErrorKind::NotFound, "no exe dir")
-                    })?
-                    .to_path_buf();
-                let shardctl = exe_dir.join("shardctl.exe");
-                if !shardctl.exists() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("shardctl.exe not found at {}", shardctl.display()),
-                    ));
-                }
-
-                use shard_supervisor::process::{PlatformProcessControl, ProcessControl};
-                let args = vec!["daemon".to_string(), "start".to_string()];
-                PlatformProcessControl::spawn_detached(&shardctl, &args).map(|_| ())
-            },
-            std::time::Duration::from_secs(3),
-        )
-        .await;
+        let _ = daemon_ipc::connect_or_spawn(std::time::Duration::from_secs(3)).await;
     });
 }
 
@@ -99,7 +75,7 @@ pub fn run() {
     let paths = shard_core::ShardPaths::new().ok();
     if let Some(ref p) = paths {
         let log_dir = p.data_dir();
-        let _ = std::fs::create_dir_all(&log_dir);
+        let _ = std::fs::create_dir_all(log_dir);
         if let Ok(log_file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -123,7 +99,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
         .setup(|app| {
-            start_monitors_for_running_sessions(&app.handle());
+            start_monitors_for_running_sessions(app.handle());
 
             // Long-lived daemon state subscription. Runs for the lifetime
             // of the app, reconnects with backoff on daemon drop, keeps

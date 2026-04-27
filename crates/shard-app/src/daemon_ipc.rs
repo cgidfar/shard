@@ -25,9 +25,33 @@ use crate::state::AppState;
 
 // ── Mutation RPCs ───────────────────────────────────────────────────────────
 //
+pub async fn connect_or_spawn(
+    timeout: Duration,
+) -> std::io::Result<daemon_client::NamedPipeDaemonConnection> {
+    daemon_client::connect_or_spawn(spawn_shardctl_daemon, timeout).await
+}
+
+fn spawn_shardctl_daemon() -> std::io::Result<()> {
+    let exe_dir = std::env::current_exe()?
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no exe dir"))?
+        .to_path_buf();
+    let shardctl = exe_dir.join("shardctl.exe");
+    if !shardctl.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("shardctl.exe not found at {}", shardctl.display()),
+        ));
+    }
+
+    use shard_supervisor::process::{PlatformProcessControl, ProcessControl};
+    let args = vec!["daemon".to_string(), "start".to_string()];
+    PlatformProcessControl::spawn_detached(&shardctl, &args).map(|_| ())
+}
+
 async fn request_daemon<T>(
     frame: ControlFrame,
-    extract: impl FnOnce(ControlFrame) -> Result<T, ControlFrame>,
+    extract: impl FnOnce(ControlFrame) -> Option<T>,
 ) -> Result<T, String> {
     let mut conn = daemon_client::connect_with_retry(Duration::from_secs(2))
         .await
@@ -50,8 +74,8 @@ pub async fn remove_workspace(repo: &str, name: &str) -> Result<(), String> {
             name: name.to_string(),
         },
         |f| match f {
-            ControlFrame::RemoveWorkspaceAck => Ok(()),
-            other => Err(other),
+            ControlFrame::RemoveWorkspaceAck => Some(()),
+            _ => None,
         },
     )
     .await
@@ -74,8 +98,8 @@ pub async fn create_workspace(
             branch,
         },
         |f| match f {
-            ControlFrame::CreateWorkspaceAck { workspace } => Ok(workspace),
-            other => Err(other),
+            ControlFrame::CreateWorkspaceAck { workspace } => Some(workspace),
+            _ => None,
         },
     )
     .await
@@ -90,8 +114,8 @@ pub async fn list_workspaces(repo: &str) -> Result<Vec<WorkspaceWithStatus>, Str
             repo: repo.to_string(),
         },
         |f| match f {
-            ControlFrame::WorkspaceList { items } => Ok(items),
-            other => Err(other),
+            ControlFrame::WorkspaceList { items } => Some(items),
+            _ => None,
         },
     )
     .await
@@ -105,8 +129,8 @@ pub async fn list_branch_info(repo: &str) -> Result<Vec<BranchInfo>, String> {
             repo: repo.to_string(),
         },
         |f| match f {
-            ControlFrame::BranchInfoList { branches } => Ok(branches),
-            other => Err(other),
+            ControlFrame::BranchInfoList { branches } => Some(branches),
+            _ => None,
         },
     )
     .await
@@ -123,8 +147,8 @@ pub async fn add_repo(url: &str, alias: Option<String>) -> Result<Repository, St
             alias,
         },
         |f| match f {
-            ControlFrame::AddRepoAck { repo } => Ok(repo),
-            other => Err(other),
+            ControlFrame::AddRepoAck { repo } => Some(repo),
+            _ => None,
         },
     )
     .await
@@ -139,8 +163,8 @@ pub async fn remove_repo(alias: &str) -> Result<(), String> {
             alias: alias.to_string(),
         },
         |f| match f {
-            ControlFrame::RemoveRepoAck => Ok(()),
-            other => Err(other),
+            ControlFrame::RemoveRepoAck => Some(()),
+            _ => None,
         },
     )
     .await
@@ -153,8 +177,8 @@ pub async fn sync_repo(alias: &str) -> Result<(), String> {
             alias: alias.to_string(),
         },
         |f| match f {
-            ControlFrame::SyncRepoAck => Ok(()),
-            other => Err(other),
+            ControlFrame::SyncRepoAck => Some(()),
+            _ => None,
         },
     )
     .await
@@ -169,8 +193,8 @@ pub async fn find_session_by_id(prefix: &str) -> Result<(String, Session), Strin
             prefix: prefix.to_string(),
         },
         |f| match f {
-            ControlFrame::FoundSession { repo, session } => Ok((repo, session)),
-            other => Err(other),
+            ControlFrame::FoundSession { repo, session } => Some((repo, session)),
+            _ => None,
         },
     )
     .await
@@ -186,8 +210,8 @@ pub async fn remove_session(repo: &str, id: &str) -> Result<(), String> {
             id: id.to_string(),
         },
         |f| match f {
-            ControlFrame::RemoveSessionAck => Ok(()),
-            other => Err(other),
+            ControlFrame::RemoveSessionAck => Some(()),
+            _ => None,
         },
     )
     .await
@@ -202,8 +226,8 @@ pub async fn rename_session(repo: &str, id: &str, label: Option<String>) -> Resu
             label,
         },
         |f| match f {
-            ControlFrame::RenameSessionAck => Ok(()),
-            other => Err(other),
+            ControlFrame::RenameSessionAck => Some(()),
+            _ => None,
         },
     )
     .await
@@ -222,33 +246,8 @@ pub async fn stop_session(id: &str, force: bool) -> Result<(), String> {
             force,
         },
         |f| match f {
-            ControlFrame::StopAck => Ok(()),
-            other => Err(other),
-        },
-    )
-    .await
-}
-
-/// Install (or verify) harness hooks via the daemon. Centralizes today's
-/// best-effort per-session install; the daemon wraps query+install in a
-/// global mutex so concurrent CLI + GUI spawns don't race the
-/// `~/.claude/settings.json` rewrite.
-///
-/// Returns `(installed, skipped_reason)` — `installed` is a postcondition
-/// ("are hooks in place after this call"), not "did this call write
-/// bytes". See the ack matrix in `docs/daemon-broker-migration.md`
-/// Phase 5 section.
-pub async fn install_harness_hooks(harness: &str) -> Result<(bool, Option<String>), String> {
-    request_daemon(
-        ControlFrame::InstallHarnessHooks {
-            harness: harness.to_string(),
-        },
-        |f| match f {
-            ControlFrame::InstallHarnessHooksAck {
-                installed,
-                skipped_reason,
-            } => Ok((installed, skipped_reason)),
-            other => Err(other),
+            ControlFrame::StopAck => Some(()),
+            _ => None,
         },
     )
     .await
@@ -258,8 +257,8 @@ pub async fn install_harness_hooks(harness: &str) -> Result<(bool, Option<String
 /// event stream.
 pub async fn list_repos() -> Result<Vec<Repository>, String> {
     request_daemon(ControlFrame::ListRepos, |f| match f {
-        ControlFrame::RepoList { repos } => Ok(repos),
-        other => Err(other),
+        ControlFrame::RepoList { repos } => Some(repos),
+        _ => None,
     })
     .await
 }
@@ -408,7 +407,7 @@ async fn apply_snapshot(app: &AppHandle, state: RepoState) {
     // user removed them, or their repo was dropped). Belt-and-suspenders
     // alongside `sidebar-changed`: ensures the frontend clears any lingering
     // live-state overlay before the next structural refresh lands.
-    for (ws_name, _) in prev_ws {
+    for ws_name in prev_ws.keys() {
         if !state.workspaces.contains_key(ws_name) {
             let _ = app.emit(
                 "workspace-status-changed",

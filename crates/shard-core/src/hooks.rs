@@ -6,8 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::Result;
 use crate::error::ShardError;
+use crate::Result;
 
 /// The four Claude Code hook events we register, paired with the shard
 /// activity state each event maps to. Kept as a single source of truth so
@@ -61,7 +61,10 @@ pub fn claude_code_hooks_installed(shardctl_path: &Path) -> bool {
 pub fn install_claude_code_hooks_in_home(home: &Path, shardctl_path: &Path) -> Result<()> {
     let claude_dir = home.join(".claude");
     if !claude_dir.exists() {
-        tracing::debug!("{} not found, skipping Claude Code hook install", claude_dir.display());
+        tracing::debug!(
+            "{} not found, skipping Claude Code hook install",
+            claude_dir.display()
+        );
         return Ok(());
     }
 
@@ -220,7 +223,7 @@ fn strip_shard_hooks_in_entry(entry: &mut serde_json::Value) {
     inner.retain(|h| {
         h.get("command")
             .and_then(|c| c.as_str())
-            .map_or(true, |c| !c.contains("shardctl"))
+            .is_none_or(|c| !c.contains("shardctl"))
     });
 }
 
@@ -231,7 +234,7 @@ fn inner_hooks_empty(entry: &serde_json::Value) -> bool {
     entry
         .get("hooks")
         .and_then(|h| h.as_array())
-        .map_or(true, |arr| arr.is_empty())
+        .is_none_or(|arr| arr.is_empty())
 }
 
 /// Does an event-array entry contain a nested `hooks[].command` that
@@ -243,11 +246,11 @@ fn entry_contains_shardctl(entry: &serde_json::Value) -> bool {
     entry
         .get("hooks")
         .and_then(|h| h.as_array())
-        .map_or(false, |hooks| {
+        .is_some_and(|hooks| {
             hooks.iter().any(|h| {
                 h.get("command")
                     .and_then(|c| c.as_str())
-                    .map_or(false, |c| c.contains("shardctl"))
+                    .is_some_and(|c| c.contains("shardctl"))
             })
         })
 }
@@ -262,16 +265,13 @@ fn entry_has_command(entry: &serde_json::Value, expected: &str) -> bool {
     if inner.is_empty() {
         return false;
     }
-    inner.iter().all(|h| {
-        h.get("command")
-            .and_then(|c| c.as_str())
-            .map_or(false, |c| c == expected)
-    })
+    inner
+        .iter()
+        .all(|h| h.get("command").and_then(|c| c.as_str()) == Some(expected))
 }
 
 fn home_dir() -> Result<PathBuf> {
-    default_hooks_home()
-        .ok_or_else(|| ShardError::Other("cannot determine home directory".into()))
+    default_hooks_home().ok_or_else(|| ShardError::Other("cannot determine home directory".into()))
 }
 
 /// Resolve the user's home directory via `directories::UserDirs::new()`.

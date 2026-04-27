@@ -199,7 +199,9 @@ impl RepositoryStore {
     pub fn sync(&self, alias: &str) -> Result<()> {
         validate_repo_alias(alias)?;
         let repo = self.get(alias)?;
-        let source_dir = self.paths.repo_source_for_repo(alias, repo.local_path.as_deref());
+        let source_dir = self
+            .paths
+            .repo_source_for_repo(alias, repo.local_path.as_deref());
         tracing::info!("syncing {}", alias);
         git::fetch(&source_dir)?;
         Ok(())
@@ -214,9 +216,8 @@ impl RepositoryStore {
         validate_repo_alias(alias)?;
         let repo = self.get(alias)?;
 
-        if repo.local_path.is_some() {
-            let local_path = std::path::Path::new(repo.local_path.as_ref().unwrap());
-
+        if let Some(local_path) = repo.local_path.as_deref() {
+            let local_path = std::path::Path::new(local_path);
             // Remove non-base worktrees via git worktree remove
             let ws_store = crate::workspaces::WorkspaceStore::new(self.paths.clone());
             let workspaces = ws_store.list(alias)?;

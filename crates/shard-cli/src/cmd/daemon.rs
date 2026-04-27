@@ -164,8 +164,7 @@ impl TrayApp {
             warn!("Failed to load embedded tray icon, using fallback square: {e}");
             // Fallback: a small Windows-blue square so the daemon still has a
             // visible tray entry even if the embedded asset is malformed.
-            let rgba: Vec<u8> = std::iter::repeat([0x00u8, 0x78, 0xD4, 0xFF])
-                .take(16 * 16)
+            let rgba: Vec<u8> = std::iter::repeat_n([0x00u8, 0x78, 0xD4, 0xFF], 16 * 16)
                 .flatten()
                 .collect();
             Icon::from_rgba(rgba, 16, 16).expect("valid icon dimensions")
@@ -224,7 +223,7 @@ impl TrayApp {
         self.session_count = count;
         if let Some(ref tray) = self.tray {
             let menu = self.build_menu();
-            let _ = tray.set_menu(Some(Box::new(menu)));
+            tray.set_menu(Some(Box::new(menu)));
         }
     }
 
@@ -348,7 +347,7 @@ impl TrayApp {
             )
         };
 
-        result == IDYES as i32
+        result == IDYES
     }
 
     /// Signal the tokio side to finish and exit the winit event loop. This is
@@ -512,7 +511,10 @@ fn terminate_app_processes(exe_dir: &std::path::Path) {
                                 warn!("TerminateProcess failed for {APP_EXE} (pid={pid})");
                             }
                         } else {
-                            info!("Skipping unrelated {APP_EXE} at {:?} (pid={pid})", full_path);
+                            info!(
+                                "Skipping unrelated {APP_EXE} at {:?} (pid={pid})",
+                                full_path
+                            );
                         }
                     } else {
                         warn!("QueryFullProcessImageNameW failed for pid={pid}; leaving alive");
@@ -581,7 +583,10 @@ impl ApplicationHandler<TrayEvent> for TrayApp {
                     );
                     return;
                 }
-                info!("Quit confirmed; stopping {} active session(s)", active.len());
+                info!(
+                    "Quit confirmed; stopping {} active session(s)",
+                    active.len()
+                );
 
                 self.tokio_handle.block_on(execute_quit(
                     self.state.clone(),
@@ -623,9 +628,7 @@ async fn stop_all_graceful(snapshots: Vec<LiveSessionSnapshot>, overall_deadline
         });
     }
 
-    let drain = async {
-        while set.join_next().await.is_some() {}
-    };
+    let drain = async { while set.join_next().await.is_some() {} };
 
     match tokio::time::timeout(overall_deadline, drain).await {
         Ok(()) => {
@@ -652,7 +655,7 @@ async fn stop_all_graceful(snapshots: Vec<LiveSessionSnapshot>, overall_deadline
 /// Outcome of a drain-only stop attempt.
 #[derive(Debug)]
 #[cfg(windows)]
-pub(crate) enum DrainOutcome {
+enum DrainOutcome {
     /// Supervisor responded with a lifecycle `Status` frame (or EOF'd) before
     /// the timeout fired.
     Exited,
@@ -663,8 +666,7 @@ pub(crate) enum DrainOutcome {
 /// Outcome of a stop-and-wait attempt.
 #[derive(Debug)]
 #[cfg(windows)]
-#[allow(dead_code)] // consumed by RemoveWorkspace handler in Phase 1
-pub(crate) enum StopOutcome {
+enum StopOutcome {
     /// Supervisor exited gracefully within the timeout window.
     Exited,
     /// Graceful window expired and we had to force-kill the supervisor PID
@@ -737,8 +739,7 @@ async fn stop_and_drain(
 /// PID is never killed. Pass `0` only when the caller explicitly trusts
 /// the PID (no recycle check) — not recommended outside legacy paths.
 #[cfg(windows)]
-#[allow(dead_code)] // consumed by RemoveWorkspace handler in Phase 1
-pub(crate) async fn stop_session_and_wait(
+async fn stop_session_and_wait(
     transport_addr: &str,
     supervisor_pid: u32,
     creation_time: u64,
@@ -951,9 +952,8 @@ pub fn run(command: DaemonCommands) -> shard_core::Result<()> {
 
 /// Build a headless `DaemonState` for the integration test harness.
 ///
-/// Separate from [`run_headless_daemon`] so tests can keep a handle to the
-/// state while the control loop runs on a spawned task — lets them inject
-/// fake sessions or inspect the lifecycle registry mid-test.
+/// Tests keep a handle to the state while the control loop runs on a spawned
+/// task, letting them inject fake sessions or inspect lifecycle state.
 #[cfg(windows)]
 #[doc(hidden)]
 pub fn build_headless_state(
@@ -962,9 +962,8 @@ pub fn build_headless_state(
 ) -> shard_core::Result<Arc<DaemonState>> {
     config.paths.ensure_dirs()?;
 
-    let job_guard = DaemonJobGuard::new().map_err(|e| {
-        shard_core::ShardError::Other(format!("Job Object creation failed: {e}"))
-    })?;
+    let job_guard = DaemonJobGuard::new()
+        .map_err(|e| shard_core::ShardError::Other(format!("Job Object creation failed: {e}")))?;
 
     let hooks_home_override = config.hooks_home_override.clone();
     let exe_path = match config.exe_path_override.clone() {
@@ -1000,21 +999,6 @@ pub async fn run_headless_daemon_with_state(
     adopt_orphans(state.clone()).await;
     run_control_loop(state, shutdown_rx).await;
     Ok(())
-}
-
-/// Headless entry point for the integration test harness.
-///
-/// Runs `adopt_orphans` + `run_control_loop` on the caller's tokio runtime,
-/// with no tray and no winit event loop. Exits cleanly once `shutdown_rx`
-/// observes a non-`Running` value.
-#[cfg(windows)]
-pub async fn run_headless_daemon(
-    config: DaemonConfig,
-    shutdown_tx: watch::Sender<ShutdownMode>,
-    shutdown_rx: watch::Receiver<ShutdownMode>,
-) -> shard_core::Result<()> {
-    let state = build_headless_state(config, shutdown_tx)?;
-    run_headless_daemon_with_state(state, shutdown_rx).await
 }
 
 // ── Test-support surface ────────────────────────────────────────────────────
@@ -1079,7 +1063,7 @@ fn run_daemon() -> shard_core::Result<()> {
 
     // Set up file-based logging
     let log_dir = paths.data_dir();
-    std::fs::create_dir_all(&log_dir)?;
+    std::fs::create_dir_all(log_dir)?;
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1116,7 +1100,10 @@ fn run_daemon() -> shard_core::Result<()> {
     };
 
     let exe_path = std::env::current_exe()?;
-    let exe_dir = exe_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let exe_dir = exe_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
     let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownMode::Running);
 
     // Build the winit event loop FIRST — must be created on the main thread.
@@ -1213,8 +1200,8 @@ fn run_daemon() -> shard_core::Result<()> {
 
 /// Send a shutdown request to the running daemon.
 fn stop_daemon() -> shard_core::Result<()> {
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| shard_core::ShardError::Other(e.to_string()))?;
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| shard_core::ShardError::Other(e.to_string()))?;
 
     rt.block_on(async {
         let mut conn = shard_transport::daemon_client::connect()
@@ -1235,9 +1222,9 @@ fn stop_daemon() -> shard_core::Result<()> {
                 println!("Daemon shutdown initiated");
                 Ok(())
             }
-            ControlFrame::Error { message } => {
-                Err(shard_core::ShardError::Other(format!("daemon error: {message}")))
-            }
+            ControlFrame::Error { message } => Err(shard_core::ShardError::Other(format!(
+                "daemon error: {message}"
+            ))),
             _ => Err(shard_core::ShardError::Other(
                 "unexpected response to shutdown".to_string(),
             )),
@@ -1247,8 +1234,8 @@ fn stop_daemon() -> shard_core::Result<()> {
 
 /// Check if the daemon is running and print status.
 fn status_daemon() -> shard_core::Result<()> {
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| shard_core::ShardError::Other(e.to_string()))?;
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| shard_core::ShardError::Other(e.to_string()))?;
 
     rt.block_on(async {
         match shard_transport::daemon_client::connect().await {
@@ -1256,20 +1243,19 @@ fn status_daemon() -> shard_core::Result<()> {
                 Ok(version) => {
                     println!("Daemon running (version: {version})");
 
-                    match conn.request(&ControlFrame::ListSessions).await {
-                        Ok(ControlFrame::SessionList { sessions }) => {
-                            println!("{} active session(s)", sessions.len());
-                            for s in &sessions {
-                                println!(
-                                    "  {} [{}:{}] pid={}",
-                                    &s.session_id[..8],
-                                    s.repo,
-                                    s.workspace,
-                                    s.supervisor_pid
-                                );
-                            }
+                    if let Ok(ControlFrame::SessionList { sessions }) =
+                        conn.request(&ControlFrame::ListSessions).await
+                    {
+                        println!("{} active session(s)", sessions.len());
+                        for s in &sessions {
+                            println!(
+                                "  {} [{}:{}] pid={}",
+                                &s.session_id[..8],
+                                s.repo,
+                                s.workspace,
+                                s.supervisor_pid
+                            );
                         }
-                        _ => {}
                     }
                     Ok(())
                 }
@@ -1292,7 +1278,7 @@ fn is_daemon_running() -> bool {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING,
     };
 
     let pipe_name: Vec<u16> = std::ffi::OsStr::new(CONTROL_PIPE_NAME)
@@ -1384,7 +1370,9 @@ async fn run_control_loop(state: Arc<DaemonState>, mut shutdown_rx: watch::Recei
         }
         ShutdownMode::Force => {
             // Do NOT remove kill-on-close — dropping the job guard will kill all supervisors
-            info!("Force shutdown — KILL_ON_JOB_CLOSE remains active, supervisors will be terminated");
+            info!(
+                "Force shutdown — KILL_ON_JOB_CLOSE remains active, supervisors will be terminated"
+            );
         }
         ShutdownMode::Running => unreachable!(),
     }
@@ -1641,9 +1629,7 @@ async fn dispatch_request(state: &Arc<DaemonState>, frame: ControlFrame) -> Cont
     // initiated quit. Read-only frames (Ping, ListSessions, Shutdown) are
     // still serviced so observers and `shardctl daemon stop` continue to
     // behave sensibly during the ≤3s drain window.
-    if state
-        .quitting
-        .load(std::sync::atomic::Ordering::Acquire)
+    if state.quitting.load(std::sync::atomic::Ordering::Acquire)
         && matches!(
             frame,
             ControlFrame::SpawnSession { .. }
@@ -1784,8 +1770,7 @@ async fn handle_spawn(
         }
 
         // Derive transport addr and create DB record.
-        let session = match session_store.create(&repo, &workspace, &command, "", harness_parsed)
-        {
+        let session = match session_store.create(&repo, &workspace, &command, "", harness_parsed) {
             Ok(s) => s,
             Err(e) => {
                 return Err(ControlFrame::Error {
@@ -1877,7 +1862,10 @@ async fn handle_spawn(
     // force-kill safely via the PID-reuse guard.
     let creation_time: u64 = {
         let sessions = state.sessions.lock().await;
-        sessions.get(&session_id).map(|s| s.creation_time).unwrap_or(0)
+        sessions
+            .get(&session_id)
+            .map(|s| s.creation_time)
+            .unwrap_or(0)
     };
 
     // ── Phase 2: ready-file wait outside the lock ─────────────────────────
@@ -1934,13 +1922,10 @@ async fn handle_spawn(
         //      daemon start doesn't try to re-adopt a ghost.
         let kill_failed = match &outcome {
             ReadyOutcome::Timeout => {
-                if let Err(e) = shard_supervisor::process_windows::force_kill_pid_checked(
-                    pid,
-                    creation_time,
-                ) {
-                    warn!(
-                        "handle_spawn: ready-timeout force-kill failed for pid={pid}: {e}"
-                    );
+                if let Err(e) =
+                    shard_supervisor::process_windows::force_kill_pid_checked(pid, creation_time)
+                {
+                    warn!("handle_spawn: ready-timeout force-kill failed for pid={pid}: {e}");
                     true
                 } else {
                     false
@@ -2081,9 +2066,8 @@ async fn handle_stop(state: &Arc<DaemonState>, session_id: String, force: bool) 
     let stop_result: shard_core::Result<()> = if force {
         // Explicit force: skip the graceful window and terminate directly.
         // `force_kill_pid_checked` refuses on a PID-recycle mismatch.
-        shard_supervisor::process_windows::force_kill_pid_checked(pid, creation_time).map_err(
-            |e| shard_core::ShardError::Other(format!("force-kill pid {pid} failed: {e}")),
-        )
+        shard_supervisor::process_windows::force_kill_pid_checked(pid, creation_time)
+            .map_err(|e| shard_core::ShardError::Other(format!("force-kill pid {pid} failed: {e}")))
     } else {
         stop_session_and_wait(
             &transport_addr,
@@ -2343,9 +2327,7 @@ async fn handle_remove_workspace(
     if !workspace.is_base {
         if let Some(monitor) = state.monitor.get() {
             if let Err(e) = monitor.drop_repo_workspace(&repo, &name).await {
-                warn!(
-                    "RemoveWorkspace: monitor watcher drop failed ({e}); proceeding",
-                );
+                warn!("RemoveWorkspace: monitor watcher drop failed ({e}); proceeding",);
                 // Fall through. Worst case the fs delete fails because
                 // the watcher still holds the handle; we'll surface that
                 // as a Broken state below.
@@ -2371,11 +2353,8 @@ async fn handle_remove_workspace(
             .repo_source_for_repo(&repo, repo_rec.local_path.as_deref());
         let ws_dir = std::path::PathBuf::from(&workspace.path);
 
-        if let Err(e) = workspaces::remove_worktree_fs(
-            state.git_ops.as_ref(),
-            &source_dir,
-            &ws_dir,
-        ) {
+        if let Err(e) = workspaces::remove_worktree_fs(state.git_ops.as_ref(), &source_dir, &ws_dir)
+        {
             warn!(
                 "RemoveWorkspace: filesystem delete failed ({}:{}): {e}",
                 repo, name
@@ -2405,10 +2384,12 @@ async fn handle_remove_workspace(
     // 7. Refresh monitor state + broadcast fine-grained event.
     if let Some(monitor) = state.monitor.get() {
         monitor.poke_topology(Some(repo.clone()));
-        monitor.broadcast(crate::cmd::workspace_monitor::ChangeKind::WorkspaceRemoved {
-            repo: repo.clone(),
-            name: name.clone(),
-        });
+        monitor.broadcast(
+            crate::cmd::workspace_monitor::ChangeKind::WorkspaceRemoved {
+                repo: repo.clone(),
+                name: name.clone(),
+            },
+        );
     }
 
     info!("RemoveWorkspace: {}:{} removed", repo, name);
@@ -2445,19 +2426,15 @@ async fn handle_create_workspace(
     // the logic in `WorkspaceStore::create` — if the two diverge we'll
     // gate-check one name and write a different one, so the helper is
     // deliberately narrow.
-    let resolved_name = match ws_store.resolve_workspace_name(
-        &repo,
-        name.as_deref(),
-        mode,
-        branch.as_deref(),
-    ) {
-        Ok(n) => n,
-        Err(e) => {
-            return ControlFrame::Error {
-                message: format!("resolve workspace name failed: {e}"),
+    let resolved_name =
+        match ws_store.resolve_workspace_name(&repo, name.as_deref(), mode, branch.as_deref()) {
+            Ok(n) => n,
+            Err(e) => {
+                return ControlFrame::Error {
+                    message: format!("resolve workspace name failed: {e}"),
+                }
             }
-        }
-    };
+        };
 
     // Pre-mutation gate check — mirrors `handle_spawn`. Rejects
     // `Deleting`/`Broken` targets regardless of whether the caller
@@ -2903,11 +2880,7 @@ async fn handle_list_repos(state: &Arc<DaemonState>) -> ControlFrame {
 /// whose supervisor is still in the in-memory map can't slip past the DB
 /// guard. Holds the per-repo mutation lock so concurrent `RemoveRepo`
 /// can't yank the repo DB out while we're mid-delete.
-async fn handle_remove_session(
-    state: &Arc<DaemonState>,
-    repo: String,
-    id: String,
-) -> ControlFrame {
+async fn handle_remove_session(state: &Arc<DaemonState>, repo: String, id: String) -> ControlFrame {
     let repo_lock = state.acquire_repo_mutation_lock(&repo).await;
     let _guard = repo_lock.lock().await;
 
@@ -2931,18 +2904,14 @@ async fn handle_remove_session(
     let session_store = SessionStore::new(state.paths.clone());
     match session_store.remove(&repo, &id) {
         Ok(()) => {
-            info!(
-                "RemoveSession: {}:{}",
-                repo,
-                &id[..8.min(id.len())]
-            );
+            info!("RemoveSession: {}:{}", repo, &id[..8.min(id.len())]);
             // Broadcast SessionsChanged so subscribers drop the row from
             // their cached list. Cheap + matches the existing coarse-event
             // policy (D10).
             if let Some(monitor) = state.monitor.get() {
-                monitor.broadcast(
-                    crate::cmd::workspace_monitor::ChangeKind::Sessions(repo.clone()),
-                );
+                monitor.broadcast(crate::cmd::workspace_monitor::ChangeKind::Sessions(
+                    repo.clone(),
+                ));
             }
             ControlFrame::RemoveSessionAck
         }
@@ -2969,9 +2938,9 @@ async fn handle_rename_session(
     match session_store.rename(&repo, &id, label.as_deref()) {
         Ok(()) => {
             if let Some(monitor) = state.monitor.get() {
-                monitor.broadcast(
-                    crate::cmd::workspace_monitor::ChangeKind::Sessions(repo.clone()),
-                );
+                monitor.broadcast(crate::cmd::workspace_monitor::ChangeKind::Sessions(
+                    repo.clone(),
+                ));
             }
             ControlFrame::RenameSessionAck
         }
@@ -2990,10 +2959,7 @@ async fn handle_rename_session(
 /// message shape `SessionStore::find_by_id` returns — callers can match
 /// on substrings if they need typed handling (see `handle_stop`'s
 /// in-memory prefix-match logic for the pattern).
-async fn handle_find_session_by_id(
-    state: &Arc<DaemonState>,
-    prefix: String,
-) -> ControlFrame {
+async fn handle_find_session_by_id(state: &Arc<DaemonState>, prefix: String) -> ControlFrame {
     let session_store = SessionStore::new(state.paths.clone());
     match session_store.find_by_id(&prefix) {
         Ok((repo, session)) => ControlFrame::FoundSession { repo, session },
@@ -3026,10 +2992,7 @@ async fn handle_find_session_by_id(
 /// two concurrent calls can't both see "not installed" and both perform a
 /// write (Codex review round 1 medium). Wrapping only the write would still
 /// race duplicate entries into settings.json.
-async fn handle_install_harness_hooks(
-    state: &Arc<DaemonState>,
-    harness: String,
-) -> ControlFrame {
+async fn handle_install_harness_hooks(state: &Arc<DaemonState>, harness: String) -> ControlFrame {
     // Parse outside the lock — pure string work, and an unknown harness
     // doesn't need to serialize against anything.
     let parsed: Option<shard_core::harness::Harness> = harness.parse().ok();
@@ -3045,9 +3008,7 @@ async fn handle_install_harness_hooks(
     };
 
     match parsed {
-        shard_core::harness::Harness::ClaudeCode => {
-            install_claude_code_under_lock(state).await
-        }
+        shard_core::harness::Harness::ClaudeCode => install_claude_code_under_lock(state).await,
         shard_core::harness::Harness::Codex => ControlFrame::InstallHarnessHooksAck {
             installed: false,
             skipped_reason: Some("codex hooks not yet implemented".to_string()),

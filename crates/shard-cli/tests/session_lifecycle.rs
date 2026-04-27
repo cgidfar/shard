@@ -100,6 +100,12 @@ async fn remove_session_happy_path() {
     harness.shutdown().await;
 }
 
+static SEQ: AtomicU32 = AtomicU32::new(0);
+
+fn next_seq() -> u32 {
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 #[tokio::test]
 async fn remove_session_refuses_live_registry_entry() {
     // Seed a DB row as `exited` but inject it into the daemon's live
@@ -506,13 +512,4 @@ async fn remove_session_serializes_against_remove_repo() {
     }
 
     harness.shutdown().await;
-}
-
-// Helper to keep test pipe names unique across the file — same pattern
-// used in `remove_workspace.rs` for the fake supervisor pipe.
-#[allow(dead_code)]
-static SEQ: AtomicU32 = AtomicU32::new(0);
-#[allow(dead_code)]
-fn next_seq() -> u32 {
-    SEQ.fetch_add(1, Ordering::Relaxed)
 }

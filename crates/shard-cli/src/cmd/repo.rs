@@ -54,8 +54,8 @@ fn add_via_daemon(url: &str, alias: Option<String>) -> shard_core::Result<Reposi
             alias,
         },
         |f| match f {
-            ControlFrame::AddRepoAck { repo } => Ok(repo),
-            other => Err(other),
+            ControlFrame::AddRepoAck { repo } => Some(repo),
+            _ => None,
         },
     )
 }
@@ -66,8 +66,8 @@ fn remove_via_daemon(alias: &str) -> shard_core::Result<()> {
             alias: alias.to_string(),
         },
         |f| match f {
-            ControlFrame::RemoveRepoAck => Ok(()),
-            other => Err(other),
+            ControlFrame::RemoveRepoAck => Some(()),
+            _ => None,
         },
     )
 }
@@ -78,15 +78,15 @@ fn sync_via_daemon(alias: &str) -> shard_core::Result<()> {
             alias: alias.to_string(),
         },
         |f| match f {
-            ControlFrame::SyncRepoAck => Ok(()),
-            other => Err(other),
+            ControlFrame::SyncRepoAck => Some(()),
+            _ => None,
         },
     )
 }
 
 fn list_via_daemon() -> shard_core::Result<Vec<Repository>> {
     crate::cmd::daemon_rpc::run(ControlFrame::ListRepos, |f| match f {
-        ControlFrame::RepoList { repos } => Ok(repos),
-        other => Err(other),
+        ControlFrame::RepoList { repos } => Some(repos),
+        _ => None,
     })
 }

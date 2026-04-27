@@ -137,15 +137,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> DaemonConnection<S> {
     pub async fn request_typed<T>(
         &mut self,
         frame: &ControlFrame,
-        extract: impl FnOnce(ControlFrame) -> Result<T, ControlFrame>,
+        extract: impl FnOnce(ControlFrame) -> Option<T>,
     ) -> Result<T, DaemonError> {
         let response = self.request(frame).await?;
         match response {
             ControlFrame::Error { message } => Err(DaemonError::Reported(message)),
-            other => extract(other).map_err(|bad| {
+            other => extract(other).ok_or_else(|| {
                 DaemonError::Transport(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("unexpected response frame: {bad:?}"),
+                    format!("unexpected response frame for request: {frame:?}"),
                 ))
             }),
         }

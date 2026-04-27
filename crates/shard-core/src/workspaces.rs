@@ -21,10 +21,7 @@ use crate::{Result, ShardError};
 pub trait WorkspaceGitOps: Send + Sync {
     fn worktree_remove(&self, repo_dir: &Path, worktree_path: &Path) -> Result<()>;
     fn worktree_prune(&self, repo_dir: &Path) -> Result<()>;
-    fn worktree_list_porcelain(
-        &self,
-        repo_dir: &Path,
-    ) -> Result<Vec<git::WorktreeEntry>>;
+    fn worktree_list_porcelain(&self, repo_dir: &Path) -> Result<Vec<git::WorktreeEntry>>;
 }
 
 /// Production git-ops implementation — delegates straight to
@@ -40,10 +37,7 @@ impl WorkspaceGitOps for RealGitOps {
         git::worktree_prune(repo_dir)
     }
 
-    fn worktree_list_porcelain(
-        &self,
-        repo_dir: &Path,
-    ) -> Result<Vec<git::WorktreeEntry>> {
+    fn worktree_list_porcelain(&self, repo_dir: &Path) -> Result<Vec<git::WorktreeEntry>> {
         git::worktree_list_porcelain(repo_dir)
     }
 }
@@ -182,13 +176,11 @@ impl WorkspaceStore {
         let repo_store = RepositoryStore::new(self.paths.clone());
         let repo = repo_store.get(repo_alias)?;
 
-        let source_dir = self.paths.repo_source_for_repo(
-            repo_alias,
-            repo.local_path.as_deref(),
-        );
+        let source_dir = self
+            .paths
+            .repo_source_for_repo(repo_alias, repo.local_path.as_deref());
 
-        let default_branch =
-            || git::default_branch(&source_dir);
+        let default_branch = || git::default_branch(&source_dir);
 
         let (branch_for_db, base_branch, new_branch) = if is_base {
             // is_base ignores mode; branch_for_db = current HEAD.
@@ -216,9 +208,7 @@ impl WorkspaceStore {
                 }
                 WorkspaceMode::ExistingBranch => {
                     let target = branch.ok_or_else(|| {
-                        ShardError::Other(
-                            "existing_branch mode requires a branch name".into(),
-                        )
+                        ShardError::Other("existing_branch mode requires a branch name".into())
                     })?;
                     (target.to_string(), target.to_string(), None)
                 }
@@ -247,11 +237,9 @@ impl WorkspaceStore {
         // reject the `worktree add` with a generic error; we front-run it
         // to surface the owning workspace name.
         if !is_base && new_branch.is_none() {
-            if let Some(owner) = self.worktree_owning_branch(
-                repo_alias,
-                &source_dir,
-                &branch_for_db,
-            )? {
+            if let Some(owner) =
+                self.worktree_owning_branch(repo_alias, &source_dir, &branch_for_db)?
+            {
                 return Err(ShardError::BranchAlreadyCheckedOut {
                     branch: branch_for_db,
                     workspace: owner,
@@ -267,18 +255,11 @@ impl WorkspaceStore {
             std::path::PathBuf::from(lp)
         } else {
             // Create a git worktree
-            let dir = self.paths.workspace_dir_for_repo(
-                repo_alias,
-                &ws_name,
-                repo.local_path.as_deref(),
-            );
+            let dir =
+                self.paths
+                    .workspace_dir_for_repo(repo_alias, &ws_name, repo.local_path.as_deref());
             tracing::info!("creating worktree at {}", dir.display());
-            git::worktree_add(
-                &source_dir,
-                &dir,
-                &base_branch,
-                new_branch.as_deref(),
-            )?;
+            git::worktree_add(&source_dir, &dir, &base_branch, new_branch.as_deref())?;
 
             // For local repos, hide .shard/ from git status on first worktree
             if repo.local_path.is_some() {
@@ -319,21 +300,22 @@ impl WorkspaceStore {
         validate_repo_alias(repo_alias)?;
         let repo_store = RepositoryStore::new(self.paths.clone());
         let repo = repo_store.get(repo_alias)?;
-        let source_dir = self.paths.repo_source_for_repo(
-            repo_alias,
-            repo.local_path.as_deref(),
-        );
+        let source_dir = self
+            .paths
+            .repo_source_for_repo(repo_alias, repo.local_path.as_deref());
 
-        let branches = match git::list_branches(&source_dir) {
-            Ok(b) => b,
-            Err(_) => Vec::new(),
-        };
+        let branches = git::list_branches(&source_dir).unwrap_or_default();
         let head = git::default_branch(&source_dir).ok();
 
         let workspaces = self.list(repo_alias).unwrap_or_default();
         let path_to_workspace: std::collections::HashMap<String, String> = workspaces
             .iter()
-            .map(|ws| (normalize_worktree_path(std::path::Path::new(&ws.path)), ws.name.clone()))
+            .map(|ws| {
+                (
+                    normalize_worktree_path(std::path::Path::new(&ws.path)),
+                    ws.name.clone(),
+                )
+            })
             .collect();
 
         let mut branch_to_workspace: std::collections::HashMap<String, String> =
@@ -343,7 +325,8 @@ impl WorkspaceStore {
                 if entry.prunable || entry.detached {
                     continue;
                 }
-                let (Some(branch), key) = (entry.branch.clone(), normalize_worktree_path(&entry.path))
+                let (Some(branch), key) =
+                    (entry.branch.clone(), normalize_worktree_path(&entry.path))
                 else {
                     continue;
                 };
@@ -393,7 +376,9 @@ impl WorkspaceStore {
             .into_iter()
             .find(|ws| normalize_worktree_path(std::path::Path::new(&ws.path)) == key)
             .map(|ws| ws.name);
-        Ok(Some(managed.unwrap_or_else(|| external_worktree_label(&entry.path))))
+        Ok(Some(
+            managed.unwrap_or_else(|| external_worktree_label(&entry.path)),
+        ))
     }
 
     /// List all workspaces for a repo.
@@ -477,10 +462,9 @@ impl WorkspaceStore {
         if !ws.is_base {
             let repo_store = RepositoryStore::new(self.paths.clone());
             let repo = repo_store.get(repo_alias)?;
-            let source_dir = self.paths.repo_source_for_repo(
-                repo_alias,
-                repo.local_path.as_deref(),
-            );
+            let source_dir = self
+                .paths
+                .repo_source_for_repo(repo_alias, repo.local_path.as_deref());
             let ws_dir = std::path::PathBuf::from(&ws.path);
 
             if ws_dir.exists() {
@@ -527,10 +511,7 @@ impl WorkspaceStore {
         validate_workspace_name(ws_name)?;
         let repo_db_path = self.paths.repo_db(repo_alias);
         let conn = db::open_connection(&repo_db_path)?;
-        conn.execute(
-            "DELETE FROM workspaces WHERE name = ?1",
-            params![ws_name],
-        )?;
+        conn.execute("DELETE FROM workspaces WHERE name = ?1", params![ws_name])?;
         Ok(())
     }
 }

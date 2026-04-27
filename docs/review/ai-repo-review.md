@@ -315,6 +315,14 @@ Implementation note:
 - Moved the shared connect-or-spawn transport decision tree into `shard_transport::daemon_client::connect_or_spawn`; CLI and Tauri still own their different executable-resolution closures.
 - Removed the unusable `SessionTransport::accept` method and the Windows placeholder that only existed to satisfy that trait shape.
 
+Follow-up simplification pass:
+
+- Centralized Tauri's `shardctl.exe` spawn resolution in `daemon_ipc::connect_or_spawn`, removing the app startup/create-session duplicate closure.
+- Kept hook installation on its own best-effort daemon connection while deleting the app-side single-use `install_harness_hooks` helper and sharing the app daemon spawn helper.
+- Aligned `request_typed` with its documented `Option<T>` extractor shape, removing repeated large-`Err(ControlFrame)` call-site patterns.
+- Removed the unused `run_headless_daemon` wrapper, stale `dead_code` allowances, and public visibility from daemon/monitor helpers that are only used inside their modules/crate.
+- Applied mechanical Clippy simplifications where they reduced code without changing behavior.
+
 ## Open Questions
 
 - Which current behaviors are intentionally Windows-only versus accidental coupling?

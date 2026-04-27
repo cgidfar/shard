@@ -34,20 +34,22 @@ async fn run_attach(
     let (mut reader, mut writer) = tokio::io::split(client);
 
     // Send resume frame with offset 0 (fresh attach)
-    protocol::write_frame(&mut writer, &Frame::Resume { last_seen_offset: 0 })
-        .await
-        .map_err(|e| shard_core::ShardError::Io(e))?;
+    protocol::write_frame(
+        &mut writer,
+        &Frame::Resume {
+            last_seen_offset: 0,
+        },
+    )
+    .await
+    .map_err(shard_core::ShardError::Io)?;
 
     // === Stdin → pipe ===
     let stdin_task = tokio::spawn(async move {
-        use crossterm::event::{self, Event, KeyCode, KeyModifiers, KeyEvent};
+        use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 
         loop {
             // crossterm event reading
-            let evt = tokio::task::spawn_blocking(|| {
-                event::read()
-            })
-            .await;
+            let evt = tokio::task::spawn_blocking(event::read).await;
 
             match evt {
                 Ok(Ok(Event::Key(KeyEvent {

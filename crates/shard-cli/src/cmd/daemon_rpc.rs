@@ -4,7 +4,7 @@ use shard_transport::daemon_client;
 /// Route a single CLI request through the daemon without spawning it.
 pub(crate) fn run<T>(
     frame: ControlFrame,
-    extract: impl FnOnce(ControlFrame) -> Result<T, ControlFrame>,
+    extract: impl FnOnce(ControlFrame) -> Option<T>,
 ) -> shard_core::Result<T> {
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| shard_core::ShardError::Other(format!("tokio: {e}")))?;

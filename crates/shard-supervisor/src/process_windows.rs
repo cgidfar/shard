@@ -130,7 +130,7 @@ pub fn spawn_detached_with_handle(
 const JOB_ASSIGN_ACCESS: u32 = 0x0100  // PROCESS_SET_QUOTA
     | 0x0001                            // PROCESS_TERMINATE
     | 0x1000                            // PROCESS_QUERY_LIMITED_INFORMATION
-    | 0x00100000;                       // SYNCHRONIZE
+    | 0x00100000; // SYNCHRONIZE
 
 /// Open a handle to an already-running process for job re-adoption.
 ///
@@ -311,9 +311,8 @@ unsafe fn wait_for_process_handle(
         WAIT_OBJECT_0 => Ok(true),
         WAIT_TIMEOUT => Ok(false),
         WAIT_FAILED => Err(std::io::Error::last_os_error()),
-        other => Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("WaitForSingleObject returned unexpected code {other}"),
-        )),
+        other => Err(std::io::Error::other(format!(
+            "WaitForSingleObject returned unexpected code {other}"
+        ))),
     }
 }
