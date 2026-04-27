@@ -17,6 +17,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// v7 adds `InstallHarnessHooks` (type bytes 0xAA–0xAB) for Phase 5.
 pub const PROTOCOL_VERSION: u16 = 7;
 
+/// Maximum accepted daemon control frame size, including the type byte.
+pub const MAX_CONTROL_FRAME_LEN: usize = 8 * 1024 * 1024;
+
+const MAX_CONTROL_COLLECTION_COUNT: usize = 16_384;
+const MAX_SPAWN_COMMAND_COUNT: usize = 1_024;
+
 /// Well-known named pipe address for the daemon control channel.
 #[cfg(windows)]
 pub const CONTROL_PIPE_NAME: &str = r"\\.\pipe\shard-control";
@@ -162,10 +168,7 @@ pub enum ControlFrame {
     /// Remote URLs are bare-cloned into the data dir; local paths are
     /// referenced in place. Auto-creates a base workspace for the
     /// detected default branch.
-    AddRepo {
-        url: String,
-        alias: Option<String>,
-    },
+    AddRepo { url: String, alias: Option<String> },
 
     /// Daemon → Client: add succeeded; returns the persisted row.
     AddRepoAck { repo: Repository },
@@ -566,13 +569,9 @@ pub async fn write_control_frame<W: AsyncWrite + Unpin>(
 pub async fn read_control_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> std::io::Result<Option<ControlFrame>> {
-    let mut len_buf = [0u8; 4];
-    match reader.read_exact(&mut len_buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-    let length = u32::from_be_bytes(len_buf) as usize;
+    let Some(length) = read_frame_len(reader, MAX_CONTROL_FRAME_LEN, "control").await? else {
+        return Ok(None);
+    };
 
     if length == 0 {
         return Err(std::io::Error::new(
@@ -587,23 +586,29 @@ pub async fn read_control_frame<R: AsyncRead + Unpin>(
     let type_byte = buf[0];
     let payload = &buf[1..];
 
-    let frame = match type_byte {
+    let (frame, consumed) = match type_byte {
         TYPE_HELLO => {
             ensure_len(payload, 2, "Hello")?;
             let protocol_version = u16::from_be_bytes(payload[..2].try_into().unwrap());
-            ControlFrame::Hello { protocol_version }
+            (ControlFrame::Hello { protocol_version }, 2)
         }
         TYPE_HELLO_ACK => {
+            let mut offset = 0;
             ensure_len(payload, 2, "HelloAck")?;
             let protocol_version = u16::from_be_bytes(payload[..2].try_into().unwrap());
-            let (daemon_version, _) = read_str(&payload[2..])?;
-            ControlFrame::HelloAck {
-                protocol_version,
-                daemon_version,
-            }
+            offset += 2;
+            let (daemon_version, n) = read_str(&payload[offset..])?;
+            offset += n;
+            (
+                ControlFrame::HelloAck {
+                    protocol_version,
+                    daemon_version,
+                },
+                offset,
+            )
         }
-        TYPE_PING => ControlFrame::Ping,
-        TYPE_PONG => ControlFrame::Pong,
+        TYPE_PING => (ControlFrame::Ping, 0),
+        TYPE_PONG => (ControlFrame::Pong, 0),
         TYPE_SPAWN_SESSION => {
             let mut offset = 0;
             let (repo, n) = read_str(&payload[offset..])?;
@@ -611,28 +616,29 @@ pub async fn read_control_frame<R: AsyncRead + Unpin>(
             let (workspace, n) = read_str(&payload[offset..])?;
             offset += n;
             ensure_len(&payload[offset..], 2, "SpawnSession cmd_count")?;
-            let cmd_count = u16::from_be_bytes(payload[offset..offset + 2].try_into().unwrap());
+            let cmd_count = bounded_count(
+                u16::from_be_bytes(payload[offset..offset + 2].try_into().unwrap()) as usize,
+                MAX_SPAWN_COMMAND_COUNT,
+                "SpawnSession command count",
+            )?;
             offset += 2;
-            let mut command = Vec::with_capacity(cmd_count as usize);
+            let mut command = Vec::with_capacity(cmd_count);
             for _ in 0..cmd_count {
                 let (cmd, n) = read_str(&payload[offset..])?;
                 offset += n;
                 command.push(cmd);
             }
-            ensure_len(&payload[offset..], 1, "SpawnSession harness flag")?;
-            let harness = if payload[offset] == 1 {
-                offset += 1;
-                let (h, _) = read_str(&payload[offset..])?;
-                Some(h)
-            } else {
-                None
-            };
-            ControlFrame::SpawnSession {
-                repo,
-                workspace,
-                command,
-                harness,
-            }
+            let (harness, n) = read_opt_str(&payload[offset..])?;
+            offset += n;
+            (
+                ControlFrame::SpawnSession {
+                    repo,
+                    workspace,
+                    command,
+                    harness,
+                },
+                offset,
+            )
         }
         TYPE_SPAWN_ACK => {
             let mut offset = 0;
@@ -642,24 +648,28 @@ pub async fn read_control_frame<R: AsyncRead + Unpin>(
             let supervisor_pid =
                 u32::from_be_bytes(payload[offset..offset + 4].try_into().unwrap());
             offset += 4;
-            let (transport_addr, _) = read_str(&payload[offset..])?;
-            ControlFrame::SpawnAck {
-                session_id,
-                supervisor_pid,
-                transport_addr,
-            }
+            let (transport_addr, n) = read_str(&payload[offset..])?;
+            offset += n;
+            (
+                ControlFrame::SpawnAck {
+                    session_id,
+                    supervisor_pid,
+                    transport_addr,
+                },
+                offset,
+            )
         }
         TYPE_STOP_SESSION => {
             let (session_id, n) = read_str(payload)?;
             ensure_len(&payload[n..], 1, "StopSession force flag")?;
-            let force = payload[n] == 1;
-            ControlFrame::StopSession { session_id, force }
+            let force = read_bool_flag(payload[n], "StopSession force flag")?;
+            (ControlFrame::StopSession { session_id, force }, n + 1)
         }
-        TYPE_STOP_ACK => ControlFrame::StopAck,
-        TYPE_LIST_SESSIONS => ControlFrame::ListSessions,
+        TYPE_STOP_ACK => (ControlFrame::StopAck, 0),
+        TYPE_LIST_SESSIONS => (ControlFrame::ListSessions, 0),
         TYPE_SESSION_LIST => {
             ensure_len(payload, 4, "SessionList count")?;
-            let count = u32::from_be_bytes(payload[..4].try_into().unwrap()) as usize;
+            let count = read_u32_count(&payload[..4], "SessionList count")?;
             let mut offset = 4;
             let mut sessions = Vec::with_capacity(count);
             for _ in 0..count {
@@ -683,28 +693,26 @@ pub async fn read_control_frame<R: AsyncRead + Unpin>(
                     workspace,
                 });
             }
-            ControlFrame::SessionList { sessions }
+            (ControlFrame::SessionList { sessions }, offset)
         }
         TYPE_SHUTDOWN => {
             ensure_len(payload, 1, "Shutdown")?;
-            let graceful = payload[0] == 1;
-            ControlFrame::Shutdown { graceful }
+            let graceful = read_bool_flag(payload[0], "Shutdown graceful flag")?;
+            (ControlFrame::Shutdown { graceful }, 1)
         }
-        TYPE_SHUTDOWN_ACK => ControlFrame::ShutdownAck,
-        TYPE_SUBSCRIBE => ControlFrame::Subscribe,
+        TYPE_SHUTDOWN_ACK => (ControlFrame::ShutdownAck, 0),
+        TYPE_SUBSCRIBE => (ControlFrame::Subscribe, 0),
         TYPE_STATE_SNAPSHOT => {
             let mut offset = 0;
             let (repo_alias, n) = read_str(&payload[offset..])?;
             offset += n;
 
             ensure_len(&payload[offset..], 8, "StateSnapshot version")?;
-            let version =
-                u64::from_be_bytes(payload[offset..offset + 8].try_into().unwrap());
+            let version = u64::from_be_bytes(payload[offset..offset + 8].try_into().unwrap());
             offset += 8;
 
             ensure_len(&payload[offset..], 4, "StateSnapshot ws count")?;
-            let ws_count =
-                u32::from_be_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
+            let ws_count = read_u32_count(&payload[offset..offset + 4], "StateSnapshot ws count")?;
             offset += 4;
 
             let mut workspaces = std::collections::HashMap::with_capacity(ws_count);
@@ -716,38 +724,35 @@ pub async fn read_control_frame<R: AsyncRead + Unpin>(
                 workspaces.insert(name, status);
             }
 
-            ControlFrame::StateSnapshot {
-                state: RepoState {
-                    repo_alias,
-                    version,
-                    workspaces,
+            (
+                ControlFrame::StateSnapshot {
+                    state: RepoState {
+                        repo_alias,
+                        version,
+                        workspaces,
+                    },
                 },
-            }
+                offset,
+            )
         }
         TYPE_TOPOLOGY_CHANGED => {
-            ensure_len(payload, 1, "TopologyChanged tag")?;
-            let repo_alias = if payload[0] == 1 {
-                let (alias, _) = read_str(&payload[1..])?;
-                Some(alias)
-            } else {
-                None
-            };
-            ControlFrame::TopologyChanged { repo_alias }
+            let (repo_alias, n) = read_opt_str(payload)?;
+            (ControlFrame::TopologyChanged { repo_alias }, n)
         }
         TYPE_SESSIONS_CHANGED => {
-            let (repo, _) = read_str(payload)?;
-            ControlFrame::SessionsChanged { repo }
+            let (repo, n) = read_str(payload)?;
+            (ControlFrame::SessionsChanged { repo }, n)
         }
         TYPE_REMOVE_WORKSPACE => {
             let (repo, n) = read_str(payload)?;
-            let (name, _) = read_str(&payload[n..])?;
-            ControlFrame::RemoveWorkspace { repo, name }
+            let (name, m) = read_str(&payload[n..])?;
+            (ControlFrame::RemoveWorkspace { repo, name }, n + m)
         }
-        TYPE_REMOVE_WORKSPACE_ACK => ControlFrame::RemoveWorkspaceAck,
+        TYPE_REMOVE_WORKSPACE_ACK => (ControlFrame::RemoveWorkspaceAck, 0),
         TYPE_WORKSPACE_REMOVED => {
             let (repo, n) = read_str(payload)?;
-            let (name, _) = read_str(&payload[n..])?;
-            ControlFrame::WorkspaceRemoved { repo, name }
+            let (name, m) = read_str(&payload[n..])?;
+            (ControlFrame::WorkspaceRemoved { repo, name }, n + m)
         }
         TYPE_CREATE_WORKSPACE => {
             let mut offset = 0;
@@ -758,32 +763,36 @@ pub async fn read_control_frame<R: AsyncRead + Unpin>(
             ensure_len(&payload[offset..], 1, "CreateWorkspace mode")?;
             let mode = mode_from_byte(payload[offset])?;
             offset += 1;
-            let (branch, _) = read_opt_str(&payload[offset..])?;
-            ControlFrame::CreateWorkspace {
-                repo,
-                name,
-                mode,
-                branch,
-            }
+            let (branch, n) = read_opt_str(&payload[offset..])?;
+            offset += n;
+            (
+                ControlFrame::CreateWorkspace {
+                    repo,
+                    name,
+                    mode,
+                    branch,
+                },
+                offset,
+            )
         }
         TYPE_CREATE_WORKSPACE_ACK => {
-            let (workspace, _) = read_workspace(payload)?;
-            ControlFrame::CreateWorkspaceAck { workspace }
+            let (workspace, n) = read_workspace(payload)?;
+            (ControlFrame::CreateWorkspaceAck { workspace }, n)
         }
         TYPE_LIST_WORKSPACES => {
-            let (repo, _) = read_str(payload)?;
-            ControlFrame::ListWorkspaces { repo }
+            let (repo, n) = read_str(payload)?;
+            (ControlFrame::ListWorkspaces { repo }, n)
         }
         TYPE_WORKSPACE_LIST => {
             ensure_len(payload, 4, "WorkspaceList count")?;
-            let count = u32::from_be_bytes(payload[..4].try_into().unwrap()) as usize;
+            let count = read_u32_count(&payload[..4], "WorkspaceList count")?;
             let mut offset = 4;
             let mut items = Vec::with_capacity(count);
             for _ in 0..count {
                 let (workspace, n) = read_workspace(&payload[offset..])?;
                 offset += n;
                 ensure_len(&payload[offset..], 1, "WorkspaceList status tag")?;
-                let status = if payload[offset] == 1 {
+                let status = if read_option_tag(payload[offset], "WorkspaceList status tag")? {
                     offset += 1;
                     let (s, n) = read_workspace_status(&payload[offset..])?;
                     offset += n;
@@ -794,22 +803,22 @@ pub async fn read_control_frame<R: AsyncRead + Unpin>(
                 };
                 items.push(WorkspaceWithStatus { workspace, status });
             }
-            ControlFrame::WorkspaceList { items }
+            (ControlFrame::WorkspaceList { items }, offset)
         }
         TYPE_LIST_BRANCH_INFO => {
-            let (repo, _) = read_str(payload)?;
-            ControlFrame::ListBranchInfo { repo }
+            let (repo, n) = read_str(payload)?;
+            (ControlFrame::ListBranchInfo { repo }, n)
         }
         TYPE_BRANCH_INFO_LIST => {
             ensure_len(payload, 4, "BranchInfoList count")?;
-            let count = u32::from_be_bytes(payload[..4].try_into().unwrap()) as usize;
+            let count = read_u32_count(&payload[..4], "BranchInfoList count")?;
             let mut offset = 4;
             let mut branches = Vec::with_capacity(count);
             for _ in 0..count {
                 let (name, n) = read_str(&payload[offset..])?;
                 offset += n;
                 ensure_len(&payload[offset..], 1, "BranchInfo is_head")?;
-                let is_head = payload[offset] == 1;
+                let is_head = read_bool_flag(payload[offset], "BranchInfo is_head")?;
                 offset += 1;
                 let (checked_out_by, n) = read_opt_str(&payload[offset..])?;
                 offset += n;
@@ -819,31 +828,31 @@ pub async fn read_control_frame<R: AsyncRead + Unpin>(
                     checked_out_by,
                 });
             }
-            ControlFrame::BranchInfoList { branches }
+            (ControlFrame::BranchInfoList { branches }, offset)
         }
         TYPE_ADD_REPO => {
             let (url, n) = read_str(payload)?;
-            let (alias, _) = read_opt_str(&payload[n..])?;
-            ControlFrame::AddRepo { url, alias }
+            let (alias, m) = read_opt_str(&payload[n..])?;
+            (ControlFrame::AddRepo { url, alias }, n + m)
         }
         TYPE_ADD_REPO_ACK => {
-            let (repo, _) = read_repository(payload)?;
-            ControlFrame::AddRepoAck { repo }
+            let (repo, n) = read_repository(payload)?;
+            (ControlFrame::AddRepoAck { repo }, n)
         }
         TYPE_REMOVE_REPO => {
-            let (alias, _) = read_str(payload)?;
-            ControlFrame::RemoveRepo { alias }
+            let (alias, n) = read_str(payload)?;
+            (ControlFrame::RemoveRepo { alias }, n)
         }
-        TYPE_REMOVE_REPO_ACK => ControlFrame::RemoveRepoAck,
+        TYPE_REMOVE_REPO_ACK => (ControlFrame::RemoveRepoAck, 0),
         TYPE_SYNC_REPO => {
-            let (alias, _) = read_str(payload)?;
-            ControlFrame::SyncRepo { alias }
+            let (alias, n) = read_str(payload)?;
+            (ControlFrame::SyncRepo { alias }, n)
         }
-        TYPE_SYNC_REPO_ACK => ControlFrame::SyncRepoAck,
-        TYPE_LIST_REPOS => ControlFrame::ListRepos,
+        TYPE_SYNC_REPO_ACK => (ControlFrame::SyncRepoAck, 0),
+        TYPE_LIST_REPOS => (ControlFrame::ListRepos, 0),
         TYPE_REPO_LIST => {
             ensure_len(payload, 4, "RepoList count")?;
-            let count = u32::from_be_bytes(payload[..4].try_into().unwrap()) as usize;
+            let count = read_u32_count(&payload[..4], "RepoList count")?;
             let mut offset = 4;
             let mut repos = Vec::with_capacity(count);
             for _ in 0..count {
@@ -851,54 +860,58 @@ pub async fn read_control_frame<R: AsyncRead + Unpin>(
                 offset += n;
                 repos.push(repo);
             }
-            ControlFrame::RepoList { repos }
+            (ControlFrame::RepoList { repos }, offset)
         }
         TYPE_REMOVE_SESSION => {
             let (repo, n) = read_str(payload)?;
-            let (id, _) = read_str(&payload[n..])?;
-            ControlFrame::RemoveSession { repo, id }
+            let (id, m) = read_str(&payload[n..])?;
+            (ControlFrame::RemoveSession { repo, id }, n + m)
         }
-        TYPE_REMOVE_SESSION_ACK => ControlFrame::RemoveSessionAck,
+        TYPE_REMOVE_SESSION_ACK => (ControlFrame::RemoveSessionAck, 0),
         TYPE_RENAME_SESSION => {
             let mut offset = 0;
             let (repo, n) = read_str(&payload[offset..])?;
             offset += n;
             let (id, n) = read_str(&payload[offset..])?;
             offset += n;
-            let (label, _) = read_opt_str(&payload[offset..])?;
-            ControlFrame::RenameSession { repo, id, label }
+            let (label, n) = read_opt_str(&payload[offset..])?;
+            offset += n;
+            (ControlFrame::RenameSession { repo, id, label }, offset)
         }
-        TYPE_RENAME_SESSION_ACK => ControlFrame::RenameSessionAck,
+        TYPE_RENAME_SESSION_ACK => (ControlFrame::RenameSessionAck, 0),
         TYPE_DETACH_SESSION => {
-            let (id, _) = read_str(payload)?;
-            ControlFrame::DetachSession { id }
+            let (id, n) = read_str(payload)?;
+            (ControlFrame::DetachSession { id }, n)
         }
-        TYPE_DETACH_SESSION_ACK => ControlFrame::DetachSessionAck,
+        TYPE_DETACH_SESSION_ACK => (ControlFrame::DetachSessionAck, 0),
         TYPE_FIND_SESSION_BY_ID => {
-            let (prefix, _) = read_str(payload)?;
-            ControlFrame::FindSessionById { prefix }
+            let (prefix, n) = read_str(payload)?;
+            (ControlFrame::FindSessionById { prefix }, n)
         }
         TYPE_FOUND_SESSION => {
             let (repo, n) = read_str(payload)?;
-            let (session, _) = read_session(&payload[n..])?;
-            ControlFrame::FoundSession { repo, session }
+            let (session, m) = read_session(&payload[n..])?;
+            (ControlFrame::FoundSession { repo, session }, n + m)
         }
         TYPE_INSTALL_HARNESS_HOOKS => {
-            let (harness, _) = read_str(payload)?;
-            ControlFrame::InstallHarnessHooks { harness }
+            let (harness, n) = read_str(payload)?;
+            (ControlFrame::InstallHarnessHooks { harness }, n)
         }
         TYPE_INSTALL_HARNESS_HOOKS_ACK => {
             ensure_len(payload, 1, "InstallHarnessHooksAck installed")?;
-            let installed = payload[0] == 1;
-            let (skipped_reason, _) = read_opt_str(&payload[1..])?;
-            ControlFrame::InstallHarnessHooksAck {
-                installed,
-                skipped_reason,
-            }
+            let installed = read_bool_flag(payload[0], "InstallHarnessHooksAck installed")?;
+            let (skipped_reason, n) = read_opt_str(&payload[1..])?;
+            (
+                ControlFrame::InstallHarnessHooksAck {
+                    installed,
+                    skipped_reason,
+                },
+                1 + n,
+            )
         }
         TYPE_ERROR => {
-            let (message, _) = read_str(payload)?;
-            ControlFrame::Error { message }
+            let (message, n) = read_str(payload)?;
+            (ControlFrame::Error { message }, n)
         }
         _ => {
             return Err(std::io::Error::new(
@@ -907,6 +920,8 @@ pub async fn read_control_frame<R: AsyncRead + Unpin>(
             ));
         }
     };
+
+    ensure_consumed(payload, consumed, "control frame payload")?;
 
     Ok(Some(frame))
 }
@@ -945,7 +960,7 @@ fn write_workspace_status(buf: &mut Vec<u8>, status: &WorkspaceStatus) {
 fn read_workspace_status(buf: &[u8]) -> std::io::Result<(WorkspaceStatus, usize)> {
     let mut offset = 0;
     ensure_len(&buf[offset..], 1, "WorkspaceStatus branch tag")?;
-    let branch = if buf[offset] == 1 {
+    let branch = if read_option_tag(buf[offset], "WorkspaceStatus branch tag")? {
         offset += 1;
         let (s, n) = read_str(&buf[offset..])?;
         offset += n;
@@ -956,7 +971,7 @@ fn read_workspace_status(buf: &[u8]) -> std::io::Result<(WorkspaceStatus, usize)
     };
 
     ensure_len(&buf[offset..], 1, "WorkspaceStatus sha tag")?;
-    let sha = if buf[offset] == 1 {
+    let sha = if read_option_tag(buf[offset], "WorkspaceStatus sha tag")? {
         offset += 1;
         let (s, n) = read_str(&buf[offset..])?;
         offset += n;
@@ -967,7 +982,7 @@ fn read_workspace_status(buf: &[u8]) -> std::io::Result<(WorkspaceStatus, usize)
     };
 
     ensure_len(&buf[offset..], 2, "WorkspaceStatus detached + health")?;
-    let detached = buf[offset] == 1;
+    let detached = read_bool_flag(buf[offset], "WorkspaceStatus detached")?;
     offset += 1;
     let health = match buf[offset] {
         HEALTH_HEALTHY => WorkspaceHealth::Healthy,
@@ -1031,7 +1046,7 @@ fn write_opt_str(buf: &mut Vec<u8>, s: Option<&str>) {
 
 fn read_opt_str(buf: &[u8]) -> std::io::Result<(Option<String>, usize)> {
     ensure_len(buf, 1, "Option<String> tag")?;
-    if buf[0] == 1 {
+    if read_option_tag(buf[0], "Option<String> tag")? {
         let (s, n) = read_str(&buf[1..])?;
         Ok((Some(s), 1 + n))
     } else {
@@ -1056,7 +1071,7 @@ fn read_workspace(buf: &[u8]) -> std::io::Result<(Workspace, usize)> {
     let (path, n) = read_str(&buf[offset..])?;
     offset += n;
     ensure_len(&buf[offset..], 9, "Workspace is_base + created_at")?;
-    let is_base = buf[offset] == 1;
+    let is_base = read_bool_flag(buf[offset], "Workspace is_base")?;
     offset += 1;
     let created_at = u64::from_be_bytes(buf[offset..offset + 8].try_into().unwrap());
     offset += 8;
@@ -1147,7 +1162,7 @@ fn write_opt_u32(buf: &mut Vec<u8>, value: Option<u32>) {
 
 fn read_opt_u32(buf: &[u8]) -> std::io::Result<(Option<u32>, usize)> {
     ensure_len(buf, 1, "Option<u32> tag")?;
-    if buf[0] == 1 {
+    if read_option_tag(buf[0], "Option<u32> tag")? {
         ensure_len(&buf[1..], 4, "Option<u32> body")?;
         let v = u32::from_be_bytes(buf[1..5].try_into().unwrap());
         Ok((Some(v), 5))
@@ -1168,7 +1183,7 @@ fn write_opt_i32(buf: &mut Vec<u8>, value: Option<i32>) {
 
 fn read_opt_i32(buf: &[u8]) -> std::io::Result<(Option<i32>, usize)> {
     ensure_len(buf, 1, "Option<i32> tag")?;
-    if buf[0] == 1 {
+    if read_option_tag(buf[0], "Option<i32> tag")? {
         ensure_len(&buf[1..], 4, "Option<i32> body")?;
         let v = i32::from_be_bytes(buf[1..5].try_into().unwrap());
         Ok((Some(v), 5))
@@ -1189,7 +1204,7 @@ fn write_opt_u64(buf: &mut Vec<u8>, value: Option<u64>) {
 
 fn read_opt_u64(buf: &[u8]) -> std::io::Result<(Option<u64>, usize)> {
     ensure_len(buf, 1, "Option<u64> tag")?;
-    if buf[0] == 1 {
+    if read_option_tag(buf[0], "Option<u64> tag")? {
         ensure_len(&buf[1..], 8, "Option<u64> body")?;
         let v = u64::from_be_bytes(buf[1..9].try_into().unwrap());
         Ok((Some(v), 9))
@@ -1278,7 +1293,10 @@ fn read_str(buf: &[u8]) -> std::io::Result<(String, usize)> {
     let len = u16::from_be_bytes(buf[..2].try_into().unwrap()) as usize;
     ensure_len(&buf[2..], len, "string body")?;
     let s = String::from_utf8(buf[2..2 + len].to_vec()).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid UTF-8: {e}"))
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid UTF-8: {e}"),
+        )
     })?;
     Ok((s, 2 + len))
 }
@@ -1292,6 +1310,103 @@ fn ensure_len(buf: &[u8], needed: usize, context: &str) -> std::io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn ensure_consumed(buf: &[u8], consumed: usize, context: &str) -> std::io::Result<()> {
+    if consumed == buf.len() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{context}: {} trailing bytes",
+                buf.len().saturating_sub(consumed)
+            ),
+        ))
+    }
+}
+
+fn read_u32_count(buf: &[u8], context: &str) -> std::io::Result<usize> {
+    bounded_count(
+        usize::try_from(u32::from_be_bytes(buf.try_into().unwrap())).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{context} does not fit usize"),
+            )
+        })?,
+        MAX_CONTROL_COLLECTION_COUNT,
+        context,
+    )
+}
+
+fn bounded_count(count: usize, max: usize, context: &str) -> std::io::Result<usize> {
+    if count > max {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{context} {count} exceeds max {max}"),
+        ))
+    } else {
+        Ok(count)
+    }
+}
+
+fn read_bool_flag(byte: u8, context: &str) -> std::io::Result<bool> {
+    match byte {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{context}: invalid boolean tag {other}"),
+        )),
+    }
+}
+
+fn read_option_tag(byte: u8, context: &str) -> std::io::Result<bool> {
+    match byte {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{context}: invalid option tag {other}"),
+        )),
+    }
+}
+
+async fn read_frame_len<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max_len: usize,
+    label: &str,
+) -> std::io::Result<Option<usize>> {
+    let mut len_buf = [0u8; 4];
+    let mut read = 0;
+    while read < len_buf.len() {
+        let n = reader.read(&mut len_buf[read..]).await?;
+        if n == 0 {
+            if read == 0 {
+                return Ok(None);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{label} frame length prefix ended after {read} bytes"),
+            ));
+        }
+        read += n;
+    }
+
+    let length = usize::try_from(u32::from_be_bytes(len_buf)).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{label} frame length does not fit usize"),
+        )
+    })?;
+    if length > max_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{label} frame length {length} exceeds max {max_len}"),
+        ));
+    }
+
+    Ok(Some(length))
 }
 
 #[cfg(test)]
@@ -1371,7 +1486,10 @@ mod tests {
 
     #[tokio::test]
     async fn roundtrip_stop_ack() {
-        assert_eq!(roundtrip(ControlFrame::StopAck).await, ControlFrame::StopAck);
+        assert_eq!(
+            roundtrip(ControlFrame::StopAck).await,
+            ControlFrame::StopAck
+        );
     }
 
     #[tokio::test]
@@ -1439,6 +1557,78 @@ mod tests {
     async fn read_eof_returns_none() {
         let mut cursor = std::io::Cursor::new(Vec::new());
         assert!(read_control_frame(&mut cursor).await.unwrap().is_none());
+    }
+
+    fn framed(type_byte: u8, payload: Vec<u8>) -> Vec<u8> {
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&((1 + payload.len()) as u32).to_be_bytes());
+        framed.push(type_byte);
+        framed.extend_from_slice(&payload);
+        framed
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_control_frame_before_allocation() {
+        let mut cursor =
+            std::io::Cursor::new(((MAX_CONTROL_FRAME_LEN as u32) + 1).to_be_bytes().to_vec());
+        let err = read_control_frame(&mut cursor).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn partial_control_length_prefix_is_invalid_data() {
+        let mut cursor = std::io::Cursor::new(vec![0, 0, 0]);
+        let err = read_control_frame(&mut cursor).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_control_type() {
+        let mut cursor = std::io::Cursor::new(framed(0xff, Vec::new()));
+        let err = read_control_frame(&mut cursor).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn rejects_string_length_past_payload() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&5u16.to_be_bytes());
+        payload.extend_from_slice(b"abc");
+
+        let mut cursor = std::io::Cursor::new(framed(TYPE_REMOVE_REPO, payload));
+        let err = read_control_frame(&mut cursor).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn rejects_excessive_collection_count_before_allocation() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&((MAX_CONTROL_COLLECTION_COUNT as u32) + 1).to_be_bytes());
+
+        let mut cursor = std::io::Cursor::new(framed(TYPE_REPO_LIST, payload));
+        let err = read_control_frame(&mut cursor).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_option_tag() {
+        let mut cursor = std::io::Cursor::new(framed(TYPE_TOPOLOGY_CHANGED, vec![2]));
+        let err = read_control_frame(&mut cursor).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_boolean_tag() {
+        let mut cursor = std::io::Cursor::new(framed(TYPE_SHUTDOWN, vec![2]));
+        let err = read_control_frame(&mut cursor).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn rejects_control_trailing_bytes() {
+        let mut cursor = std::io::Cursor::new(framed(TYPE_PING, vec![0]));
+        let err = read_control_frame(&mut cursor).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]
@@ -1669,7 +1859,11 @@ mod tests {
             } else {
                 Some("github.com".to_string())
             },
-            owner: if local { None } else { Some("demo".to_string()) },
+            owner: if local {
+                None
+            } else {
+                Some("demo".to_string())
+            },
             name: Some(alias.to_string()),
             local_path: if local {
                 Some(format!(r"C:\repos\{alias}"))
@@ -1886,7 +2080,7 @@ mod tests {
         payload.extend_from_slice(&0u64.to_be_bytes()); // created_at
         payload.push(0); // stopped_at: None
         payload.push(0); // label: None
-        // harness: Some("unknown-harness") — expected to decode as None
+                         // harness: Some("unknown-harness") — expected to decode as None
         payload.push(1);
         write_str(&mut payload, "unknown-harness");
 

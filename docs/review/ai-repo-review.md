@@ -265,6 +265,10 @@ Goal: make local IPC robust against malformed clients.
 - Treat partial length-prefix reads as invalid data after any byte is received.
 - Add malformed-frame tests for frame length, string length, counts, invalid tags, and trailing bytes.
 
+Implementation note:
+
+- Implemented by adding bounded session/control frame length reads, converting clean EOF versus partial length-prefix EOF distinctly, capping control collection counts before allocation, rejecting invalid option/bool tags, and checking exact payload consumption for control frames and fixed-size session frames. Added malformed-frame tests covering oversized frames, partial prefixes, unknown tags/types, string length overruns, excessive counts, and trailing bytes.
+
 ### Batch 4: App Event And Terminal State Coalescing
 
 Goal: remove stale UI states and races without large UI rewrites.
