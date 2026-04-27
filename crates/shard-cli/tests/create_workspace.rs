@@ -345,6 +345,47 @@ async fn implicit_existing_branch_name_is_sanitized_before_validation() {
     harness.shutdown().await;
 }
 
+#[tokio::test]
+async fn implicit_new_branch_name_is_sanitized_before_validation() {
+    let harness = TestHarness::start().await;
+    let (_alias, repo_path) = harness.setup_local_repo("demo");
+    let branch = "feature/new-branch-path-like-name";
+    let output = std::process::Command::new("git")
+        .args(["branch", branch])
+        .current_dir(&repo_path)
+        .output()
+        .expect("spawn git branch");
+    assert!(
+        output.status.success(),
+        "git branch failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    match create_workspace(
+        &harness,
+        "demo",
+        None,
+        WorkspaceMode::NewBranch,
+        Some(branch),
+    )
+    .await
+    {
+        ControlFrame::CreateWorkspaceAck { workspace } => {
+            assert_eq!(workspace.name, "feature-new-branch-path-like-name");
+            assert_eq!(workspace.branch, branch);
+            assert_eq!(
+                Path::new(&workspace.path)
+                    .file_name()
+                    .and_then(|s| s.to_str()),
+                Some("feature-new-branch-path-like-name")
+            );
+        }
+        other => panic!("expected Ack, got {other:?}"),
+    }
+
+    harness.shutdown().await;
+}
+
 // ── Create after committed delete succeeds (lifecycle entry removed) ───────
 
 #[tokio::test]

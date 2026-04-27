@@ -1,3 +1,4 @@
+use std::path::{Component, Path};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection};
@@ -222,6 +223,7 @@ impl RepositoryStore {
             for ws in workspaces {
                 if !ws.is_base {
                     let ws_dir = std::path::PathBuf::from(&ws.path);
+                    ensure_managed_local_workspace_path(local_path, &ws_dir)?;
                     if ws_dir.exists() {
                         crate::workspaces::remove_worktree_fs(
                             &crate::workspaces::RealGitOps,
@@ -245,18 +247,52 @@ impl RepositoryStore {
             git::remove_from_exclude(local_path, ".shard/")?;
         }
 
-        // Remove repo data directory (DB, bare clone for remote, sessions).
-        // Do this before deleting the index row so cleanup failure preserves
-        // the retry handle.
+        // Delete the index row inside a transaction before removing the repo
+        // data directory. If cleanup fails, the transaction rolls back and
+        // preserves the retry handle.
         let repo_dir = self.paths.repo_dir(alias);
+        let mut conn = self.open_index()?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM repos WHERE alias = ?1", params![alias])?;
+
         if repo_dir.exists() {
             std::fs::remove_dir_all(&repo_dir)?;
         }
 
-        // Remove from index
-        let conn = self.open_index()?;
-        conn.execute("DELETE FROM repos WHERE alias = ?1", params![alias])?;
+        tx.commit()?;
 
         Ok(())
     }
+}
+
+fn ensure_managed_local_workspace_path(local_path: &Path, ws_dir: &Path) -> Result<()> {
+    let local_root = git::strip_unc_prefix(local_path.canonicalize()?);
+    let managed_root = local_root.join(".shard");
+
+    let candidate = if ws_dir.exists() {
+        git::strip_unc_prefix(ws_dir.canonicalize()?)
+    } else {
+        if !ws_dir.is_absolute()
+            || ws_dir
+                .components()
+                .any(|c| matches!(c, Component::ParentDir))
+        {
+            return Err(unsafe_workspace_path_error(ws_dir, &managed_root));
+        }
+        git::strip_unc_prefix(ws_dir.to_path_buf())
+    };
+
+    if candidate.parent() == Some(managed_root.as_path()) {
+        Ok(())
+    } else {
+        Err(unsafe_workspace_path_error(ws_dir, &managed_root))
+    }
+}
+
+fn unsafe_workspace_path_error(ws_dir: &Path, managed_root: &Path) -> ShardError {
+    ShardError::Other(format!(
+        "refusing to remove workspace path outside managed .shard root: {} (expected direct child of {})",
+        ws_dir.display(),
+        managed_root.display()
+    ))
 }

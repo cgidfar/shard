@@ -241,6 +241,7 @@ Implementation note:
 
 - Started in this branch by adding `shard_core::identifiers`, validating repo aliases and workspace names at store boundaries, preserving branch-slash behavior through sanitized implicit workspace names, making `RepositoryStore::remove` propagate cleanup errors before index deletion, and serializing daemon `StopSession` behind the per-repo mutation lock.
 - Compatibility caveat: legacy DB rows that already contain path-like aliases or workspace names will now be rejected by store APIs. If such rows exist in a real profile, recovery should be explicit rather than letting normal destructive commands operate on unsafe path segments.
+- Review follow-up: Batch 1 now also rejects persisted non-base local workspace paths outside the repo's managed `.shard` root during `RemoveRepo`, preserves implicit slash-branch names for both `ExistingBranch` and `NewBranch`, and wraps the final index delete/repo-dir cleanup in a transaction so filesystem cleanup failure rolls the index mutation back.
 
 ### Batch 2: Daemon-Only Session Stop
 

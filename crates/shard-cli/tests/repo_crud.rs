@@ -399,6 +399,47 @@ async fn remove_repo_cascades_workspaces() {
 }
 
 #[tokio::test]
+async fn remove_repo_rejects_persisted_workspace_path_outside_shard_root() {
+    let harness = TestHarness::start().await;
+    let checkout = harness.create_bare_checkout("demo");
+    add_repo(&harness, checkout.to_str().unwrap(), Some("demo")).await;
+
+    let outside_dir = harness.data_path.join("outside-delete-target");
+    std::fs::create_dir_all(&outside_dir).expect("create outside target");
+    std::fs::write(outside_dir.join("sentinel.txt"), "keep").expect("write sentinel");
+
+    let paths = shard_core::paths::ShardPaths::from_data_dir(harness.data_path.clone());
+    let conn = shard_core::db::open_connection(&paths.repo_db("demo")).expect("open repo db");
+    let outside_path = outside_dir.to_string_lossy().to_string();
+    conn.execute(
+        "INSERT INTO workspaces (name, branch, path, is_base, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        ("corrupt", "main", outside_path.as_str(), 0i32, 1i64),
+    )
+    .expect("seed corrupt workspace row");
+
+    match remove_repo(&harness, "demo").await {
+        ControlFrame::Error { message } => {
+            assert!(
+                message.contains("outside managed .shard root"),
+                "unexpected error: {message}"
+            );
+        }
+        other => panic!("expected Error for unsafe workspace path, got {other:?}"),
+    }
+
+    assert!(
+        outside_dir.join("sentinel.txt").exists(),
+        "RemoveRepo must not delete outside persisted workspace paths"
+    );
+    assert!(
+        db_has_repo(&harness.data_path, "demo"),
+        "failed cleanup should preserve the repo index row for retry"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn remove_repo_unknown_alias_is_idempotent() {
     let harness = TestHarness::start().await;
 

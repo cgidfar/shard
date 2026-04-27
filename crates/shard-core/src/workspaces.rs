@@ -615,8 +615,11 @@ fn resolve_workspace_name_from_branch(
         (WorkspaceMode::ExistingBranch, Some(n)) if n == branch_for_db => {
             safe_workspace_name(branch_for_db)
         }
+        (WorkspaceMode::NewBranch, None) => safe_workspace_name(branch_for_db),
+        (WorkspaceMode::NewBranch, Some(n)) if n == branch_for_db => {
+            safe_workspace_name(branch_for_db)
+        }
         (_, Some(n)) => n.to_string(),
-        (_, None) => branch_for_db.to_string(),
     }
 }
 
