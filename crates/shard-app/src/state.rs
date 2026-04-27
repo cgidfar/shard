@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use shard_core::state::RepoState;
 use tokio::io::WriteHalf;
@@ -9,6 +10,16 @@ pub struct SessionWriter {
     pub writer: WriteHalf<NamedPipeClient>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionToken(u64);
+
+impl ConnectionToken {
+    pub fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 /// Per-session connection state. Each running session has exactly one pipe
 /// connection at a time — either a lightweight monitor or a full terminal attach.
 pub enum SessionConnection {
@@ -17,6 +28,7 @@ pub enum SessionConnection {
     Monitored { task: tauri::async_runtime::JoinHandle<()> },
     /// Full terminal connection with input forwarding.
     Attached {
+        token: ConnectionToken,
         writer: SessionWriter,
         task: tauri::async_runtime::JoinHandle<()>,
     },

@@ -284,6 +284,7 @@ Goal: remove stale UI states and races without large UI rewrites.
 Implementation note:
 
 - Implemented by restoring the background monitor if app attach fails after aborting the old monitor, gating terminal input/resize behind attach completion, emitting `terminal-ended` on supervisor `Status`, clearing stale attached state when the attach reader exits, handling `WorkspaceRemoved` in the daemon subscriber, and coalescing `Sidebar.refresh()` calls that arrive while a refresh is already in flight.
+- Review follow-up: attached connections now carry a generation token so stale reader tasks only remove their own connection, late attach completion refuses to overwrite a monitor/attachment installed by a concurrent detach/reopen, and `terminal-ended` is emitted after the defensive trailing-output drain.
 
 ### Batch 5: Deletion/Consolidation Sweep
 

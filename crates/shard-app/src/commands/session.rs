@@ -11,7 +11,7 @@ use shard_transport::transport_windows::NamedPipeTransport;
 use shard_transport::SessionTransport;
 
 use crate::daemon_ipc;
-use crate::state::{AppState, SessionConnection, SessionWriter};
+use crate::state::{AppState, ConnectionToken, SessionConnection, SessionWriter};
 
 #[derive(Clone, serde::Serialize)]
 pub struct SessionInfo {
@@ -64,14 +64,6 @@ fn handle_supervisor_frame(app: &tauri::AppHandle, session_id: &str, frame: &Fra
                     let _ = store.update_status(&repo, session_id, status, Some(*code as i32));
                 }
             }
-            let _ = app.emit(
-                "terminal-ended",
-                TerminalEndedEvent {
-                    id: session_id.to_string(),
-                    status,
-                    code: *code,
-                },
-            );
             let _ = app.emit("sidebar-changed", ());
             true
         }
@@ -374,6 +366,7 @@ pub async fn attach_session(
     };
 
     let (mut reader, writer) = tokio::io::split(client);
+    let token = ConnectionToken::new();
 
     // Send Resume frame
     let mut writer = writer;
@@ -393,6 +386,7 @@ pub async fn attach_session(
     let session_id = id.clone();
     let app_clone = app.clone();
     let task = tauri::async_runtime::spawn(async move {
+        let mut terminal_status: Option<(&'static str, u8)> = None;
         loop {
             match protocol::read_frame(&mut reader).await {
                 Ok(Some(Frame::TerminalOutput { data, .. })) => {
@@ -404,6 +398,14 @@ pub async fn attach_session(
                     handle_supervisor_frame(&app_clone, &session_id, frame);
                 }
                 Ok(Some(ref frame @ Frame::Status { .. })) => {
+                    if let Frame::Status { code } = frame {
+                        let status = match code {
+                            0 => "exited",
+                            1 => "stopped",
+                            _ => "failed",
+                        };
+                        terminal_status = Some((status, *code));
+                    }
                     handle_supervisor_frame(&app_clone, &session_id, frame);
                     // Drain any trailing TerminalOutput (defensive)
                     let deadline =
@@ -425,18 +427,41 @@ pub async fn attach_session(
                 Err(_) => break,
             }
         }
+        if let Some((status, code)) = terminal_status {
+            let _ = app_clone.emit(
+                "terminal-ended",
+                TerminalEndedEvent {
+                    id: session_id.clone(),
+                    status,
+                    code,
+                },
+            );
+        }
         let state = app_clone.state::<AppState>();
         let mut conns = state.connections.lock().await;
-        conns.remove(&session_id);
+        let should_remove = matches!(
+            conns.get(&session_id),
+            Some(SessionConnection::Attached {
+                token: current, ..
+            }) if *current == token
+        );
+        if should_remove {
+            conns.remove(&session_id);
+        }
         tracing::debug!("attach reader ended for session {session_id}");
     });
 
     // Store writer + reader task as Attached connection
     {
         let mut conns = state.connections.lock().await;
+        if conns.contains_key(&id) {
+            task.abort();
+            return Err("session connection changed while attaching".into());
+        }
         conns.insert(
             id.clone(),
             SessionConnection::Attached {
+                token,
                 writer: SessionWriter { writer },
                 task,
             },
