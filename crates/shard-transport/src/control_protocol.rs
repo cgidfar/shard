@@ -325,7 +325,7 @@ pub async fn write_control_frame<W: AsyncWrite + Unpin>(
             daemon_version,
         } => {
             payload.extend_from_slice(&protocol_version.to_be_bytes());
-            write_str(&mut payload, daemon_version);
+            write_str(&mut payload, daemon_version)?;
             TYPE_HELLO_ACK
         }
         ControlFrame::Ping => TYPE_PING,
@@ -336,16 +336,21 @@ pub async fn write_control_frame<W: AsyncWrite + Unpin>(
             command,
             harness,
         } => {
-            write_str(&mut payload, repo);
-            write_str(&mut payload, workspace);
-            payload.extend_from_slice(&(command.len() as u16).to_be_bytes());
+            write_str(&mut payload, repo)?;
+            write_str(&mut payload, workspace)?;
+            write_count_u16(
+                &mut payload,
+                "SpawnSession command",
+                command.len(),
+                MAX_SPAWN_COMMAND_COUNT,
+            )?;
             for cmd in command {
-                write_str(&mut payload, cmd);
+                write_str(&mut payload, cmd)?;
             }
             match harness {
                 Some(h) => {
                     payload.push(1);
-                    write_str(&mut payload, h);
+                    write_str(&mut payload, h)?;
                 }
                 None => payload.push(0),
             }
@@ -356,26 +361,26 @@ pub async fn write_control_frame<W: AsyncWrite + Unpin>(
             supervisor_pid,
             transport_addr,
         } => {
-            write_str(&mut payload, session_id);
+            write_str(&mut payload, session_id)?;
             payload.extend_from_slice(&supervisor_pid.to_be_bytes());
-            write_str(&mut payload, transport_addr);
+            write_str(&mut payload, transport_addr)?;
             TYPE_SPAWN_ACK
         }
         ControlFrame::StopSession { session_id, force } => {
-            write_str(&mut payload, session_id);
+            write_str(&mut payload, session_id)?;
             payload.push(if *force { 1 } else { 0 });
             TYPE_STOP_SESSION
         }
         ControlFrame::StopAck => TYPE_STOP_ACK,
         ControlFrame::ListSessions => TYPE_LIST_SESSIONS,
         ControlFrame::SessionList { sessions } => {
-            payload.extend_from_slice(&(sessions.len() as u32).to_be_bytes());
+            write_count_u32(&mut payload, "SessionList sessions", sessions.len())?;
             for s in sessions {
-                write_str(&mut payload, &s.session_id);
+                write_str(&mut payload, &s.session_id)?;
                 payload.extend_from_slice(&s.supervisor_pid.to_be_bytes());
-                write_str(&mut payload, &s.transport_addr);
-                write_str(&mut payload, &s.repo);
-                write_str(&mut payload, &s.workspace);
+                write_str(&mut payload, &s.transport_addr)?;
+                write_str(&mut payload, &s.repo)?;
+                write_str(&mut payload, &s.workspace)?;
             }
             TYPE_SESSION_LIST
         }
@@ -386,7 +391,7 @@ pub async fn write_control_frame<W: AsyncWrite + Unpin>(
         ControlFrame::ShutdownAck => TYPE_SHUTDOWN_ACK,
         ControlFrame::Subscribe => TYPE_SUBSCRIBE,
         ControlFrame::StateSnapshot { state } => {
-            write_str(&mut payload, &state.repo_alias);
+            write_str(&mut payload, &state.repo_alias)?;
             payload.extend_from_slice(&state.version.to_be_bytes());
 
             // Workspaces — sort for deterministic encoding so roundtrip tests
@@ -394,10 +399,10 @@ pub async fn write_control_frame<W: AsyncWrite + Unpin>(
             // diff against a map.
             let mut ws: Vec<(&String, &WorkspaceStatus)> = state.workspaces.iter().collect();
             ws.sort_by(|a, b| a.0.cmp(b.0));
-            payload.extend_from_slice(&(ws.len() as u32).to_be_bytes());
+            write_count_u32(&mut payload, "StateSnapshot workspaces", ws.len())?;
             for (name, status) in ws {
-                write_str(&mut payload, name);
-                write_workspace_status(&mut payload, status);
+                write_str(&mut payload, name)?;
+                write_workspace_status(&mut payload, status)?;
             }
 
             TYPE_STATE_SNAPSHOT
@@ -406,25 +411,25 @@ pub async fn write_control_frame<W: AsyncWrite + Unpin>(
             match repo_alias {
                 Some(alias) => {
                     payload.push(1);
-                    write_str(&mut payload, alias);
+                    write_str(&mut payload, alias)?;
                 }
                 None => payload.push(0),
             }
             TYPE_TOPOLOGY_CHANGED
         }
         ControlFrame::SessionsChanged { repo } => {
-            write_str(&mut payload, repo);
+            write_str(&mut payload, repo)?;
             TYPE_SESSIONS_CHANGED
         }
         ControlFrame::RemoveWorkspace { repo, name } => {
-            write_str(&mut payload, repo);
-            write_str(&mut payload, name);
+            write_str(&mut payload, repo)?;
+            write_str(&mut payload, name)?;
             TYPE_REMOVE_WORKSPACE
         }
         ControlFrame::RemoveWorkspaceAck => TYPE_REMOVE_WORKSPACE_ACK,
         ControlFrame::WorkspaceRemoved { repo, name } => {
-            write_str(&mut payload, repo);
-            write_str(&mut payload, name);
+            write_str(&mut payload, repo)?;
+            write_str(&mut payload, name)?;
             TYPE_WORKSPACE_REMOVED
         }
         ControlFrame::CreateWorkspace {
@@ -433,28 +438,28 @@ pub async fn write_control_frame<W: AsyncWrite + Unpin>(
             mode,
             branch,
         } => {
-            write_str(&mut payload, repo);
-            write_opt_str(&mut payload, name.as_deref());
+            write_str(&mut payload, repo)?;
+            write_opt_str(&mut payload, name.as_deref())?;
             payload.push(mode_to_byte(*mode));
-            write_opt_str(&mut payload, branch.as_deref());
+            write_opt_str(&mut payload, branch.as_deref())?;
             TYPE_CREATE_WORKSPACE
         }
         ControlFrame::CreateWorkspaceAck { workspace } => {
-            write_workspace(&mut payload, workspace);
+            write_workspace(&mut payload, workspace)?;
             TYPE_CREATE_WORKSPACE_ACK
         }
         ControlFrame::ListWorkspaces { repo } => {
-            write_str(&mut payload, repo);
+            write_str(&mut payload, repo)?;
             TYPE_LIST_WORKSPACES
         }
         ControlFrame::WorkspaceList { items } => {
-            payload.extend_from_slice(&(items.len() as u32).to_be_bytes());
+            write_count_u32(&mut payload, "WorkspaceList items", items.len())?;
             for item in items {
-                write_workspace(&mut payload, &item.workspace);
+                write_workspace(&mut payload, &item.workspace)?;
                 match &item.status {
                     Some(status) => {
                         payload.push(1);
-                        write_workspace_status(&mut payload, status);
+                        write_workspace_status(&mut payload, status)?;
                     }
                     None => payload.push(0),
                 }
@@ -462,69 +467,69 @@ pub async fn write_control_frame<W: AsyncWrite + Unpin>(
             TYPE_WORKSPACE_LIST
         }
         ControlFrame::ListBranchInfo { repo } => {
-            write_str(&mut payload, repo);
+            write_str(&mut payload, repo)?;
             TYPE_LIST_BRANCH_INFO
         }
         ControlFrame::BranchInfoList { branches } => {
-            payload.extend_from_slice(&(branches.len() as u32).to_be_bytes());
+            write_count_u32(&mut payload, "BranchInfoList branches", branches.len())?;
             for b in branches {
-                write_str(&mut payload, &b.name);
+                write_str(&mut payload, &b.name)?;
                 payload.push(if b.is_head { 1 } else { 0 });
-                write_opt_str(&mut payload, b.checked_out_by.as_deref());
+                write_opt_str(&mut payload, b.checked_out_by.as_deref())?;
             }
             TYPE_BRANCH_INFO_LIST
         }
         ControlFrame::AddRepo { url, alias } => {
-            write_str(&mut payload, url);
-            write_opt_str(&mut payload, alias.as_deref());
+            write_str(&mut payload, url)?;
+            write_opt_str(&mut payload, alias.as_deref())?;
             TYPE_ADD_REPO
         }
         ControlFrame::AddRepoAck { repo } => {
-            write_repository(&mut payload, repo);
+            write_repository(&mut payload, repo)?;
             TYPE_ADD_REPO_ACK
         }
         ControlFrame::RemoveRepo { alias } => {
-            write_str(&mut payload, alias);
+            write_str(&mut payload, alias)?;
             TYPE_REMOVE_REPO
         }
         ControlFrame::RemoveRepoAck => TYPE_REMOVE_REPO_ACK,
         ControlFrame::SyncRepo { alias } => {
-            write_str(&mut payload, alias);
+            write_str(&mut payload, alias)?;
             TYPE_SYNC_REPO
         }
         ControlFrame::SyncRepoAck => TYPE_SYNC_REPO_ACK,
         ControlFrame::ListRepos => TYPE_LIST_REPOS,
         ControlFrame::RepoList { repos } => {
-            payload.extend_from_slice(&(repos.len() as u32).to_be_bytes());
+            write_count_u32(&mut payload, "RepoList repos", repos.len())?;
             for r in repos {
-                write_repository(&mut payload, r);
+                write_repository(&mut payload, r)?;
             }
             TYPE_REPO_LIST
         }
         ControlFrame::RemoveSession { repo, id } => {
-            write_str(&mut payload, repo);
-            write_str(&mut payload, id);
+            write_str(&mut payload, repo)?;
+            write_str(&mut payload, id)?;
             TYPE_REMOVE_SESSION
         }
         ControlFrame::RemoveSessionAck => TYPE_REMOVE_SESSION_ACK,
         ControlFrame::RenameSession { repo, id, label } => {
-            write_str(&mut payload, repo);
-            write_str(&mut payload, id);
-            write_opt_str(&mut payload, label.as_deref());
+            write_str(&mut payload, repo)?;
+            write_str(&mut payload, id)?;
+            write_opt_str(&mut payload, label.as_deref())?;
             TYPE_RENAME_SESSION
         }
         ControlFrame::RenameSessionAck => TYPE_RENAME_SESSION_ACK,
         ControlFrame::FindSessionById { prefix } => {
-            write_str(&mut payload, prefix);
+            write_str(&mut payload, prefix)?;
             TYPE_FIND_SESSION_BY_ID
         }
         ControlFrame::FoundSession { repo, session } => {
-            write_str(&mut payload, repo);
-            write_session(&mut payload, session);
+            write_str(&mut payload, repo)?;
+            write_session(&mut payload, session)?;
             TYPE_FOUND_SESSION
         }
         ControlFrame::InstallHarnessHooks { harness } => {
-            write_str(&mut payload, harness);
+            write_str(&mut payload, harness)?;
             TYPE_INSTALL_HARNESS_HOOKS
         }
         ControlFrame::InstallHarnessHooksAck {
@@ -532,16 +537,27 @@ pub async fn write_control_frame<W: AsyncWrite + Unpin>(
             skipped_reason,
         } => {
             payload.push(if *installed { 1 } else { 0 });
-            write_opt_str(&mut payload, skipped_reason.as_deref());
+            write_opt_str(&mut payload, skipped_reason.as_deref())?;
             TYPE_INSTALL_HARNESS_HOOKS_ACK
         }
         ControlFrame::Error { message } => {
-            write_str(&mut payload, message);
+            write_str(&mut payload, message)?;
             TYPE_ERROR
         }
     };
 
-    let length = 1 + payload.len() as u32;
+    let length = u32::try_from(1 + payload.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("control frame payload too large: {} bytes", payload.len()),
+        )
+    })?;
+    if (length as usize) > MAX_CONTROL_FRAME_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("control frame exceeds MAX_CONTROL_FRAME_LEN: {length}"),
+        ));
+    }
     writer.write_all(&length.to_be_bytes()).await?;
     writer.write_all(&[type_byte]).await?;
     writer.write_all(&payload).await?;
@@ -915,18 +931,18 @@ const HEALTH_HEALTHY: u8 = 0;
 const HEALTH_MISSING: u8 = 1;
 const HEALTH_BROKEN: u8 = 2;
 
-fn write_workspace_status(buf: &mut Vec<u8>, status: &WorkspaceStatus) {
+fn write_workspace_status(buf: &mut Vec<u8>, status: &WorkspaceStatus) -> std::io::Result<()> {
     match &status.current_branch {
         Some(b) => {
             buf.push(1);
-            write_str(buf, b);
+            write_str(buf, b)?;
         }
         None => buf.push(0),
     }
     match &status.head_sha {
         Some(s) => {
             buf.push(1);
-            write_str(buf, s);
+            write_str(buf, s)?;
         }
         None => buf.push(0),
     }
@@ -936,6 +952,7 @@ fn write_workspace_status(buf: &mut Vec<u8>, status: &WorkspaceStatus) {
         WorkspaceHealth::Missing => HEALTH_MISSING,
         WorkspaceHealth::Broken => HEALTH_BROKEN,
     });
+    Ok(())
 }
 
 fn read_workspace_status(buf: &[u8]) -> std::io::Result<(WorkspaceStatus, usize)> {
@@ -1015,14 +1032,15 @@ fn mode_from_byte(byte: u8) -> std::io::Result<WorkspaceMode> {
     }
 }
 
-fn write_opt_str(buf: &mut Vec<u8>, s: Option<&str>) {
+fn write_opt_str(buf: &mut Vec<u8>, s: Option<&str>) -> std::io::Result<()> {
     match s {
         Some(value) => {
             buf.push(1);
-            write_str(buf, value);
+            write_str(buf, value)?;
         }
         None => buf.push(0),
     }
+    Ok(())
 }
 
 fn read_opt_str(buf: &[u8]) -> std::io::Result<(Option<String>, usize)> {
@@ -1035,12 +1053,13 @@ fn read_opt_str(buf: &[u8]) -> std::io::Result<(Option<String>, usize)> {
     }
 }
 
-fn write_workspace(buf: &mut Vec<u8>, ws: &Workspace) {
-    write_str(buf, &ws.name);
-    write_str(buf, &ws.branch);
-    write_str(buf, &ws.path);
+fn write_workspace(buf: &mut Vec<u8>, ws: &Workspace) -> std::io::Result<()> {
+    write_str(buf, &ws.name)?;
+    write_str(buf, &ws.branch)?;
+    write_str(buf, &ws.path)?;
     buf.push(if ws.is_base { 1 } else { 0 });
     buf.extend_from_slice(&ws.created_at.to_be_bytes());
+    Ok(())
 }
 
 fn read_workspace(buf: &[u8]) -> std::io::Result<(Workspace, usize)> {
@@ -1074,15 +1093,16 @@ fn read_workspace(buf: &[u8]) -> std::io::Result<(Workspace, usize)> {
 //   [id str][url str][alias str][host opt_str][owner opt_str]
 //   [name opt_str][local_path opt_str][created_at u64]
 
-fn write_repository(buf: &mut Vec<u8>, repo: &Repository) {
-    write_str(buf, &repo.id);
-    write_str(buf, &repo.url);
-    write_str(buf, &repo.alias);
-    write_opt_str(buf, repo.host.as_deref());
-    write_opt_str(buf, repo.owner.as_deref());
-    write_opt_str(buf, repo.name.as_deref());
-    write_opt_str(buf, repo.local_path.as_deref());
+fn write_repository(buf: &mut Vec<u8>, repo: &Repository) -> std::io::Result<()> {
+    write_str(buf, &repo.id)?;
+    write_str(buf, &repo.url)?;
+    write_str(buf, &repo.alias)?;
+    write_opt_str(buf, repo.host.as_deref())?;
+    write_opt_str(buf, repo.owner.as_deref())?;
+    write_opt_str(buf, repo.name.as_deref())?;
+    write_opt_str(buf, repo.local_path.as_deref())?;
     buf.extend_from_slice(&repo.created_at.to_be_bytes());
+    Ok(())
 }
 
 fn read_repository(buf: &[u8]) -> std::io::Result<(Repository, usize)> {
@@ -1194,20 +1214,21 @@ fn read_opt_u64(buf: &[u8]) -> std::io::Result<(Option<u64>, usize)> {
     }
 }
 
-fn write_session(buf: &mut Vec<u8>, session: &Session) {
-    write_str(buf, &session.id);
-    write_str(buf, &session.workspace_name);
-    write_str(buf, &session.command_json);
-    write_str(buf, &session.transport_addr);
-    write_str(buf, &session.log_path);
+fn write_session(buf: &mut Vec<u8>, session: &Session) -> std::io::Result<()> {
+    write_str(buf, &session.id)?;
+    write_str(buf, &session.workspace_name)?;
+    write_str(buf, &session.command_json)?;
+    write_str(buf, &session.transport_addr)?;
+    write_str(buf, &session.log_path)?;
     write_opt_u32(buf, session.supervisor_pid);
     write_opt_u32(buf, session.child_pid);
-    write_str(buf, &session.status);
+    write_str(buf, &session.status)?;
     write_opt_i32(buf, session.exit_code);
     buf.extend_from_slice(&session.created_at.to_be_bytes());
     write_opt_u64(buf, session.stopped_at);
-    write_opt_str(buf, session.label.as_deref());
-    write_opt_str(buf, session.harness.map(|h| h.to_string()).as_deref());
+    write_opt_str(buf, session.label.as_deref())?;
+    write_opt_str(buf, session.harness.map(|h| h.to_string()).as_deref())?;
+    Ok(())
 }
 
 fn read_session(buf: &[u8]) -> std::io::Result<(Session, usize)> {
@@ -1262,10 +1283,42 @@ fn read_session(buf: &[u8]) -> std::io::Result<(Session, usize)> {
 
 // --- Helpers for length-prefixed string encoding ---
 
-fn write_str(buf: &mut Vec<u8>, s: &str) {
+fn write_str(buf: &mut Vec<u8>, s: &str) -> std::io::Result<()> {
     let bytes = s.as_bytes();
-    buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+    let len = u16::try_from(bytes.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("string too long for u16 prefix: {} bytes", bytes.len()),
+        )
+    })?;
+    buf.extend_from_slice(&len.to_be_bytes());
     buf.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn write_count_u32(buf: &mut Vec<u8>, label: &str, count: usize) -> std::io::Result<()> {
+    if count > MAX_CONTROL_COLLECTION_COUNT {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{label} count {count} exceeds MAX_CONTROL_COLLECTION_COUNT ({})",
+                MAX_CONTROL_COLLECTION_COUNT
+            ),
+        ));
+    }
+    buf.extend_from_slice(&(count as u32).to_be_bytes());
+    Ok(())
+}
+
+fn write_count_u16(buf: &mut Vec<u8>, label: &str, count: usize, max: usize) -> std::io::Result<()> {
+    if count > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{label} count {count} exceeds max ({max})"),
+        ));
+    }
+    buf.extend_from_slice(&(count as u16).to_be_bytes());
+    Ok(())
 }
 
 /// Read a length-prefixed string. Returns (string, bytes_consumed).
@@ -2046,21 +2099,21 @@ mod tests {
         // recognize, we decode it as `None` — matches the DB's tolerance.
         let mut payload = Vec::new();
         // Session fields, matching write_session layout:
-        write_str(&mut payload, "id"); // id
-        write_str(&mut payload, "ws"); // workspace_name
-        write_str(&mut payload, "[]"); // command_json
-        write_str(&mut payload, ""); // transport_addr
-        write_str(&mut payload, ""); // log_path
+        write_str(&mut payload, "id").unwrap(); // id
+        write_str(&mut payload, "ws").unwrap(); // workspace_name
+        write_str(&mut payload, "[]").unwrap(); // command_json
+        write_str(&mut payload, "").unwrap(); // transport_addr
+        write_str(&mut payload, "").unwrap(); // log_path
         payload.push(0); // supervisor_pid: None
         payload.push(0); // child_pid: None
-        write_str(&mut payload, "running"); // status
+        write_str(&mut payload, "running").unwrap(); // status
         payload.push(0); // exit_code: None
         payload.extend_from_slice(&0u64.to_be_bytes()); // created_at
         payload.push(0); // stopped_at: None
         payload.push(0); // label: None
                          // harness: Some("unknown-harness") — expected to decode as None
         payload.push(1);
-        write_str(&mut payload, "unknown-harness");
+        write_str(&mut payload, "unknown-harness").unwrap();
 
         let (session, _) = read_session(&payload).unwrap();
         assert!(
@@ -2107,7 +2160,7 @@ mod tests {
     #[tokio::test]
     async fn mode_byte_rejects_unknown() {
         let mut bytes = Vec::new();
-        write_str(&mut bytes, "demo");
+        write_str(&mut bytes, "demo").unwrap();
         bytes.push(0); // name tag: None
         bytes.push(0x7f); // invalid mode
         bytes.push(0); // branch tag: None

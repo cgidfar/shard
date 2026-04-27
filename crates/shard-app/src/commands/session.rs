@@ -419,9 +419,19 @@ pub async fn attach_session(
                     }
                     break;
                 }
-                Ok(None) => break,
+                Ok(None) => {
+                    if terminal_status.is_none() {
+                        terminal_status = Some(("failed", 255));
+                    }
+                    break;
+                }
                 Ok(Some(_)) => {}
-                Err(_) => break,
+                Err(_) => {
+                    if terminal_status.is_none() {
+                        terminal_status = Some(("failed", 255));
+                    }
+                    break;
+                }
             }
         }
         if let Some((status, code)) = terminal_status {

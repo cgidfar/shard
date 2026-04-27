@@ -112,7 +112,18 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
         }
     };
 
-    let length = 1 + payload.len() as u32; // type byte + payload
+    let length = u32::try_from(1 + payload.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame payload too large: {} bytes", payload.len()),
+        )
+    })?;
+    if (length as usize) > MAX_SESSION_FRAME_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame exceeds MAX_SESSION_FRAME_LEN: {length}"),
+        ));
+    }
     writer.write_all(&length.to_be_bytes()).await?;
     writer.write_all(&[type_byte]).await?;
     writer.write_all(&payload).await?;
