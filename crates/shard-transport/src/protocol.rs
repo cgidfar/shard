@@ -187,13 +187,25 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result
             Frame::StopForce
         }
         TYPE_STATUS => {
-            if payload.len() != 1 && payload.len() != 4 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "status frame must be 1 byte or legacy 4-byte code",
-                ));
-            }
-            Frame::Status { code: payload[0] }
+            let code = match payload.len() {
+                1 => payload[0],
+                4 => {
+                    let legacy = u32::from_be_bytes(payload.try_into().unwrap());
+                    u8::try_from(legacy).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("legacy status code {legacy} exceeds u8"),
+                        )
+                    })?
+                }
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "status frame must be 1 byte or legacy 4-byte code",
+                    ));
+                }
+            };
+            Frame::Status { code }
         }
         TYPE_RESUME => {
             if payload.len() != 8 {
@@ -392,6 +404,22 @@ mod tests {
             read_frame(&mut cursor).await.unwrap(),
             Some(Frame::Status { code: 0 })
         );
+    }
+
+    #[tokio::test]
+    async fn parses_legacy_four_byte_status_payload_as_u32() {
+        let mut cursor = std::io::Cursor::new(vec![0, 0, 0, 5, TYPE_STATUS, 0, 0, 0, 1]);
+        assert_eq!(
+            read_frame(&mut cursor).await.unwrap(),
+            Some(Frame::Status { code: 1 })
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_legacy_status_payload_outside_u8_range() {
+        let mut cursor = std::io::Cursor::new(vec![0, 0, 0, 5, TYPE_STATUS, 0, 0, 1, 0]);
+        let err = read_frame(&mut cursor).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]

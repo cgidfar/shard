@@ -269,6 +269,7 @@ Implementation note:
 
 - Implemented by adding bounded session/control frame length reads, converting clean EOF versus partial length-prefix EOF distinctly, capping control collection counts before allocation, rejecting invalid option/bool tags, and checking exact payload consumption for control frames and fixed-size session frames. Added malformed-frame tests covering oversized frames, partial prefixes, unknown tags/types, string length overruns, excessive counts, and trailing bytes.
 - Review follow-up: session `Status` decoding accepts the current one-byte payload and the legacy four-byte fake-supervisor payload used by existing stop-and-drain tests, while still rejecting other unexpected trailing-byte shapes.
+- Second review follow-up: the four-byte compatibility path now parses the value as a legacy big-endian `u32` and rejects values outside the current `u8` status-code range, rather than ignoring trailing bytes.
 
 ### Batch 4: App Event And Terminal State Coalescing
 
