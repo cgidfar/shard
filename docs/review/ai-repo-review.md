@@ -151,6 +151,8 @@ Notes:
 
 2. `NamedPipeTransport::accept` is a public trait method whose Windows implementation reaches an `unreachable!` placeholder. The event loop uses direct named-pipe handling instead, so the trait shape no longer matches reality.
 
+   Status: resolved in Batch 5 by removing `SessionTransport::accept` and the Windows placeholder.
+
 3. Frontend Tauri `listen()` unlisten handles are ignored.
 
    Mostly a dev/HMR risk, but duplicate listeners can cause duplicate refresh or activity handling after reloads.
@@ -163,6 +165,8 @@ Notes:
 
    The Tauri detach command already uses `FindSessionById` to both validate the id and recover the transport address for monitor restart. The unused `daemon_ipc::detach_session` warning is a direct signal that this protocol branch is dead weight.
 
+   Status: resolved in Batch 5. The remaining `detach_session` symbol is the Tauri UI command, not a daemon control frame.
+
 2. Delete CLI `session stop` direct fallback.
 
    The invariant preserved is daemon ownership of session lifecycle and live registry. If offline cleanup is needed, it should be a separate recovery command with different guarantees.
@@ -171,9 +175,13 @@ Notes:
 
    `crates/shard-app/src/daemon_ipc.rs` repeats connect/handshake/request extraction for every RPC, and CLI repo/workspace commands have their own versions. A small shared typed-request helper would remove duplicated error plumbing without changing behavior.
 
+   Status: resolved in Batch 5 for app daemon RPC helpers and CLI repo/workspace/session daemon RPC calls.
+
 4. Collapse duplicate daemon spawn/connect logic.
 
    CLI and Tauri backend both implement `connect_or_spawn_daemon` with different executable-location assumptions. A shared helper with injected executable resolution would make daemon startup behavior easier to reason about.
+
+   Status: resolved in Batch 5 by moving the transport decision tree to `daemon_client::connect_or_spawn`; CLI and Tauri provide only their executable-resolution/spawn closures.
 
 5. Collapse duplicate workspace removal logic.
 
@@ -182,6 +190,8 @@ Notes:
 6. Narrow or delete `SessionTransport::accept`.
 
    The current trait method does not model Windows named-pipe accept semantics and is not used by the real multi-client event loop.
+
+   Status: resolved in Batch 5.
 
 7. Handle `WorkspaceRemoved` in the app subscriber and delete any redundant sidebar pokes this makes unnecessary.
 

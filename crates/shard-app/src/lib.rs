@@ -20,30 +20,29 @@ fn ensure_daemon_running() {
     rt.block_on(async {
         use shard_transport::daemon_client;
 
-        // Check if already running
-        if daemon_client::connect().await.is_ok() {
-            return;
-        }
+        let _ = daemon_client::connect_or_spawn(
+            || {
+                let exe_dir = std::env::current_exe()?
+                    .parent()
+                    .ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::NotFound, "no exe dir")
+                    })?
+                    .to_path_buf();
+                let shardctl = exe_dir.join("shardctl.exe");
+                if !shardctl.exists() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("shardctl.exe not found at {}", shardctl.display()),
+                    ));
+                }
 
-        // Spawn daemon
-        let exe_dir = match std::env::current_exe() {
-            Ok(p) => match p.parent() {
-                Some(d) => d.to_path_buf(),
-                None => return,
+                use shard_supervisor::process::{PlatformProcessControl, ProcessControl};
+                let args = vec!["daemon".to_string(), "start".to_string()];
+                PlatformProcessControl::spawn_detached(&shardctl, &args).map(|_| ())
             },
-            Err(_) => return,
-        };
-        let shardctl = exe_dir.join("shardctl.exe");
-        if !shardctl.exists() {
-            return;
-        }
-
-        use shard_supervisor::process::{PlatformProcessControl, ProcessControl};
-        let args = vec!["daemon".to_string(), "start".to_string()];
-        let _ = PlatformProcessControl::spawn_detached(&shardctl, &args);
-
-        // Wait briefly for daemon to be ready (best-effort)
-        let _ = daemon_client::connect_with_retry(std::time::Duration::from_secs(3)).await;
+            std::time::Duration::from_secs(3),
+        )
+        .await;
     });
 }
 
