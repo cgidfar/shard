@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions};
+use tokio::net::windows::named_pipe::{
+    ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
+};
 
 use crate::transport::SessionTransport;
 
@@ -15,23 +17,6 @@ impl SessionTransport for NamedPipeTransport {
             .first_pipe_instance(true)
             .create(address)?;
         Ok(server)
-    }
-
-    async fn accept(server: &Self::Server) -> std::io::Result<Self::Client> {
-        // Wait for a client to connect to the existing server instance
-        server.connect().await?;
-
-        // The current server instance is now connected.
-        // We need to return a client-like handle. But named pipes on Windows
-        // work differently — the server IS the connected stream.
-        // We'll handle this by having the caller use the server directly
-        // after connect(). For multi-client support, we create new instances.
-        //
-        // This trait method doesn't map perfectly to Windows named pipes.
-        // The actual multi-client pattern is handled in the event loop.
-        // For now, connect as a client to the same pipe.
-        let client = ClientOptions::new().open(server_name_placeholder())?;
-        Ok(client)
     }
 
     async fn connect(address: &str) -> std::io::Result<Self::Client> {
@@ -58,13 +43,6 @@ impl SessionTransport for NamedPipeTransport {
     fn session_address(session_id: &str) -> String {
         format!(r"\\.\pipe\shard-session-{session_id}")
     }
-}
-
-fn server_name_placeholder() -> &'static str {
-    // This function exists because the accept() trait method doesn't
-    // map well to Windows named pipes. The real multi-client pattern
-    // is implemented directly in the event loop.
-    unreachable!("use event loop's direct pipe handling instead")
 }
 
 /// Create a new named pipe server instance for multi-client support.

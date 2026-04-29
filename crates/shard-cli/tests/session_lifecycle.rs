@@ -1,5 +1,5 @@
 //! Integration tests for Phase 4 (Batch C tail): `ControlFrame::RemoveSession`,
-//! `RenameSession`, `DetachSession`, and `FindSessionById`.
+//! `RenameSession`, and `FindSessionById`.
 //!
 //! Coverage matches the template Phases 1–3 established:
 //!   - Happy path per RPC
@@ -49,15 +49,6 @@ async fn rename_session_rpc(
     .expect("RenameSession RPC")
 }
 
-async fn detach_session_rpc(harness: &TestHarness, id: &str) -> ControlFrame {
-    let mut conn = harness.connect().await;
-    conn.request(&ControlFrame::DetachSession {
-        id: id.to_string(),
-    })
-    .await
-    .expect("DetachSession RPC")
-}
-
 async fn find_session_by_id_rpc(harness: &TestHarness, prefix: &str) -> ControlFrame {
     let mut conn = harness.connect().await;
     conn.request(&ControlFrame::FindSessionById {
@@ -72,11 +63,7 @@ fn db_session_exists(data_path: &std::path::Path, repo: &str, id: &str) -> bool 
     SessionStore::new(paths).get(repo, id).is_ok()
 }
 
-fn db_session_label(
-    data_path: &std::path::Path,
-    repo: &str,
-    id: &str,
-) -> Option<String> {
+fn db_session_label(data_path: &std::path::Path, repo: &str, id: &str) -> Option<String> {
     let paths = ShardPaths::from_data_dir(data_path.to_path_buf());
     SessionStore::new(paths)
         .get(repo, id)
@@ -91,10 +78,12 @@ async fn remove_session_happy_path() {
     let harness = TestHarness::start().await;
     harness.setup_local_repo("demo");
     harness.setup_workspace("demo", "feature-a");
-    let (session_id, session_dir) =
-        harness.setup_terminal_session("demo", "feature-a", "exited");
+    let (session_id, session_dir) = harness.setup_terminal_session("demo", "feature-a", "exited");
 
-    assert!(session_dir.exists(), "session dir should exist before remove");
+    assert!(
+        session_dir.exists(),
+        "session dir should exist before remove"
+    );
     assert!(db_session_exists(&harness.data_path, "demo", &session_id));
 
     match remove_session_rpc(&harness, "demo", &session_id).await {
@@ -106,12 +95,15 @@ async fn remove_session_happy_path() {
         !db_session_exists(&harness.data_path, "demo", &session_id),
         "DB row should be gone"
     );
-    assert!(
-        !session_dir.exists(),
-        "session dir should be cleaned up"
-    );
+    assert!(!session_dir.exists(), "session dir should be cleaned up");
 
     harness.shutdown().await;
+}
+
+static SEQ: AtomicU32 = AtomicU32::new(0);
+
+fn next_seq() -> u32 {
+    SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 #[tokio::test]
@@ -147,7 +139,10 @@ async fn remove_session_refuses_live_registry_entry() {
         other => panic!("expected Error, got {other:?}"),
     }
 
-    assert!(session_dir.exists(), "session dir should survive the refused remove");
+    assert!(
+        session_dir.exists(),
+        "session dir should survive the refused remove"
+    );
     assert!(db_session_exists(&harness.data_path, "demo", &session_id));
 
     harness.shutdown().await;
@@ -160,8 +155,7 @@ async fn remove_session_refuses_running_status() {
     let harness = TestHarness::start().await;
     harness.setup_local_repo("demo");
     harness.setup_workspace("demo", "feature-running");
-    let (session_id, _) =
-        harness.setup_terminal_session("demo", "feature-running", "running");
+    let (session_id, _) = harness.setup_terminal_session("demo", "feature-running", "running");
 
     match remove_session_rpc(&harness, "demo", &session_id).await {
         ControlFrame::Error { message } => {
@@ -198,10 +192,12 @@ async fn rename_session_sets_and_clears_label() {
     let harness = TestHarness::start().await;
     harness.setup_local_repo("demo");
     harness.setup_workspace("demo", "feature-b");
-    let (session_id, _) =
-        harness.setup_terminal_session("demo", "feature-b", "exited");
+    let (session_id, _) = harness.setup_terminal_session("demo", "feature-b", "exited");
 
-    assert_eq!(db_session_label(&harness.data_path, "demo", &session_id), None);
+    assert_eq!(
+        db_session_label(&harness.data_path, "demo", &session_id),
+        None
+    );
 
     match rename_session_rpc(&harness, "demo", &session_id, Some("my-agent")).await {
         ControlFrame::RenameSessionAck => {}
@@ -217,7 +213,10 @@ async fn rename_session_sets_and_clears_label() {
         ControlFrame::RenameSessionAck => {}
         other => panic!("expected Ack, got {other:?}"),
     }
-    assert_eq!(db_session_label(&harness.data_path, "demo", &session_id), None);
+    assert_eq!(
+        db_session_label(&harness.data_path, "demo", &session_id),
+        None
+    );
 
     harness.shutdown().await;
 }
@@ -256,39 +255,6 @@ async fn rename_session_unknown_id_errors() {
     harness.shutdown().await;
 }
 
-// ── DetachSession ──────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn detach_session_happy_path() {
-    let harness = TestHarness::start().await;
-    harness.setup_local_repo("demo");
-    harness.setup_workspace("demo", "feature-d");
-    let (session_id, _) =
-        harness.setup_terminal_session("demo", "feature-d", "exited");
-
-    match detach_session_rpc(&harness, &session_id).await {
-        ControlFrame::DetachSessionAck => {}
-        other => panic!("expected Ack, got {other:?}"),
-    }
-
-    // Detach is effectively a probe: the DB row is unchanged.
-    assert!(db_session_exists(&harness.data_path, "demo", &session_id));
-
-    harness.shutdown().await;
-}
-
-#[tokio::test]
-async fn detach_session_unknown_id_errors() {
-    let harness = TestHarness::start().await;
-
-    match detach_session_rpc(&harness, "no-such-id").await {
-        ControlFrame::Error { .. } => {}
-        other => panic!("expected Error, got {other:?}"),
-    }
-
-    harness.shutdown().await;
-}
-
 // ── FindSessionById ────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -296,8 +262,7 @@ async fn find_session_by_id_exact_match() {
     let harness = TestHarness::start().await;
     harness.setup_local_repo("demo");
     harness.setup_workspace("demo", "feature-e");
-    let (session_id, _) =
-        harness.setup_terminal_session("demo", "feature-e", "exited");
+    let (session_id, _) = harness.setup_terminal_session("demo", "feature-e", "exited");
 
     match find_session_by_id_rpc(&harness, &session_id).await {
         ControlFrame::FoundSession { repo, session } => {
@@ -317,8 +282,7 @@ async fn find_session_by_id_prefix_match() {
     let harness = TestHarness::start().await;
     harness.setup_local_repo("demo");
     harness.setup_workspace("demo", "feature-f");
-    let (session_id, _) =
-        harness.setup_terminal_session("demo", "feature-f", "exited");
+    let (session_id, _) = harness.setup_terminal_session("demo", "feature-f", "exited");
 
     let prefix: String = session_id.chars().take(8).collect();
     match find_session_by_id_rpc(&harness, &prefix).await {
@@ -370,6 +334,90 @@ async fn find_session_by_id_unknown_errors() {
     harness.shutdown().await;
 }
 
+// ── CLI StopSession routing ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn cli_stop_does_not_fallback_to_session_pipe_or_db_status() {
+    let harness = TestHarness::start().await;
+    harness.setup_local_repo("demo");
+    harness.setup_workspace("demo", "feature-stop");
+
+    let paths = ShardPaths::from_data_dir(harness.data_path.clone());
+    let store = SessionStore::new(paths);
+    let fallback_pipe = format!(
+        r"\\.\pipe\shard-test-cli-stop-fallback-{}-{}",
+        std::process::id(),
+        next_seq()
+    );
+    let session = store
+        .create(
+            "demo",
+            "feature-stop",
+            &["pwsh".to_string()],
+            &fallback_pipe,
+            None,
+        )
+        .expect("create session");
+    store
+        .update_status("demo", &session.id, "running", None)
+        .expect("mark running");
+
+    let missing_live_pipe = format!(
+        r"\\.\pipe\shard-test-cli-stop-missing-live-{}-{}",
+        std::process::id(),
+        next_seq()
+    );
+    shard_cli::cmd::daemon::test_inject_live_session(
+        &harness.state,
+        session.id.clone(),
+        std::process::id(),
+        missing_live_pipe,
+        "demo".to_string(),
+        "feature-stop".to_string(),
+        1,
+    )
+    .await;
+
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let probe_pipe = fallback_pipe.clone();
+    let fallback_probe = tokio::spawn(async move {
+        let server = shard_transport::transport_windows::create_pipe_instance(&probe_pipe, true)
+            .expect("create fallback probe pipe");
+        let _ = ready_tx.send(());
+        tokio::time::timeout(Duration::from_millis(350), server.connect())
+            .await
+            .is_ok()
+    });
+    ready_rx.await.expect("fallback probe ready");
+
+    let err = shard_cli::cmd::session::test_stop_with_control_pipe(
+        &session.id,
+        false,
+        &harness.control_pipe_name,
+    )
+    .await
+    .expect_err("daemon StopSession failure should surface to CLI");
+    assert!(
+        err.to_string().contains("daemon failed to stop session")
+            || err.to_string().contains("daemon stop request failed"),
+        "unexpected error: {err}"
+    );
+
+    let session_after = store
+        .get("demo", &session.id)
+        .expect("session still exists");
+    assert_eq!(
+        session_after.status, "running",
+        "CLI stop must not write DB status when daemon stop fails"
+    );
+    assert!(
+        !fallback_probe.await.expect("fallback probe task"),
+        "CLI stop must not connect directly to the DB session pipe after daemon failure"
+    );
+
+    harness.shutdown().await;
+}
+
 // ── Cross-RPC flow: find → remove ──────────────────────────────────────────
 
 #[tokio::test]
@@ -381,8 +429,7 @@ async fn find_then_remove_by_prefix() {
     let harness = TestHarness::start().await;
     harness.setup_local_repo("demo");
     harness.setup_workspace("demo", "feature-g");
-    let (session_id, session_dir) =
-        harness.setup_terminal_session("demo", "feature-g", "exited");
+    let (session_id, session_dir) = harness.setup_terminal_session("demo", "feature-g", "exited");
 
     let prefix: String = session_id.chars().take(8).collect();
     let (repo, session) = match find_session_by_id_rpc(&harness, &prefix).await {
@@ -416,8 +463,7 @@ async fn remove_session_serializes_against_remove_repo() {
     let harness = TestHarness::start().await;
     harness.setup_local_repo("demo");
     harness.setup_workspace("demo", "feature-h");
-    let (session_id, _) =
-        harness.setup_terminal_session("demo", "feature-h", "exited");
+    let (session_id, _) = harness.setup_terminal_session("demo", "feature-h", "exited");
 
     // Give the control loop a moment to register the workspace via
     // the monitor's topology reload.
@@ -466,13 +512,4 @@ async fn remove_session_serializes_against_remove_repo() {
     }
 
     harness.shutdown().await;
-}
-
-// Helper to keep test pipe names unique across the file — same pattern
-// used in `remove_workspace.rs` for the fake supervisor pipe.
-#[allow(dead_code)]
-static SEQ: AtomicU32 = AtomicU32::new(0);
-#[allow(dead_code)]
-fn next_seq() -> u32 {
-    SEQ.fetch_add(1, Ordering::Relaxed)
 }

@@ -516,3 +516,81 @@ async fn partial_failure_marks_broken_then_retry_completes() {
 
     harness.shutdown().await;
 }
+
+// ── StopSession vs RemoveWorkspace race ─────────────────────────────────────
+
+/// Concurrent `StopSession` and `RemoveWorkspace` on the same repo must
+/// serialize through the per-repo mutation lock. The forbidden outcome is
+/// the workspace removal completing while a stale live-session entry still
+/// references the workspace, or the StopSession backstop resurrecting any
+/// state for a workspace that has already been removed.
+#[tokio::test]
+async fn stop_session_racing_remove_workspace_does_not_leak_state() {
+    let harness = TestHarness::start().await;
+    harness.setup_local_repo("demo");
+    let ws_path = harness.setup_workspace("demo", "feature-stop-race");
+
+    let session_id = "01993333-3333-7333-8333-333333333333".to_string();
+    let pipe_name = format!(
+        r"\\.\pipe\shard-test-stop-rmws-race-{}-{}",
+        std::process::id(),
+        next_seq()
+    );
+    let _supervisor = spawn_fake_supervisor(pipe_name.clone()).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    shard_cli::cmd::daemon::test_inject_live_session(
+        &harness.state,
+        session_id.clone(),
+        std::process::id(),
+        pipe_name,
+        "demo".to_string(),
+        "feature-stop-race".to_string(),
+        1,
+    )
+    .await;
+    assert_eq!(
+        shard_cli::cmd::daemon::test_live_session_count(&harness.state).await,
+        1
+    );
+
+    let stop = async {
+        let mut conn = harness.connect().await;
+        conn.request(&ControlFrame::StopSession {
+            session_id: session_id.clone(),
+            force: false,
+        })
+        .await
+        .expect("StopSession RPC")
+    };
+    let remove = async { remove_workspace(&harness, "demo", "feature-stop-race").await };
+    let (stop_r, remove_r) = tokio::join!(stop, remove);
+
+    // RemoveWorkspace cascades through any bound live session, so it always
+    // succeeds. StopSession either lands first (StopAck) or finds the
+    // session already cleared by RemoveWorkspace (Error). Both are legal.
+    assert!(
+        matches!(stop_r, ControlFrame::StopAck | ControlFrame::Error { .. }),
+        "StopSession outcome: {stop_r:?}"
+    );
+    assert!(
+        matches!(remove_r, ControlFrame::RemoveWorkspaceAck),
+        "RemoveWorkspace outcome: {remove_r:?}"
+    );
+
+    // Workspace must be fully gone — no resurrection of the directory or DB row.
+    assert!(!ws_path.exists(), "workspace dir must not be resurrected");
+    assert!(
+        !db_has_workspace(&harness.data_path, "demo", "feature-stop-race"),
+        "workspace DB row must not be resurrected"
+    );
+    // Live registry must be empty — the StopSession backstop must not
+    // re-insert an entry for a workspace that no longer exists.
+    assert_eq!(
+        shard_cli::cmd::daemon::test_live_session_count(&harness.state).await,
+        0,
+        "live registry must be empty after race"
+    );
+
+    harness.shutdown().await;
+}

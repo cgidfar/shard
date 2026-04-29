@@ -35,17 +35,12 @@ fn prune_sessions() -> shard_core::Result<()> {
             // Check if the supervisor is actually still running
             let alive = session
                 .supervisor_pid
-                .map(|pid| PlatformProcessControl::is_alive(pid))
+                .map(PlatformProcessControl::is_alive)
                 .unwrap_or(false);
 
             if !alive {
                 // Supervisor is dead — mark session as failed
-                session_store.update_status(
-                    &repo.alias,
-                    &session.id,
-                    "failed",
-                    None,
-                )?;
+                session_store.update_status(&repo.alias, &session.id, "failed", None)?;
                 println!(
                     "  Pruned {} [{}:{}] — supervisor (pid {:?}) no longer running",
                     &session.id[..8],

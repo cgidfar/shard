@@ -1,4 +1,5 @@
 pub mod daemon;
+pub(crate) mod daemon_rpc;
 pub mod lifecycle;
 pub mod notify;
 pub mod prune;

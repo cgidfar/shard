@@ -1,3 +1,5 @@
+use std::collections::hash_map::Entry;
+
 use tauri::ipc::{Channel, Response};
 use tauri::{Emitter, Manager};
 
@@ -11,7 +13,7 @@ use shard_transport::transport_windows::NamedPipeTransport;
 use shard_transport::SessionTransport;
 
 use crate::daemon_ipc;
-use crate::state::{AppState, SessionConnection, SessionWriter};
+use crate::state::{AppState, ConnectionToken, SessionConnection, SessionWriter};
 
 #[derive(Clone, serde::Serialize)]
 pub struct SessionInfo {
@@ -23,6 +25,13 @@ pub struct SessionInfo {
 struct SessionActivityEvent {
     id: String,
     state: &'static str, // "active" | "idle" | "blocked"
+}
+
+#[derive(Clone, serde::Serialize)]
+struct TerminalEndedEvent {
+    id: String,
+    status: &'static str,
+    code: u8,
 }
 
 /// Handle ActivityUpdate and Status frames — shared by monitors and attach readers.
@@ -67,12 +76,19 @@ fn handle_supervisor_frame(app: &tauri::AppHandle, session_id: &str, frame: &Fra
 /// Start a lightweight monitor connection for a running session.
 /// The monitor discards terminal output but relays ActivityUpdate and Status
 /// frames as Tauri events. Returns the spawned task handle.
-pub fn start_monitor(app: tauri::AppHandle, session_id: String, transport_addr: String) -> tauri::async_runtime::JoinHandle<()> {
+pub fn start_monitor(
+    app: tauri::AppHandle,
+    session_id: String,
+    transport_addr: String,
+) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
         let client = match NamedPipeTransport::connect(&transport_addr).await {
             Ok(c) => c,
             Err(e) => {
-                tracing::debug!("monitor connect failed for {}: {e}", &session_id[..8.min(session_id.len())]);
+                tracing::debug!(
+                    "monitor connect failed for {}: {e}",
+                    &session_id[..8.min(session_id.len())]
+                );
                 return;
             }
         };
@@ -101,7 +117,10 @@ pub fn start_monitor(app: tauri::AppHandle, session_id: String, transport_addr: 
                 Err(_) => break,
             }
         }
-        tracing::debug!("monitor ended for session {}", &session_id[..8.min(session_id.len())]);
+        tracing::debug!(
+            "monitor ended for session {}",
+            &session_id[..8.min(session_id.len())]
+        );
     })
 }
 
@@ -180,7 +199,8 @@ pub fn create_session(
     let (session_id, transport_addr) = rt.block_on(async {
         use shard_transport::control_protocol::ControlFrame;
 
-        let mut conn = connect_or_spawn_daemon_app()
+        let daemon_start_timeout = std::time::Duration::from_secs(5);
+        let mut conn = daemon_ipc::connect_or_spawn(daemon_start_timeout)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -190,7 +210,35 @@ pub fn create_session(
 
         // Hooks install round-trip — non-fatal. A hooks failure must
         // not block session spawn (today's behavior preserved).
-        match crate::daemon_ipc::install_harness_hooks("claude-code").await {
+        let hooks_result: Result<(bool, Option<String>), String> = async {
+            let mut hook_conn = daemon_ipc::connect_or_spawn(daemon_start_timeout)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            hook_conn
+                .handshake()
+                .await
+                .map_err(|e| format!("daemon handshake failed: {e}"))?;
+
+            hook_conn
+                .request_typed(
+                    &ControlFrame::InstallHarnessHooks {
+                        harness: "claude-code".to_string(),
+                    },
+                    |f| match f {
+                        ControlFrame::InstallHarnessHooksAck {
+                            installed,
+                            skipped_reason,
+                        } => Some((installed, skipped_reason)),
+                        _ => None,
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())
+        }
+        .await;
+
+        match hooks_result {
             Ok((installed, skipped_reason)) => {
                 tracing::info!(
                     installed,
@@ -243,40 +291,6 @@ pub fn create_session(
 
     let _ = app.emit("sidebar-changed", ());
     Ok(result)
-}
-
-/// Connect to daemon, spawning it if not running. For use from app context.
-async fn connect_or_spawn_daemon_app() -> Result<
-    shard_transport::daemon_client::DaemonConnection<tokio::net::windows::named_pipe::NamedPipeClient>,
-    std::io::Error,
-> {
-    use shard_transport::daemon_client;
-
-    // Try connecting first
-    match daemon_client::connect().await {
-        Ok(conn) => return Ok(conn),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-
-    // Spawn daemon — find shardctl.exe relative to app exe
-    let exe_dir = std::env::current_exe()?
-        .parent()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no exe dir"))?
-        .to_path_buf();
-    let shardctl = exe_dir.join("shardctl.exe");
-    if !shardctl.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("shardctl.exe not found at {}", shardctl.display()),
-        ));
-    }
-
-    use shard_supervisor::process::{PlatformProcessControl, ProcessControl};
-    let args = vec!["daemon".to_string(), "start".to_string()];
-    PlatformProcessControl::spawn_detached(&shardctl, &args)?;
-
-    daemon_client::connect_with_retry(std::time::Duration::from_secs(5)).await
 }
 
 #[tauri::command]
@@ -344,22 +358,37 @@ pub async fn attach_session(
         }
     }
 
-    let client = NamedPipeTransport::connect(&session.transport_addr)
-        .await
-        .map_err(|e| e.to_string())?;
+    let client = match NamedPipeTransport::connect(&session.transport_addr).await {
+        Ok(client) => client,
+        Err(e) => {
+            restore_monitor_if_absent(&app, &state, id.clone(), session.transport_addr.clone())
+                .await;
+            return Err(e.to_string());
+        }
+    };
 
     let (mut reader, writer) = tokio::io::split(client);
+    let token = ConnectionToken::new();
 
     // Send Resume frame
     let mut writer = writer;
-    protocol::write_frame(&mut writer, &Frame::Resume { last_seen_offset: 0 })
-        .await
-        .map_err(|e| e.to_string())?;
+    if let Err(e) = protocol::write_frame(
+        &mut writer,
+        &Frame::Resume {
+            last_seen_offset: 0,
+        },
+    )
+    .await
+    {
+        restore_monitor_if_absent(&app, &state, id.clone(), session.transport_addr.clone()).await;
+        return Err(e.to_string());
+    }
 
     // Spawn reader task that forwards terminal output AND relays activity/status events
     let session_id = id.clone();
     let app_clone = app.clone();
     let task = tauri::async_runtime::spawn(async move {
+        let mut terminal_status: Option<(&'static str, u8)> = None;
         loop {
             match protocol::read_frame(&mut reader).await {
                 Ok(Some(Frame::TerminalOutput { data, .. })) => {
@@ -371,29 +400,60 @@ pub async fn attach_session(
                     handle_supervisor_frame(&app_clone, &session_id, frame);
                 }
                 Ok(Some(ref frame @ Frame::Status { .. })) => {
+                    if let Frame::Status { code } = frame {
+                        let status = match code {
+                            0 => "exited",
+                            1 => "stopped",
+                            _ => "failed",
+                        };
+                        terminal_status = Some((status, *code));
+                    }
                     handle_supervisor_frame(&app_clone, &session_id, frame);
                     // Drain any trailing TerminalOutput (defensive)
-                    let deadline = tokio::time::Instant::now()
-                        + std::time::Duration::from_millis(500);
-                    loop {
-                        match tokio::time::timeout_at(
-                            deadline,
-                            protocol::read_frame(&mut reader),
-                        )
-                        .await
-                        {
-                            Ok(Ok(Some(Frame::TerminalOutput { data, .. }))) => {
-                                let _ = channel.send(Response::new(data));
-                            }
-                            _ => break,
-                        }
+                    let deadline =
+                        tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+                    while let Ok(Ok(Some(Frame::TerminalOutput { data, .. }))) =
+                        tokio::time::timeout_at(deadline, protocol::read_frame(&mut reader)).await
+                    {
+                        let _ = channel.send(Response::new(data));
                     }
                     break;
                 }
-                Ok(None) => break,
+                Ok(None) => {
+                    if terminal_status.is_none() {
+                        terminal_status = Some(("failed", 255));
+                    }
+                    break;
+                }
                 Ok(Some(_)) => {}
-                Err(_) => break,
+                Err(_) => {
+                    if terminal_status.is_none() {
+                        terminal_status = Some(("failed", 255));
+                    }
+                    break;
+                }
             }
+        }
+        if let Some((status, code)) = terminal_status {
+            let _ = app_clone.emit(
+                "terminal-ended",
+                TerminalEndedEvent {
+                    id: session_id.clone(),
+                    status,
+                    code,
+                },
+            );
+        }
+        let state = app_clone.state::<AppState>();
+        let mut conns = state.connections.lock().await;
+        let should_remove = matches!(
+            conns.get(&session_id),
+            Some(SessionConnection::Attached {
+                token: current, ..
+            }) if *current == token
+        );
+        if should_remove {
+            conns.remove(&session_id);
         }
         tracing::debug!("attach reader ended for session {session_id}");
     });
@@ -401,16 +461,38 @@ pub async fn attach_session(
     // Store writer + reader task as Attached connection
     {
         let mut conns = state.connections.lock().await;
-        conns.insert(
-            id.clone(),
-            SessionConnection::Attached {
-                writer: SessionWriter { writer },
-                task,
-            },
-        );
+        match conns.entry(id) {
+            Entry::Vacant(entry) => {
+                entry.insert(SessionConnection::Attached {
+                    token,
+                    writer: SessionWriter { writer },
+                    task,
+                });
+            }
+            Entry::Occupied(_) => {
+                task.abort();
+                return Err("session connection changed while attaching".into());
+            }
+        }
     }
 
     Ok(())
+}
+
+async fn restore_monitor_if_absent(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, AppState>,
+    id: String,
+    transport_addr: String,
+) {
+    let task = start_monitor(app.clone(), id.clone(), transport_addr);
+    let mut conns = state.connections.lock().await;
+    match conns.entry(id) {
+        Entry::Vacant(entry) => {
+            entry.insert(SessionConnection::Monitored { task });
+        }
+        Entry::Occupied(_) => task.abort(),
+    }
 }
 
 #[tauri::command]
@@ -490,7 +572,12 @@ pub async fn detach_session(
         if session.status == "running" {
             let task = start_monitor(app, id.clone(), session.transport_addr);
             let mut conns = state.connections.lock().await;
-            conns.insert(id, SessionConnection::Monitored { task });
+            match conns.entry(id) {
+                Entry::Vacant(entry) => {
+                    entry.insert(SessionConnection::Monitored { task });
+                }
+                Entry::Occupied(_) => task.abort(),
+            }
         }
     }
 

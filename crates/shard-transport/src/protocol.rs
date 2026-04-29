@@ -1,5 +1,8 @@
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+/// Maximum accepted session frame size, including the type byte.
+pub const MAX_SESSION_FRAME_LEN: usize = 16 * 1024 * 1024;
+
 /// Activity state pushed by harness hooks to the supervisor, then fanned out
 /// to all connected clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,7 +75,10 @@ const TYPE_ACTIVITY_UPDATE: u8 = 0x07;
 ///
 /// Wire format: [u32 length][u8 type][payload]
 /// Length includes the type byte + payload.
-pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &Frame) -> std::io::Result<()> {
+pub async fn write_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame: &Frame,
+) -> std::io::Result<()> {
     let mut payload = Vec::new();
 
     let type_byte = match frame {
@@ -106,7 +112,18 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &Frame) -
         }
     };
 
-    let length = 1 + payload.len() as u32; // type byte + payload
+    let length = u32::try_from(1 + payload.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame payload too large: {} bytes", payload.len()),
+        )
+    })?;
+    if (length as usize) > MAX_SESSION_FRAME_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame exceeds MAX_SESSION_FRAME_LEN: {length}"),
+        ));
+    }
     writer.write_all(&length.to_be_bytes()).await?;
     writer.write_all(&[type_byte]).await?;
     writer.write_all(&payload).await?;
@@ -118,14 +135,9 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &Frame) -
 ///
 /// Returns None on clean EOF (reader closed).
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<Option<Frame>> {
-    // Read length prefix
-    let mut len_buf = [0u8; 4];
-    match reader.read_exact(&mut len_buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-    let length = u32::from_be_bytes(len_buf) as usize;
+    let Some(length) = read_frame_len(reader, MAX_SESSION_FRAME_LEN, "session").await? else {
+        return Ok(None);
+    };
 
     if length == 0 {
         return Err(std::io::Error::new(
@@ -154,10 +166,10 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result
             Frame::TerminalOutput { offset, data }
         }
         TYPE_RESIZE => {
-            if payload.len() < 4 {
+            if payload.len() != 4 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "resize frame too short",
+                    "resize frame must be exactly 4 bytes",
                 ));
             }
             let rows = u16::from_be_bytes(payload[..2].try_into().unwrap());
@@ -167,32 +179,60 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result
         TYPE_TERMINAL_INPUT => Frame::TerminalInput {
             data: payload.to_vec(),
         },
-        TYPE_STOP_GRACEFUL => Frame::StopGraceful,
-        TYPE_STOP_FORCE => Frame::StopForce,
-        TYPE_STATUS => {
-            if payload.is_empty() {
+        TYPE_STOP_GRACEFUL => {
+            if !payload.is_empty() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "status frame missing code",
+                    "stop graceful frame has trailing bytes",
                 ));
             }
-            Frame::Status { code: payload[0] }
+            Frame::StopGraceful
         }
-        TYPE_RESUME => {
-            if payload.len() < 8 {
+        TYPE_STOP_FORCE => {
+            if !payload.is_empty() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "resume frame too short",
+                    "stop force frame has trailing bytes",
+                ));
+            }
+            Frame::StopForce
+        }
+        TYPE_STATUS => {
+            let code = match payload.len() {
+                1 => payload[0],
+                4 => {
+                    let legacy = u32::from_be_bytes(payload.try_into().unwrap());
+                    u8::try_from(legacy).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("legacy status code {legacy} exceeds u8"),
+                        )
+                    })?
+                }
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "status frame must be 1 byte or legacy 4-byte code",
+                    ));
+                }
+            };
+            Frame::Status { code }
+        }
+        TYPE_RESUME => {
+            if payload.len() != 8 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "resume frame must be exactly 8 bytes",
                 ));
             }
             let last_seen_offset = u64::from_be_bytes(payload[..8].try_into().unwrap());
             Frame::Resume { last_seen_offset }
         }
         TYPE_ACTIVITY_UPDATE => {
-            if payload.is_empty() {
+            if payload.len() != 1 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "activity update frame missing state",
+                    "activity update frame must be exactly 1 byte",
                 ));
             }
             let state = ActivityState::try_from(payload[0]).map_err(|b| {
@@ -212,6 +252,43 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result
     };
 
     Ok(Some(frame))
+}
+
+async fn read_frame_len<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max_len: usize,
+    label: &str,
+) -> std::io::Result<Option<usize>> {
+    let mut len_buf = [0u8; 4];
+    let mut read = 0;
+    while read < len_buf.len() {
+        let n = reader.read(&mut len_buf[read..]).await?;
+        if n == 0 {
+            if read == 0 {
+                return Ok(None);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{label} frame length prefix ended after {read} bytes"),
+            ));
+        }
+        read += n;
+    }
+
+    let length = usize::try_from(u32::from_be_bytes(len_buf)).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{label} frame length does not fit usize"),
+        )
+    })?;
+    if length > max_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{label} frame length {length} exceeds max {max_len}"),
+        ));
+    }
+
+    Ok(Some(length))
 }
 
 #[cfg(test)]
@@ -300,5 +377,73 @@ mod tests {
     async fn read_eof_returns_none() {
         let mut cursor = std::io::Cursor::new(Vec::new());
         assert!(read_frame(&mut cursor).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_frame_before_allocation() {
+        let mut cursor =
+            std::io::Cursor::new(((MAX_SESSION_FRAME_LEN as u32) + 1).to_be_bytes().to_vec());
+        let err = read_frame(&mut cursor).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn partial_length_prefix_is_invalid_data() {
+        let mut cursor = std::io::Cursor::new(vec![0, 0]);
+        let err = read_frame(&mut cursor).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_type() {
+        let mut cursor = std::io::Cursor::new(vec![0, 0, 0, 1, 0xff]);
+        let err = read_frame(&mut cursor).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn rejects_fixed_frame_trailing_bytes() {
+        let mut cursor = std::io::Cursor::new(vec![0, 0, 0, 2, TYPE_STOP_GRACEFUL, 0]);
+        let err = read_frame(&mut cursor).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn accepts_legacy_four_byte_status_payload() {
+        let mut cursor = std::io::Cursor::new(vec![0, 0, 0, 5, TYPE_STATUS, 0, 0, 0, 0]);
+        assert_eq!(
+            read_frame(&mut cursor).await.unwrap(),
+            Some(Frame::Status { code: 0 })
+        );
+    }
+
+    #[tokio::test]
+    async fn parses_legacy_four_byte_status_payload_as_u32() {
+        let mut cursor = std::io::Cursor::new(vec![0, 0, 0, 5, TYPE_STATUS, 0, 0, 0, 1]);
+        assert_eq!(
+            read_frame(&mut cursor).await.unwrap(),
+            Some(Frame::Status { code: 1 })
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_legacy_status_payload_outside_u8_range() {
+        let mut cursor = std::io::Cursor::new(vec![0, 0, 0, 5, TYPE_STATUS, 0, 0, 1, 0]);
+        let err = read_frame(&mut cursor).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn rejects_status_payload_with_unrecognized_trailing_bytes() {
+        let mut cursor = std::io::Cursor::new(vec![0, 0, 0, 3, TYPE_STATUS, 0, 0]);
+        let err = read_frame(&mut cursor).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_activity_state() {
+        let mut cursor = std::io::Cursor::new(vec![0, 0, 0, 2, TYPE_ACTIVITY_UPDATE, 0xff]);
+        let err = read_frame(&mut cursor).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

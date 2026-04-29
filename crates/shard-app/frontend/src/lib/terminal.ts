@@ -2,6 +2,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Channel } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { attachSession, writeToSession, resizeSession, detachSession } from "./api";
 import { formatOscTitle } from "./titleFormat";
 
@@ -135,30 +136,62 @@ export function createTerminalSession(
     terminal.write(new Uint8Array(data));
   };
 
-  // Attach to session (sends Resume, starts receiving output)
-  attachSession(sessionId, channel).catch((err) => {
-    terminal.write(`\r\n\x1b[31mFailed to attach: ${err}\x1b[0m\r\n`);
+  let disconnected = false;
+  let disposed = false;
+  let attached = false;
+  const encoder = new TextEncoder();
+
+  // Attach to session (sends Resume, starts receiving output). Input and
+  // resize calls wait on this so they cannot race the backend connection
+  // registration.
+  const attachReady = attachSession(sessionId, channel)
+    .then(() => {
+      if (!disposed) attached = true;
+    })
+    .catch((err) => {
+      disconnected = true;
+      terminal.write(`\r\n\x1b[31mFailed to attach: ${err}\x1b[0m\r\n`);
+    });
+
+  async function waitForAttach(): Promise<boolean> {
+    if (attached && !disconnected && !disposed) return true;
+    await attachReady;
+    return attached && !disconnected && !disposed;
+  }
+
+  function markDisconnected() {
+    if (disconnected) return;
+    disconnected = true;
+    // Restore main screen, show cursor, reset SGR (NOT full RIS — preserves scrollback)
+    terminal.write("\x1b[?1049l\x1b[?25h\x1b[0m");
+    terminal.write("\r\n\x1b[31mSession ended.\x1b[0m\r\n");
+  }
+
+  let unlistenEnded: (() => void) | null = null;
+  listen<{ id: string }>("terminal-ended", ({ payload }) => {
+    if (payload.id === sessionId) markDisconnected();
+  }).then((unlisten) => {
+    if (disposed) unlisten();
+    else unlistenEnded = unlisten;
   });
 
   // Forward user input to backend
-  let disconnected = false;
   terminal.onData((data: string) => {
-    if (disconnected) return;
-    const encoder = new TextEncoder();
-    writeToSession(sessionId, encoder.encode(data)).catch(() => {
-      if (!disconnected) {
-        disconnected = true;
-        // Restore main screen, show cursor, reset SGR (NOT full RIS — preserves scrollback)
-        terminal.write("\x1b[?1049l\x1b[?25h\x1b[0m");
-        terminal.write("\r\n\x1b[31mSession ended.\x1b[0m\r\n");
-      }
-    });
+    if (disconnected || disposed) return;
+    void (async () => {
+      if (!(await waitForAttach())) return;
+      writeToSession(sessionId, encoder.encode(data)).catch(markDisconnected);
+    })();
   });
 
   // Handle resize
   let lastRows = 0;
   let lastCols = 0;
   let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+  async function sendResize(rows: number, cols: number) {
+    if (!(await waitForAttach())) return;
+    resizeSession(sessionId, rows, cols).catch(() => {});
+  }
 
   const resizeObserver = new ResizeObserver(() => {
     // Debounce BOTH fit() and resizeSession() together. Calling fit()
@@ -173,7 +206,7 @@ export function createTerminalSession(
       if (dims && (dims.rows !== lastRows || dims.cols !== lastCols)) {
         lastRows = dims.rows;
         lastCols = dims.cols;
-        resizeSession(sessionId, dims.rows, dims.cols).catch(() => {});
+        void sendResize(dims.rows, dims.cols);
       }
     }, 150);
   });
@@ -184,12 +217,15 @@ export function createTerminalSession(
   if (initialDims) {
     lastRows = initialDims.rows;
     lastCols = initialDims.cols;
-    resizeSession(sessionId, initialDims.rows, initialDims.cols).catch(() => {});
+    void sendResize(initialDims.rows, initialDims.cols);
   }
 
   function dispose() {
+    disposed = true;
+    disconnected = true;
     if (resizeTimer) clearTimeout(resizeTimer);
     resizeObserver.disconnect();
+    if (unlistenEnded) unlistenEnded();
     detachSession(sessionId).catch(() => {});
     terminal.dispose();
   }

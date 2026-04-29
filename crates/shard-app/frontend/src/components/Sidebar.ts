@@ -313,7 +313,10 @@ export class Sidebar {
   }
 
   async refresh() {
-    if (this.refreshing) return;
+    if (this.refreshing) {
+      this.pendingRefresh = true;
+      return;
+    }
     // Queue refresh if rename is active — flush after commit/cancel
     if (this.renamingSessionId !== null) {
       this.pendingRefresh = true;
@@ -342,6 +345,10 @@ export class Sidebar {
       this.render();
     } finally {
       this.refreshing = false;
+      if (this.pendingRefresh && this.renamingSessionId === null) {
+        this.pendingRefresh = false;
+        void this.refresh();
+      }
     }
   }
 

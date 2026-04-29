@@ -18,32 +18,7 @@ fn ensure_daemon_running() {
     };
 
     rt.block_on(async {
-        use shard_transport::daemon_client;
-
-        // Check if already running
-        if daemon_client::connect().await.is_ok() {
-            return;
-        }
-
-        // Spawn daemon
-        let exe_dir = match std::env::current_exe() {
-            Ok(p) => match p.parent() {
-                Some(d) => d.to_path_buf(),
-                None => return,
-            },
-            Err(_) => return,
-        };
-        let shardctl = exe_dir.join("shardctl.exe");
-        if !shardctl.exists() {
-            return;
-        }
-
-        use shard_supervisor::process::{PlatformProcessControl, ProcessControl};
-        let args = vec!["daemon".to_string(), "start".to_string()];
-        let _ = PlatformProcessControl::spawn_detached(&shardctl, &args);
-
-        // Wait briefly for daemon to be ready (best-effort)
-        let _ = daemon_client::connect_with_retry(std::time::Duration::from_secs(3)).await;
+        let _ = daemon_ipc::connect_or_spawn(std::time::Duration::from_secs(3)).await;
     });
 }
 
@@ -100,7 +75,7 @@ pub fn run() {
     let paths = shard_core::ShardPaths::new().ok();
     if let Some(ref p) = paths {
         let log_dir = p.data_dir();
-        let _ = std::fs::create_dir_all(&log_dir);
+        let _ = std::fs::create_dir_all(log_dir);
         if let Ok(log_file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -124,7 +99,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
         .setup(|app| {
-            start_monitors_for_running_sessions(&app.handle());
+            start_monitors_for_running_sessions(app.handle());
 
             // Long-lived daemon state subscription. Runs for the lifetime
             // of the app, reconnects with backoff on daemon drop, keeps

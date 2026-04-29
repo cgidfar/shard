@@ -5,6 +5,7 @@ use serde::Serialize;
 
 use crate::db;
 use crate::harness::Harness;
+use crate::identifiers::{validate_repo_alias, validate_session_id, validate_workspace_name};
 use crate::paths::ShardPaths;
 use crate::{Result, ShardError};
 
@@ -44,6 +45,8 @@ impl SessionStore {
         transport_addr: &str,
         harness: Option<Harness>,
     ) -> Result<Session> {
+        validate_repo_alias(repo_alias)?;
+        validate_workspace_name(workspace_name)?;
         let repo_db_path = self.paths.repo_db(repo_alias);
         let conn = db::open_connection(&repo_db_path)?;
 
@@ -92,6 +95,7 @@ impl SessionStore {
         status: &str,
         exit_code: Option<i32>,
     ) -> Result<()> {
+        validate_repo_alias(repo_alias)?;
         let repo_db_path = self.paths.repo_db(repo_alias);
         let conn = db::open_connection(&repo_db_path)?;
 
@@ -120,6 +124,7 @@ impl SessionStore {
         session_id: &str,
         addr: &str,
     ) -> Result<()> {
+        validate_repo_alias(repo_alias)?;
         let repo_db_path = self.paths.repo_db(repo_alias);
         let conn = db::open_connection(&repo_db_path)?;
         conn.execute(
@@ -136,6 +141,7 @@ impl SessionStore {
         session_id: &str,
         pid: u32,
     ) -> Result<()> {
+        validate_repo_alias(repo_alias)?;
         let repo_db_path = self.paths.repo_db(repo_alias);
         let conn = db::open_connection(&repo_db_path)?;
         conn.execute(
@@ -152,6 +158,7 @@ impl SessionStore {
         session_id: &str,
         pid: u32,
     ) -> Result<()> {
+        validate_repo_alias(repo_alias)?;
         let repo_db_path = self.paths.repo_db(repo_alias);
         let conn = db::open_connection(&repo_db_path)?;
         conn.execute(
@@ -167,6 +174,10 @@ impl SessionStore {
         repo_alias: &str,
         workspace_name: Option<&str>,
     ) -> Result<Vec<Session>> {
+        validate_repo_alias(repo_alias)?;
+        if let Some(ws) = workspace_name {
+            validate_workspace_name(ws)?;
+        }
         let repo_db_path = self.paths.repo_db(repo_alias);
         let conn = db::open_connection(&repo_db_path)?;
 
@@ -199,6 +210,7 @@ impl SessionStore {
 
     /// Get a session by ID.
     pub fn get(&self, repo_alias: &str, session_id: &str) -> Result<Session> {
+        validate_repo_alias(repo_alias)?;
         let repo_db_path = self.paths.repo_db(repo_alias);
         let conn = db::open_connection(&repo_db_path)?;
         conn.query_row(
@@ -228,6 +240,7 @@ impl SessionStore {
         let mut matches: Vec<(String, Session)> = Vec::new();
 
         for alias in aliases {
+            validate_repo_alias(&alias)?;
             let repo_db_path = self.paths.repo_db(&alias);
             if !repo_db_path.exists() {
                 continue;
@@ -271,6 +284,8 @@ impl SessionStore {
     /// removal. Keeping the DB row preserves the retry handle — the next
     /// `RemoveSession` call sees the same row and can try again.
     pub fn remove(&self, repo_alias: &str, session_id: &str) -> Result<()> {
+        validate_repo_alias(repo_alias)?;
+        validate_session_id(session_id)?;
         let session = self.get(repo_alias, session_id)?;
         if session.status == "running" || session.status == "starting" {
             return Err(ShardError::Other(format!(
@@ -308,6 +323,7 @@ impl SessionStore {
         session_id: &str,
         label: Option<&str>,
     ) -> Result<()> {
+        validate_repo_alias(repo_alias)?;
         let repo_db_path = self.paths.repo_db(repo_alias);
         let conn = db::open_connection(&repo_db_path)?;
         let rows = conn.execute(

@@ -1,6 +1,5 @@
 use shard_core::repos::Repository;
 use shard_transport::control_protocol::ControlFrame;
-use shard_transport::daemon_client;
 
 use crate::opts::RepoCommands;
 
@@ -48,68 +47,46 @@ pub fn run(command: RepoCommands) -> shard_core::Result<()> {
     Ok(())
 }
 
-/// Route one request through the daemon. Same shape as
-/// `cmd/workspace.rs::run_daemon_rpc`. Daemon startup is on the caller;
-/// CLI repo subcommands assume a daemon is already running.
-fn run_daemon_rpc<T>(
-    frame: ControlFrame,
-    extract: impl FnOnce(ControlFrame) -> Result<T, ControlFrame>,
-) -> shard_core::Result<T> {
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| shard_core::ShardError::Other(format!("runtime: {e}")))?;
-    rt.block_on(async move {
-        let mut conn = daemon_client::connect()
-            .await
-            .map_err(|e| shard_core::ShardError::Other(format!("daemon connect: {e}")))?;
-        conn.handshake()
-            .await
-            .map_err(|e| shard_core::ShardError::Other(format!("daemon handshake: {e}")))?;
-        conn.request_typed(&frame, extract)
-            .await
-            .map_err(|e| shard_core::ShardError::Other(e.to_string()))
-    })
-}
-
 fn add_via_daemon(url: &str, alias: Option<String>) -> shard_core::Result<Repository> {
-    run_daemon_rpc(
+    crate::cmd::daemon_rpc::run(
         ControlFrame::AddRepo {
             url: url.to_string(),
             alias,
         },
         |f| match f {
-            ControlFrame::AddRepoAck { repo } => Ok(repo),
-            other => Err(other),
+            ControlFrame::AddRepoAck { repo } => Some(repo),
+            _ => None,
         },
     )
 }
 
 fn remove_via_daemon(alias: &str) -> shard_core::Result<()> {
-    run_daemon_rpc(
+    crate::cmd::daemon_rpc::run(
         ControlFrame::RemoveRepo {
             alias: alias.to_string(),
         },
         |f| match f {
-            ControlFrame::RemoveRepoAck => Ok(()),
-            other => Err(other),
+            ControlFrame::RemoveRepoAck => Some(()),
+            _ => None,
         },
     )
 }
 
 fn sync_via_daemon(alias: &str) -> shard_core::Result<()> {
-    run_daemon_rpc(
+    crate::cmd::daemon_rpc::run(
         ControlFrame::SyncRepo {
             alias: alias.to_string(),
         },
         |f| match f {
-            ControlFrame::SyncRepoAck => Ok(()),
-            other => Err(other),
+            ControlFrame::SyncRepoAck => Some(()),
+            _ => None,
         },
     )
 }
 
 fn list_via_daemon() -> shard_core::Result<Vec<Repository>> {
-    run_daemon_rpc(ControlFrame::ListRepos, |f| match f {
-        ControlFrame::RepoList { repos } => Ok(repos),
-        other => Err(other),
+    crate::cmd::daemon_rpc::run(ControlFrame::ListRepos, |f| match f {
+        ControlFrame::RepoList { repos } => Some(repos),
+        _ => None,
     })
 }

@@ -16,9 +16,6 @@
 //!     delete. Dropping a `DeleteGuard` without committing rolls back to
 //!     `Active` (or `Broken`, if the initial state was `Broken`).
 //!
-//! Phase 0 lands this infrastructure only. Phase 1 wires it into the
-//! `RemoveWorkspace` handler.
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -26,7 +23,6 @@ use tokio::sync::Notify;
 
 /// Per-workspace lifecycle state.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // variants read by Phase 1
 pub enum WorkspaceLifecycle {
     /// Normal state. Mutations are accepted.
     Active,
@@ -40,7 +36,6 @@ pub enum WorkspaceLifecycle {
 
 /// Outcome of a `begin_delete` call.
 #[derive(Debug)]
-#[allow(dead_code)] // consumed by Phase 1
 pub enum BeginDelete {
     /// Caller owns the delete and must eventually commit via the guard.
     Started(DeleteGuard),
@@ -54,11 +49,12 @@ pub enum BeginDelete {
 
 /// Error returned by the pre-mutation guard check.
 #[derive(Debug, thiserror::Error)]
-#[allow(dead_code)]
 pub enum LifecycleError {
     #[error("workspace '{repo}:{name}' is being deleted")]
     Deleting { repo: String, name: String },
-    #[error("workspace '{repo}:{name}' is in broken state — call RemoveWorkspace to retry cleanup")]
+    #[error(
+        "workspace '{repo}:{name}' is in broken state — call RemoveWorkspace to retry cleanup"
+    )]
     Broken { repo: String, name: String },
 }
 
@@ -84,7 +80,6 @@ impl LifecycleRegistry {
     /// Populate the registry with a workspace in `Active` state. Idempotent.
     /// Called on startup for every known workspace, and after successful
     /// `CreateWorkspace` to register the new entry.
-    #[allow(dead_code)] // consumed by Phase 1+
     pub fn register_active(&self, repo: &str, name: &str) {
         let mut map = self.states.lock().expect("lifecycle mutex poisoned");
         map.entry((repo.to_string(), name.to_string()))
@@ -99,14 +94,10 @@ impl LifecycleRegistry {
     ///
     /// Returns the list of `(repo, name)` entries that were cleared,
     /// for logging / telemetry.
-    #[allow(dead_code)] // consumed by Phase 3
     pub fn clear_repo(&self, repo: &str) -> Vec<(String, String)> {
         let mut map = self.states.lock().expect("lifecycle mutex poisoned");
-        let keys_to_remove: Vec<(String, String)> = map
-            .keys()
-            .filter(|(r, _)| r == repo)
-            .cloned()
-            .collect();
+        let keys_to_remove: Vec<(String, String)> =
+            map.keys().filter(|(r, _)| r == repo).cloned().collect();
         let mut removed = Vec::with_capacity(keys_to_remove.len());
         for key in keys_to_remove {
             if let Some(state) = map.remove(&key) {
@@ -122,7 +113,6 @@ impl LifecycleRegistry {
     /// Pre-mutation guard: fail fast if the target is currently unreachable
     /// (being deleted or in broken state). Called from `SpawnSession` and
     /// `CreateWorkspace` before any work begins.
-    #[allow(dead_code)]
     pub fn check_can_mutate(&self, repo: &str, name: &str) -> Result<(), LifecycleError> {
         let map = self.states.lock().expect("lifecycle mutex poisoned");
         match map.get(&(repo.to_string(), name.to_string())) {
@@ -149,7 +139,6 @@ impl LifecycleRegistry {
     /// unseen workspace is legal (the DB is the source of truth for
     /// whether the row exists); the gate is about serializing
     /// concurrent mutations, not about proving existence.
-    #[allow(dead_code)]
     pub fn begin_delete(self: &Arc<Self>, repo: &str, name: &str) -> BeginDelete {
         let mut map = self.states.lock().expect("lifecycle mutex poisoned");
         let key = (repo.to_string(), name.to_string());
@@ -158,8 +147,7 @@ impl LifecycleRegistry {
                 BeginDelete::AlreadyDeleting(completion.clone())
             }
             existing => {
-                let prior_broken =
-                    matches!(existing, Some(WorkspaceLifecycle::Broken));
+                let prior_broken = matches!(existing, Some(WorkspaceLifecycle::Broken));
                 let completion = Arc::new(Notify::new());
                 map.insert(
                     key.clone(),
@@ -191,7 +179,6 @@ impl Default for LifecycleRegistry {
 /// without a commit (e.g., a panic), the state rolls back to `Active` (or
 /// `Broken` if the delete was retrying a previously-broken entry) and the
 /// completion notifier fires so any joiners unblock.
-#[allow(dead_code)] // consumed by Phase 1
 pub struct DeleteGuard {
     registry: Arc<LifecycleRegistry>,
     repo: String,
@@ -212,13 +199,16 @@ impl std::fmt::Debug for DeleteGuard {
     }
 }
 
-#[allow(dead_code)]
 impl DeleteGuard {
     /// Finalize: workspace is gone. Removes the entry from the map and
     /// fires the completion notifier.
     pub fn commit_gone(mut self) {
         {
-            let mut map = self.registry.states.lock().expect("lifecycle mutex poisoned");
+            let mut map = self
+                .registry
+                .states
+                .lock()
+                .expect("lifecycle mutex poisoned");
             map.remove(&(self.repo.clone(), self.name.clone()));
         }
         self.completion.notify_waiters();
@@ -229,7 +219,11 @@ impl DeleteGuard {
     /// fires the completion notifier so any joiners see the outcome.
     pub fn commit_broken(mut self) {
         {
-            let mut map = self.registry.states.lock().expect("lifecycle mutex poisoned");
+            let mut map = self
+                .registry
+                .states
+                .lock()
+                .expect("lifecycle mutex poisoned");
             map.insert(
                 (self.repo.clone(), self.name.clone()),
                 WorkspaceLifecycle::Broken,
@@ -242,7 +236,11 @@ impl DeleteGuard {
     /// Abort: nothing on disk was touched, revert to the prior state.
     pub fn rollback(mut self) {
         {
-            let mut map = self.registry.states.lock().expect("lifecycle mutex poisoned");
+            let mut map = self
+                .registry
+                .states
+                .lock()
+                .expect("lifecycle mutex poisoned");
             let state = if self.prior_broken {
                 WorkspaceLifecycle::Broken
             } else {
@@ -260,7 +258,11 @@ impl Drop for DeleteGuard {
         if !self.finalized {
             // Unclean drop (panic, early return). Best-effort rollback so
             // the state doesn't stay stuck on `Deleting`.
-            let mut map = self.registry.states.lock().expect("lifecycle mutex poisoned");
+            let mut map = self
+                .registry
+                .states
+                .lock()
+                .expect("lifecycle mutex poisoned");
             let state = if self.prior_broken {
                 WorkspaceLifecycle::Broken
             } else {

@@ -46,6 +46,7 @@ static PIPE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Construction options for [`TestHarness`]. `Default` yields production
 /// git-ops, no hooks-home override, and a synthetic `shardctl.exe` path
 /// for the hooks predicate / installer to render into settings.json.
+#[derive(Default)]
 pub struct HarnessOptions {
     pub git_ops: Option<Arc<dyn WorkspaceGitOps>>,
     pub hooks_home_override: Option<PathBuf>,
@@ -55,16 +56,6 @@ pub struct HarnessOptions {
     /// commands as shard-owned. Production uses `std::env::current_exe()`
     /// (the daemon binary IS shardctl).
     pub exe_path_override: Option<PathBuf>,
-}
-
-impl Default for HarnessOptions {
-    fn default() -> Self {
-        Self {
-            git_ops: None,
-            hooks_home_override: None,
-            exe_path_override: None,
-        }
-    }
 }
 
 impl TestHarness {
@@ -133,8 +124,7 @@ impl TestHarness {
         // Build the state synchronously so the test can grab a handle
         // before the control loop starts. run_headless_daemon_with_state
         // then drives the loop on a spawned task.
-        let state =
-            daemon::build_headless_state(config, shutdown_tx.clone()).expect("build state");
+        let state = daemon::build_headless_state(config, shutdown_tx.clone()).expect("build state");
 
         let task_state = state.clone();
         let daemon_task = tokio::spawn(async move {
@@ -143,10 +133,9 @@ impl TestHarness {
 
         // Wait for the control pipe to exist by trying a short-retry connect.
         // If the daemon can't come up in 5s, something is wrong.
-        let mut probe =
-            connect_to_with_retry(&control_pipe_name, Duration::from_secs(5))
-                .await
-                .expect("daemon control pipe should come up within 5s");
+        let mut probe = connect_to_with_retry(&control_pipe_name, Duration::from_secs(5))
+            .await
+            .expect("daemon control pipe should come up within 5s");
         probe.handshake().await.expect("handshake on probe connect");
         drop(probe);
 
@@ -191,9 +180,9 @@ impl TestHarness {
 
         let repo_path = self.create_bare_checkout(alias);
 
-        let repo_store = RepositoryStore::new(
-            shard_core::paths::ShardPaths::from_data_dir(self.data_path.clone()),
-        );
+        let repo_store = RepositoryStore::new(shard_core::paths::ShardPaths::from_data_dir(
+            self.data_path.clone(),
+        ));
         repo_store
             .add(repo_path.to_str().unwrap(), Some(alias))
             .expect("register repo");
@@ -237,13 +226,7 @@ impl TestHarness {
         let paths = shard_core::paths::ShardPaths::from_data_dir(self.data_path.clone());
         let store = SessionStore::new(paths.clone());
         let session = store
-            .create(
-                repo,
-                ws_name,
-                &["pwsh".to_string()],
-                "",
-                None,
-            )
+            .create(repo, ws_name, &["pwsh".to_string()], "", None)
             .expect("create session row");
         store
             .update_status(repo, &session.id, terminal_status, Some(0))
@@ -258,9 +241,9 @@ impl TestHarness {
     pub fn setup_workspace(&self, repo: &str, ws_name: &str) -> PathBuf {
         use shard_core::workspaces::{WorkspaceMode, WorkspaceStore};
 
-        let ws_store = WorkspaceStore::new(
-            shard_core::paths::ShardPaths::from_data_dir(self.data_path.clone()),
-        );
+        let ws_store = WorkspaceStore::new(shard_core::paths::ShardPaths::from_data_dir(
+            self.data_path.clone(),
+        ));
         let ws = ws_store
             .create(
                 repo,
