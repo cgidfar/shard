@@ -48,7 +48,7 @@ impl SessionStore {
         validate_repo_alias(repo_alias)?;
         validate_workspace_name(workspace_name)?;
         let repo_db_path = self.paths.repo_db(repo_alias);
-        let conn = db::open_connection(&repo_db_path)?;
+        let conn = db::open_repo_db(&repo_db_path)?;
 
         let id = uuid::Uuid::now_v7().to_string();
         let command_json = serde_json::to_string(command)?;
@@ -97,7 +97,7 @@ impl SessionStore {
     ) -> Result<()> {
         validate_repo_alias(repo_alias)?;
         let repo_db_path = self.paths.repo_db(repo_alias);
-        let conn = db::open_connection(&repo_db_path)?;
+        let conn = db::open_repo_db(&repo_db_path)?;
 
         let now = if status == "exited" || status == "stopped" || status == "failed" {
             Some(
@@ -126,7 +126,7 @@ impl SessionStore {
     ) -> Result<()> {
         validate_repo_alias(repo_alias)?;
         let repo_db_path = self.paths.repo_db(repo_alias);
-        let conn = db::open_connection(&repo_db_path)?;
+        let conn = db::open_repo_db(&repo_db_path)?;
         conn.execute(
             "UPDATE sessions SET transport_addr = ?1 WHERE id = ?2",
             params![addr, session_id],
@@ -143,7 +143,7 @@ impl SessionStore {
     ) -> Result<()> {
         validate_repo_alias(repo_alias)?;
         let repo_db_path = self.paths.repo_db(repo_alias);
-        let conn = db::open_connection(&repo_db_path)?;
+        let conn = db::open_repo_db(&repo_db_path)?;
         conn.execute(
             "UPDATE sessions SET supervisor_pid = ?1 WHERE id = ?2",
             params![pid, session_id],
@@ -160,7 +160,7 @@ impl SessionStore {
     ) -> Result<()> {
         validate_repo_alias(repo_alias)?;
         let repo_db_path = self.paths.repo_db(repo_alias);
-        let conn = db::open_connection(&repo_db_path)?;
+        let conn = db::open_repo_db(&repo_db_path)?;
         conn.execute(
             "UPDATE sessions SET child_pid = ?1 WHERE id = ?2",
             params![pid, session_id],
@@ -179,7 +179,7 @@ impl SessionStore {
             validate_workspace_name(ws)?;
         }
         let repo_db_path = self.paths.repo_db(repo_alias);
-        let conn = db::open_connection(&repo_db_path)?;
+        let conn = db::open_repo_db(&repo_db_path)?;
 
         let mut sessions = Vec::new();
 
@@ -212,7 +212,7 @@ impl SessionStore {
     pub fn get(&self, repo_alias: &str, session_id: &str) -> Result<Session> {
         validate_repo_alias(repo_alias)?;
         let repo_db_path = self.paths.repo_db(repo_alias);
-        let conn = db::open_connection(&repo_db_path)?;
+        let conn = db::open_repo_db(&repo_db_path)?;
         conn.query_row(
             "SELECT id, workspace_name, command_json, transport_addr, log_path,
                     supervisor_pid, child_pid, status, exit_code, created_at, stopped_at, label, harness
@@ -254,7 +254,7 @@ impl SessionStore {
             }
 
             // Try prefix match
-            let conn = db::open_connection(&repo_db_path)?;
+            let conn = db::open_repo_db(&repo_db_path)?;
             let like_pattern = format!("{session_id}%");
             let mut pstmt = conn.prepare(
                 "SELECT id, workspace_name, command_json, transport_addr, log_path,
@@ -305,7 +305,7 @@ impl SessionStore {
         }
 
         let repo_db_path = self.paths.repo_db(repo_alias);
-        let conn = db::open_connection(&repo_db_path)?;
+        let conn = db::open_repo_db(&repo_db_path)?;
         conn.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
 
         Ok(())
@@ -325,7 +325,7 @@ impl SessionStore {
     ) -> Result<()> {
         validate_repo_alias(repo_alias)?;
         let repo_db_path = self.paths.repo_db(repo_alias);
-        let conn = db::open_connection(&repo_db_path)?;
+        let conn = db::open_repo_db(&repo_db_path)?;
         let rows = conn.execute(
             "UPDATE sessions SET label = ?1 WHERE id = ?2",
             params![label, session_id],

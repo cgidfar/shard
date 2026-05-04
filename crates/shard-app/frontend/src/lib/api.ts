@@ -29,6 +29,9 @@ export interface Workspace {
   branch: string;
   path: string;
   is_base: boolean;
+  /** True when Shard adopted this worktree (didn't create it). Remove
+   *  is untrack-only — the directory is left intact. */
+  is_external: boolean;
   created_at: number;
   /** Live-state overlay supplied by the daemon WorkspaceMonitor. `null`
    *  when the monitor has not yet reported a snapshot for this repo. */
@@ -39,9 +42,44 @@ export interface BranchInfo {
   name: string;
   is_head: boolean;
   checked_out_by: string | null;
+  /** Set when this branch is currently checked out in an externally-managed
+   *  worktree (one not tracked by Shard). The path can be passed straight to
+   *  `adoptWorkspace` to register it. */
+  external_path: string | null;
 }
 
 export type WorkspaceMode = "new_branch" | "existing_branch";
+
+/** Mirror of `shard_core::identifiers::safe_workspace_name` so the dialog
+ *  can preview the workspace name the daemon will derive from a branch
+ *  (e.g. for collision checks against existing workspaces before submit).
+ *  Keep in sync with the Rust impl. */
+const WINDOWS_RESERVED_NAMES = new Set([
+  "CON", "PRN", "AUX", "NUL",
+  "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+  "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+]);
+export function safeWorkspaceName(raw: string): string {
+  let out = "";
+  let lastDash = false;
+  for (const ch of raw) {
+    const code = ch.charCodeAt(0);
+    const isControl = code < 0x20 || code === 0x7f;
+    const safe = isControl || /[/\\<>:"|?*]/.test(ch) ? "-" : ch;
+    if (safe === "-") {
+      if (lastDash) continue;
+      lastDash = true;
+    } else {
+      lastDash = false;
+    }
+    out += safe;
+  }
+  let trimmed = out.replace(/^[-. ]+|[-. ]+$/g, "");
+  if (!trimmed) trimmed = "workspace";
+  const stem = (trimmed.split(".")[0] || trimmed).toUpperCase();
+  if (WINDOWS_RESERVED_NAMES.has(stem)) trimmed = `workspace-${trimmed}`;
+  return trimmed;
+}
 
 export type Harness = "claude-code" | "codex";
 
@@ -101,6 +139,20 @@ export function createWorkspace(
     name: name ?? null,
     mode,
     branch: branch ?? null,
+  });
+}
+
+/** Adopt an existing external git worktree as a Shard workspace.
+ *  `path` must already be registered with git as a worktree of `repo`. */
+export function adoptWorkspace(
+  repo: string,
+  path: string,
+  name?: string,
+): Promise<Workspace> {
+  return invoke("adopt_workspace", {
+    repo,
+    path,
+    name: name ?? null,
   });
 }
 

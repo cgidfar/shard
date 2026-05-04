@@ -118,6 +118,7 @@ pub fn run() {
             commands::repo::remove_repo,
             commands::workspace::list_workspaces,
             commands::workspace::create_workspace,
+            commands::workspace::adopt_workspace,
             commands::workspace::remove_workspace,
             commands::workspace::list_repo_branches,
             commands::session::list_sessions,

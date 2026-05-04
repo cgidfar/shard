@@ -129,6 +129,23 @@ pub enum WorkspaceCommands {
         /// Target as repo:workspace
         target: String,
     },
+
+    /// Adopt a pre-existing external git worktree as a Shard workspace.
+    ///
+    /// The path must already be a registered, non-prunable worktree of
+    /// `repo`. Shard records the row and skips filesystem teardown on
+    /// remove (untrack only). Local repos only.
+    Adopt {
+        /// Repository alias
+        repo: String,
+
+        /// Absolute path to the existing worktree directory
+        path: String,
+
+        /// Workspace name (defaults to safe form of the worktree's HEAD branch)
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]

@@ -81,6 +81,27 @@ pub async fn remove_workspace(repo: &str, name: &str) -> Result<(), String> {
     .await
 }
 
+/// Adopt a pre-existing external worktree via the daemon RPC. See
+/// `crates/shard-cli/src/cmd/daemon.rs::handle_adopt_workspace`.
+pub async fn adopt_workspace(
+    repo: &str,
+    path: &str,
+    name: Option<String>,
+) -> Result<Workspace, String> {
+    request_daemon(
+        ControlFrame::AdoptWorkspace {
+            repo: repo.to_string(),
+            path: path.to_string(),
+            name,
+        },
+        |f| match f {
+            ControlFrame::AdoptWorkspaceAck { workspace } => Some(workspace),
+            _ => None,
+        },
+    )
+    .await
+}
+
 /// Create a workspace via the daemon RPC. See
 /// `crates/shard-cli/src/cmd/daemon.rs::handle_create_workspace` for the
 /// gate / register / poke sequence.
@@ -386,10 +407,21 @@ async fn apply_snapshot(app: &AppHandle, state: RepoState) {
     let empty: HashMap<String, shard_core::state::WorkspaceStatus> = HashMap::new();
     let prev_ws = prev.as_ref().map(|p| &p.workspaces).unwrap_or(&empty);
 
+    // Track whether the workspace *set* (not just statuses) changed, so we
+    // can fire `sidebar-changed` for cross-process mutations. In-app
+    // mutations emit `sidebar-changed` from their Tauri command after the
+    // RPC returns, but a CLI `workspace create`/`adopt` lands purely via
+    // this broadcast — without this nudge the sidebar wouldn't re-query
+    // and the new row would stay invisible until the next manual refresh.
+    let mut membership_changed = false;
+
     for (ws_name, status) in &state.workspaces {
         let changed = match prev_ws.get(ws_name) {
             Some(prev) => prev != status,
-            None => true,
+            None => {
+                membership_changed = true;
+                true
+            }
         };
         if changed {
             let _ = app.emit(
@@ -409,6 +441,7 @@ async fn apply_snapshot(app: &AppHandle, state: RepoState) {
     // live-state overlay before the next structural refresh lands.
     for ws_name in prev_ws.keys() {
         if !state.workspaces.contains_key(ws_name) {
+            membership_changed = true;
             let _ = app.emit(
                 "workspace-status-changed",
                 WorkspaceStatusChanged {
@@ -418,6 +451,10 @@ async fn apply_snapshot(app: &AppHandle, state: RepoState) {
                 },
             );
         }
+    }
+
+    if membership_changed {
+        let _ = app.emit("sidebar-changed", ());
     }
 
     cache.insert(alias, state);

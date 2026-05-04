@@ -41,6 +41,20 @@ pub fn init_index_db(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Open a connection to a per-repo `repo.db`, applying schema migrations.
+///
+/// Combines [`open_connection`] (WAL mode + busy_timeout) with
+/// [`init_repo_db`] so existing repo databases pick up new columns when
+/// the daemon/CLI/app starts a fresh build. `init_repo_db` is idempotent
+/// (CREATE TABLE IF NOT EXISTS + per-column `ALTER TABLE` whose errors
+/// are silently ignored when the column already exists), so this is safe
+/// to call on every open and cheap enough not to bother caching.
+pub fn open_repo_db(path: &Path) -> Result<Connection> {
+    let conn = open_connection(path)?;
+    init_repo_db(&conn)?;
+    Ok(conn)
+}
+
 /// Initialize a per-repo repo.db schema
 pub fn init_repo_db(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -49,6 +63,7 @@ pub fn init_repo_db(conn: &Connection) -> Result<()> {
             branch TEXT NOT NULL,
             path TEXT NOT NULL UNIQUE,
             is_base INTEGER NOT NULL DEFAULT 0,
+            is_external INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL
         );
 
@@ -69,6 +84,8 @@ pub fn init_repo_db(conn: &Connection) -> Result<()> {
     )?;
     // Migration: add is_base column if missing (existing databases)
     let _ = conn.execute_batch("ALTER TABLE workspaces ADD COLUMN is_base INTEGER NOT NULL DEFAULT 0;");
+    // Migration: add is_external column if missing (existing databases)
+    let _ = conn.execute_batch("ALTER TABLE workspaces ADD COLUMN is_external INTEGER NOT NULL DEFAULT 0;");
     // Migration: add label column if missing (existing databases)
     let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN label TEXT;");
     // Migration: add harness column if missing (existing databases)

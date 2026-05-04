@@ -1642,6 +1642,7 @@ async fn dispatch_request(state: &Arc<DaemonState>, frame: ControlFrame) -> Cont
                 | ControlFrame::RemoveSession { .. }
                 | ControlFrame::RenameSession { .. }
                 | ControlFrame::InstallHarnessHooks { .. }
+                | ControlFrame::AdoptWorkspace { .. }
         )
     {
         return ControlFrame::Error {
@@ -1673,6 +1674,10 @@ async fn dispatch_request(state: &Arc<DaemonState>, frame: ControlFrame) -> Cont
             mode,
             branch,
         } => handle_create_workspace(state, repo, name, mode, branch).await,
+
+        ControlFrame::AdoptWorkspace { repo, path, name } => {
+            handle_adopt_workspace(state, repo, path, name).await
+        }
 
         ControlFrame::ListWorkspaces { repo } => handle_list_workspaces(state, repo).await,
 
@@ -2336,7 +2341,13 @@ async fn handle_remove_workspace(
     }
 
     // 4. Filesystem side.
-    if !workspace.is_base {
+    //
+    // Skip for `is_base` (the user's own checkout) and for `is_external`
+    // (adopted worktree — Shard didn't create the directory or git admin
+    // entry, so remove is untrack-only on the way back out). The watcher
+    // drop above runs for both is_base=false branches because the monitor
+    // does watch externally-adopted paths once we record them.
+    if !workspace.is_base && !workspace.is_external {
         let repo_store = RepositoryStore::new(state.paths.clone());
         let repo_rec = match repo_store.get(&repo) {
             Ok(r) => r,
@@ -2473,6 +2484,87 @@ async fn handle_create_workspace(
         repo, ws.name, ws.branch
     );
     ControlFrame::CreateWorkspaceAck { workspace: ws }
+}
+
+/// Handle `AdoptWorkspace` (SHA-50).
+///
+/// Registers an externally-created git worktree as a Shard workspace without
+/// running any git side effects — only a DB INSERT. Mirrors
+/// `handle_create_workspace`'s lifecycle gating: per-repo mutation lock,
+/// up-front name resolution so explicit and implicit names are gated
+/// uniformly, then `adopt → register_active → poke_topology`.
+///
+/// Local repos only in v1; remote repos return `Error`. The remove path
+/// (see `handle_remove_workspace`) skips filesystem teardown when
+/// `is_external=true`, so adoption is symmetrically untrack-only on the way
+/// back out.
+async fn handle_adopt_workspace(
+    state: &Arc<DaemonState>,
+    repo: String,
+    path: String,
+    name: Option<String>,
+) -> ControlFrame {
+    let repo_lock = state.acquire_repo_mutation_lock(&repo).await;
+    let _guard = repo_lock.lock().await;
+
+    // Local-repo guard. Surfaced here (and again in the store) so the
+    // error message reaches the caller before any name resolution.
+    let repo_store = RepositoryStore::new(state.paths.clone());
+    match repo_store.get(&repo) {
+        Ok(r) if r.local_path.is_none() => {
+            return ControlFrame::Error {
+                message: "adopt is only supported for local repos".into(),
+            };
+        }
+        Err(e) => return ControlFrame::Error { message: e.to_string() },
+        Ok(_) => {}
+    }
+
+    let ws_store = WorkspaceStore::new(state.paths.clone());
+    let external_path = std::path::Path::new(&path);
+
+    // Resolve the effective name before any side effects so the lifecycle
+    // gate covers both explicit and implicit-name callers — same discipline
+    // as handle_create_workspace.
+    let resolved_name =
+        match ws_store.resolve_adopt_name(&repo, external_path, name.as_deref()) {
+            Ok(n) => n,
+            Err(e) => {
+                return ControlFrame::Error {
+                    message: format!("resolve adopt name failed: {e}"),
+                };
+            }
+        };
+
+    if let Err(e) = state.lifecycle.check_can_mutate(&repo, &resolved_name) {
+        return ControlFrame::Error { message: e.to_string() };
+    }
+
+    // Pass the already-resolved name into the store so name derivation
+    // happens exactly once (in resolve_adopt_name above). Without this,
+    // the gate-checked name and the inserted name could diverge — adopt
+    // re-reads HEAD via porcelain, while resolve_adopt_name reads HEAD
+    // via `git symbolic-ref` on the worktree dir.
+    let ws = match ws_store.adopt(&repo, external_path, Some(&resolved_name)) {
+        Ok(w) => w,
+        Err(e) => {
+            return ControlFrame::Error {
+                message: format!("adopt workspace failed: {e}"),
+            };
+        }
+    };
+
+    state.lifecycle.register_active(&repo, &ws.name);
+
+    if let Some(monitor) = state.monitor.get() {
+        monitor.poke_topology(Some(repo.clone()));
+    }
+
+    info!(
+        "AdoptWorkspace: {}:{} on branch '{}' at {}",
+        repo, ws.name, ws.branch, ws.path
+    );
+    ControlFrame::AdoptWorkspaceAck { workspace: ws }
 }
 
 /// Handle `ListWorkspaces` — enriched list of workspaces for a repo.

@@ -134,6 +134,13 @@ struct MonitorInner {
     /// Typed command channel (replaces the former topology-only poke).
     /// Fire-and-forget pokes are encoded as `MonitorCommand::PokeTopology`.
     command_tx: mpsc::UnboundedSender<MonitorCommand>,
+    /// Monotonic counter for `RepoState.version`. Subscribers (the app's
+    /// `apply_snapshot`) discard any snapshot whose version is `<= prev`,
+    /// so versions must strictly increase across the monitor's lifetime —
+    /// including across drop_repo + load_repo cycles, which would
+    /// otherwise reset to 1 and cause topology-poke broadcasts to be
+    /// silently dropped at the subscriber.
+    next_version: std::sync::atomic::AtomicU64,
 }
 
 impl MonitorHandle {
@@ -233,6 +240,7 @@ pub(crate) fn spawn(
         repos: RwLock::new(HashMap::new()),
         change_tx,
         command_tx,
+        next_version: std::sync::atomic::AtomicU64::new(1),
     });
 
     let handle = MonitorHandle {
@@ -336,7 +344,10 @@ impl WorkspaceMonitor {
         };
 
         let mut state = RepoState::new(alias.clone());
-        state.version = 1;
+        state.version = self
+            .inner
+            .next_version
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         for ws in &workspaces {
             let status = classify_workspace(ws, repo);
             state.workspaces.insert(ws.name.clone(), status);
@@ -670,7 +681,10 @@ impl WorkspaceMonitor {
             .map(|s| (**s).clone())
             .unwrap_or_else(|| RepoState::new(alias));
         state.workspaces = new_map;
-        state.version += 1;
+        state.version = self
+            .inner
+            .next_version
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         repos.insert(alias.to_string(), Arc::new(state));
         drop(repos);
         let _ = self

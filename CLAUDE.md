@@ -83,7 +83,11 @@ Playwright MCP can attach to the running Tauri WebView via CDP (Chrome DevTools 
 
 ### Gotchas
 
-- **App relaunch = Playwright reconnect required.** When the Tauri app restarts, the CDP WebSocket changes. Playwright MCP caches the old connection and will return "Target page, context or browser has been closed." Fix: run `/mcp` to reconnect.
+- **App relaunch = Playwright reconnect required.** When the Tauri app restarts, the CDP WebSocket changes. Playwright MCP caches the old connection and the next call returns "Target page, context or browser has been closed." Two ways to recover, in order of preference:
+  1. **In-tool reattach (no MCP restart needed):** call `browser_close` then `browser_tabs list`. This makes Playwright re-enumerate CDP targets and pick up the new "Shard" page. Then call `browser_snapshot` normally.
+  2. **Fallback:** run `/mcp` to fully reconnect.
+
+  Do **not** call `browser_navigate http://localhost:5173/` to recover — that creates a fresh CDP context without `window.__TAURI__`, which empties the sidebar and breaks IPC for the rest of the session. Recovery requires killing and restarting the app.
 
 - **`tauri.conf.json` changes require full relaunch.** Changes like `decorations: false` are compiled into the Rust binary. Vite HMR won't pick them up — you must kill and re-run `cargo run -p shard-app`.
 

@@ -25,6 +25,18 @@ pub async fn create_workspace(
 }
 
 #[tauri::command]
+pub async fn adopt_workspace(
+    app: tauri::AppHandle,
+    repo: String,
+    path: String,
+    name: Option<String>,
+) -> Result<Workspace, String> {
+    let ws = daemon_ipc::adopt_workspace(&repo, &path, name).await?;
+    let _ = app.emit("sidebar-changed", ());
+    Ok(ws)
+}
+
+#[tauri::command]
 pub async fn list_repo_branches(repo: String) -> Result<Vec<BranchInfo>, String> {
     daemon_ipc::list_branch_info(&repo).await
 }

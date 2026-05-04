@@ -47,6 +47,15 @@ pub fn run(command: WorkspaceCommands) -> shard_core::Result<()> {
             remove_via_daemon(repo, ws_name)?;
             println!("Removed workspace '{}:{}'", repo, ws_name);
         }
+
+        WorkspaceCommands::Adopt { repo, path, name } => {
+            let ws = adopt_via_daemon(&repo, &path, name)?;
+            println!(
+                "Adopted workspace '{}:{}' on branch '{}'",
+                repo, ws.name, ws.branch
+            );
+            println!("  Path: {}", ws.path);
+        }
     }
     Ok(())
 }
@@ -79,6 +88,25 @@ fn list_via_daemon(repo: &str) -> shard_core::Result<Vec<WorkspaceWithStatus>> {
         },
         |f| match f {
             ControlFrame::WorkspaceList { items } => Some(items),
+            _ => None,
+        },
+    )
+}
+
+fn adopt_via_daemon(
+    repo: &str,
+    path: &str,
+    name: Option<String>,
+) -> shard_core::Result<Workspace> {
+    use shard_transport::control_protocol::ControlFrame;
+    crate::cmd::daemon_rpc::run(
+        ControlFrame::AdoptWorkspace {
+            repo: repo.to_string(),
+            path: path.to_string(),
+            name,
+        },
+        |f| match f {
+            ControlFrame::AdoptWorkspaceAck { workspace } => Some(workspace),
             _ => None,
         },
     )

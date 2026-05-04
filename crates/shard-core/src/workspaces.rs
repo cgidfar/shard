@@ -53,6 +53,11 @@ pub struct Workspace {
     pub branch: String,
     pub path: String,
     pub is_base: bool,
+    /// True when Shard did not create this worktree — the path was registered
+    /// via `WorkspaceStore::adopt`. Skip filesystem teardown on remove (mirrors
+    /// `is_base` semantics) so the user's externally-managed directory stays
+    /// intact.
+    pub is_external: bool,
     pub created_at: u64,
 }
 
@@ -74,11 +79,17 @@ pub enum WorkspaceMode {
 /// Surfaces to the frontend so the new-workspace wizard can pick a base
 /// branch (mode = NewBranch) or pick an existing branch to check out
 /// (mode = ExistingBranch) and warn when that branch is already claimed.
+///
+/// `external_path` carries the porcelain-reported path when the branch is
+/// checked out in an externally-managed worktree (one absent from the DB).
+/// The frontend uses it as the source of truth for adopt-mode dispatch —
+/// `checked_out_by` remains a display-only label.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BranchInfo {
     pub name: String,
     pub is_head: bool,
     pub checked_out_by: Option<String>,
+    pub external_path: Option<String>,
 }
 
 /// A workspace persisted row enriched with live derived status from the
@@ -152,6 +163,184 @@ impl WorkspaceStore {
         Ok(resolved)
     }
 
+    /// Side-effect-free name resolution for an adopt request — the daemon
+    /// runs this before the lifecycle gate so explicit and implicit names
+    /// are both gated uniformly. Mirrors `resolve_workspace_name` for the
+    /// create path.
+    ///
+    /// Reads HEAD at `external_path` via `git symbolic-ref` (no fetch, no
+    /// commit). Detached HEAD is rejected here so callers don't have to
+    /// invent a branch name.
+    pub fn resolve_adopt_name(
+        &self,
+        repo_alias: &str,
+        external_path: &Path,
+        name: Option<&str>,
+    ) -> Result<String> {
+        validate_repo_alias(repo_alias)?;
+        let resolved = match name {
+            Some(n) => n.to_string(),
+            None => {
+                if !external_path.exists() || !external_path.is_dir() {
+                    return Err(ShardError::Other(format!(
+                        "path does not exist or is not a directory: {}",
+                        external_path.display()
+                    )));
+                }
+                let branch = git::default_branch(external_path).map_err(|e| {
+                    ShardError::Other(format!(
+                        "cannot read HEAD at {}: {e}",
+                        external_path.display()
+                    ))
+                })?;
+                safe_workspace_name(&branch)
+            }
+        };
+        validate_workspace_name(&resolved)?;
+        Ok(resolved)
+    }
+
+    /// Adopt an externally-managed worktree into Shard tracking.
+    ///
+    /// The directory must already be a registered, non-prunable worktree of
+    /// this repo. No `git worktree add` is run; the only mutation is the DB
+    /// INSERT. Sets `is_external=1` so [`Self::remove`] (and the daemon's
+    /// remove handler) skip filesystem teardown — adoption is "untrack only"
+    /// on the way back out.
+    ///
+    /// `name` defaults to `safe_workspace_name(branch)` where `branch` is the
+    /// worktree's current HEAD. Detached HEAD is rejected.
+    ///
+    /// Local repos only in v1; remote (bare-cloned) repos return an error.
+    pub fn adopt(
+        &self,
+        repo_alias: &str,
+        external_path: &Path,
+        name: Option<&str>,
+    ) -> Result<Workspace> {
+        validate_repo_alias(repo_alias)?;
+        let repo_store = RepositoryStore::new(self.paths.clone());
+        let repo = repo_store.get(repo_alias)?;
+
+        let local_path = repo.local_path.as_deref().ok_or_else(|| {
+            ShardError::Other("adopt is only supported for local repos".into())
+        })?;
+
+        if !external_path.exists() || !external_path.is_dir() {
+            return Err(ShardError::Other(format!(
+                "path does not exist or is not a directory: {}",
+                external_path.display()
+            )));
+        }
+
+        // Reject the repo's own base checkout — that's a different repair
+        // path (an existing or missing is_base row), not adoption.
+        let local_key = normalize_worktree_path(Path::new(local_path));
+        let adopt_key = normalize_worktree_path(external_path);
+        if local_key == adopt_key {
+            return Err(ShardError::Other(format!(
+                "cannot adopt the repo's base checkout: {}",
+                external_path.display()
+            )));
+        }
+
+        // Reject paths inside the repo's `.shard/` directory. That dir
+        // is reserved for Shard-managed worktrees and gets `remove_dir_all`'d
+        // on `RemoveRepo`, which would silently delete an adopted external
+        // worktree's contents — bypassing the is_external untrack-only
+        // contract. Adopting into the managed root is also semantically
+        // wrong: managed worktrees are created via `WorkspaceStore::create`,
+        // not adoption.
+        let managed_key = normalize_worktree_path(&Path::new(local_path).join(".shard"));
+        let managed_prefix = format!("{managed_key}\\");
+        if adopt_key.starts_with(&managed_prefix) {
+            return Err(ShardError::Other(format!(
+                "cannot adopt a path under the repo's .shard directory: {}",
+                external_path.display()
+            )));
+        }
+
+        // Confirm the path is registered as a live worktree of this repo.
+        // Persist the porcelain entry's path (not the user-provided one) so
+        // reconcile lookups match what git reports.
+        let source_dir = self
+            .paths
+            .repo_source_for_repo(repo_alias, repo.local_path.as_deref());
+        let entries = git::worktree_list_porcelain(&source_dir)?;
+        let entry = entries
+            .iter()
+            .find(|e| !e.prunable && normalize_worktree_path(&e.path) == adopt_key)
+            .ok_or_else(|| {
+                ShardError::Other(format!(
+                    "path is not a registered worktree of repo '{}': {}",
+                    repo_alias,
+                    external_path.display()
+                ))
+            })?;
+
+        let branch = entry.branch.clone().ok_or_else(|| {
+            ShardError::Other(format!(
+                "cannot adopt worktree at {}: detached HEAD is not supported",
+                external_path.display()
+            ))
+        })?;
+
+        let ws_name = match name {
+            Some(n) => {
+                validate_workspace_name(n)?;
+                n.to_string()
+            }
+            None => safe_workspace_name(&branch),
+        };
+
+        let path_str = entry.path.to_string_lossy().to_string();
+
+        let repo_db_path = self.paths.repo_db(repo_alias);
+        let conn = db::open_repo_db(&repo_db_path)?;
+
+        let name_exists: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM workspaces WHERE name = ?1",
+            params![ws_name],
+            |row| row.get(0),
+        )?;
+        if name_exists {
+            return Err(ShardError::WorkspaceAlreadyExists(ws_name));
+        }
+
+        // Path uniqueness must be normalized — SQLite UNIQUE on the raw path
+        // string would miss casing/separator/UNC variants.
+        let existing = self.list(repo_alias).unwrap_or_default();
+        if existing
+            .iter()
+            .any(|ws| normalize_worktree_path(Path::new(&ws.path)) == adopt_key)
+        {
+            return Err(ShardError::Other(format!(
+                "a workspace already tracks this path: {}",
+                external_path.display()
+            )));
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        conn.execute(
+            "INSERT INTO workspaces (name, branch, path, is_base, is_external, created_at) \
+             VALUES (?1, ?2, ?3, 0, 1, ?4)",
+            params![ws_name, branch, path_str, now],
+        )?;
+
+        Ok(Workspace {
+            name: ws_name,
+            branch,
+            path: path_str,
+            is_base: false,
+            is_external: true,
+            created_at: now,
+        })
+    }
+
     /// Create a new workspace for a repo.
     ///
     /// `is_base` means the workspace points to the original checkout
@@ -220,7 +409,7 @@ impl WorkspaceStore {
 
         // Check for duplicates in DB
         let repo_db_path = self.paths.repo_db(repo_alias);
-        let conn = db::open_connection(&repo_db_path)?;
+        let conn = db::open_repo_db(&repo_db_path)?;
 
         let exists: bool = conn.query_row(
             "SELECT COUNT(*) > 0 FROM workspaces WHERE name = ?1",
@@ -277,7 +466,7 @@ impl WorkspaceStore {
         let path_str = ws_dir.to_string_lossy().to_string();
 
         conn.execute(
-            "INSERT INTO workspaces (name, branch, path, is_base, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO workspaces (name, branch, path, is_base, is_external, created_at) VALUES (?1, ?2, ?3, ?4, 0, ?5)",
             params![ws_name, branch_for_db, path_str, is_base as i32, now],
         )?;
 
@@ -286,6 +475,7 @@ impl WorkspaceStore {
             branch: branch_for_db,
             path: path_str,
             is_base,
+            is_external: false,
             created_at: now,
         })
     }
@@ -320,6 +510,11 @@ impl WorkspaceStore {
 
         let mut branch_to_workspace: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        // For branches checked out in unmanaged worktrees, carry the porcelain
+        // path so the frontend can pass it to `adopt` without having to derive
+        // it from the (display-only) `(external: <name>)` label.
+        let mut branch_to_external_path: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         if let Ok(entries) = git::worktree_list_porcelain(&source_dir) {
             for entry in entries {
                 if entry.prunable || entry.detached {
@@ -330,10 +525,18 @@ impl WorkspaceStore {
                 else {
                     continue;
                 };
-                let label = path_to_workspace
-                    .get(&key)
-                    .cloned()
-                    .unwrap_or_else(|| external_worktree_label(&entry.path));
+                let managed = path_to_workspace.get(&key).cloned();
+                let label = match &managed {
+                    Some(name) => name.clone(),
+                    None => {
+                        // Carry the porcelain-reported path verbatim — that's
+                        // the shape `WorkspaceStore::adopt` matches against
+                        // and the shape it persists.
+                        branch_to_external_path
+                            .insert(branch.clone(), entry.path.to_string_lossy().to_string());
+                        external_worktree_label(&entry.path)
+                    }
+                };
                 branch_to_workspace.insert(branch, label);
             }
         }
@@ -343,10 +546,12 @@ impl WorkspaceStore {
             .map(|name| {
                 let is_head = head.as_deref() == Some(name.as_str());
                 let checked_out_by = branch_to_workspace.get(&name).cloned();
+                let external_path = branch_to_external_path.get(&name).cloned();
                 BranchInfo {
                     name,
                     is_head,
                     checked_out_by,
+                    external_path,
                 }
             })
             .collect())
@@ -389,19 +594,21 @@ impl WorkspaceStore {
         let _repo = repo_store.get(repo_alias)?;
 
         let repo_db_path = self.paths.repo_db(repo_alias);
-        let conn = db::open_connection(&repo_db_path)?;
+        let conn = db::open_repo_db(&repo_db_path)?;
 
         let mut stmt = conn.prepare(
-            "SELECT name, branch, path, is_base, created_at FROM workspaces ORDER BY name",
+            "SELECT name, branch, path, is_base, is_external, created_at FROM workspaces ORDER BY name",
         )?;
         let workspaces = stmt.query_map([], |row| {
             let is_base_int: i32 = row.get(3)?;
+            let is_external_int: i32 = row.get(4)?;
             Ok(Workspace {
                 name: row.get(0)?,
                 branch: row.get(1)?,
                 path: row.get(2)?,
                 is_base: is_base_int != 0,
-                created_at: row.get(4)?,
+                is_external: is_external_int != 0,
+                created_at: row.get(5)?,
             })
         })?;
 
@@ -417,19 +624,21 @@ impl WorkspaceStore {
         validate_repo_alias(repo_alias)?;
         validate_workspace_name(ws_name)?;
         let repo_db_path = self.paths.repo_db(repo_alias);
-        let conn = db::open_connection(&repo_db_path)?;
+        let conn = db::open_repo_db(&repo_db_path)?;
 
         conn.query_row(
-            "SELECT name, branch, path, is_base, created_at FROM workspaces WHERE name = ?1",
+            "SELECT name, branch, path, is_base, is_external, created_at FROM workspaces WHERE name = ?1",
             params![ws_name],
             |row| {
                 let is_base_int: i32 = row.get(3)?;
+                let is_external_int: i32 = row.get(4)?;
                 Ok(Workspace {
                     name: row.get(0)?,
                     branch: row.get(1)?,
                     path: row.get(2)?,
                     is_base: is_base_int != 0,
-                    created_at: row.get(4)?,
+                    is_external: is_external_int != 0,
+                    created_at: row.get(5)?,
                 })
             },
         )
@@ -459,7 +668,7 @@ impl WorkspaceStore {
         validate_workspace_name(ws_name)?;
         let ws = self.get(repo_alias, ws_name)?;
 
-        if !ws.is_base {
+        if !ws.is_base && !ws.is_external {
             let repo_store = RepositoryStore::new(self.paths.clone());
             let repo = repo_store.get(repo_alias)?;
             let source_dir = self
@@ -496,7 +705,7 @@ impl WorkspaceStore {
 
         // Remove from DB
         let repo_db_path = self.paths.repo_db(repo_alias);
-        let conn = db::open_connection(&repo_db_path)?;
+        let conn = db::open_repo_db(&repo_db_path)?;
         conn.execute("DELETE FROM workspaces WHERE name = ?1", params![ws_name])?;
 
         Ok(())
@@ -510,7 +719,7 @@ impl WorkspaceStore {
         validate_repo_alias(repo_alias)?;
         validate_workspace_name(ws_name)?;
         let repo_db_path = self.paths.repo_db(repo_alias);
-        let conn = db::open_connection(&repo_db_path)?;
+        let conn = db::open_repo_db(&repo_db_path)?;
         conn.execute("DELETE FROM workspaces WHERE name = ?1", params![ws_name])?;
         Ok(())
     }

@@ -1,6 +1,7 @@
 import {
   listRepoBranches,
   listWorkspaces,
+  safeWorkspaceName,
   type BranchInfo,
   type WorkspaceMode,
 } from "../lib/api";
@@ -9,6 +10,10 @@ export interface AddWorkspaceResult {
   name: string;
   mode: WorkspaceMode;
   branch: string;
+  /** When set, the user picked a branch checked out in an externally-managed
+   *  worktree. The caller should route to `adoptWorkspace(repo, adoptPath, ...)`
+   *  instead of `createWorkspace(...)`. Always paired with `mode === "existing_branch"`. */
+  adoptPath?: string;
 }
 
 export class AddWorkspaceDialog {
@@ -98,10 +103,25 @@ export class AddWorkspaceDialog {
     }
 
     let warn: string | null = null;
+    let adoptable = false;
     if (this.mode === "existing_branch") {
       const sel = this.selectedBranch(this.existingSelect);
       if (!sel) {
         reasons.push("no-branch");
+      } else if (sel.external_path) {
+        // Branch is checked out in a worktree Shard didn't create. Allow
+        // submit; the caller will route to `adoptWorkspace` via `adoptPath`
+        // on the result.
+        adoptable = true;
+        warn = `External worktree at ${sel.external_path}. Click Adopt to track it in Shard.`;
+        // Compare against the sanitized form the daemon will derive — for
+        // a branch like `feature/foo`, the workspace will land as
+        // `feature-foo` and would otherwise collide silently on submit.
+        const derivedName = safeWorkspaceName(sel.name);
+        if (this.existingWorkspaceNames.includes(derivedName)) {
+          reasons.push("name-collision");
+          warn = `A workspace named "${derivedName}" already exists.`;
+        }
       } else if (sel.checked_out_by) {
         reasons.push("occupied");
         warn = `Already checked out in workspace "${sel.checked_out_by}". Choose a different branch.`;
@@ -121,13 +141,11 @@ export class AddWorkspaceDialog {
       }
     }
 
-    if (warn) {
-      this.warnEl.textContent = warn;
-      this.warnEl.style.display = "block";
-    } else {
-      this.warnEl.style.display = "none";
-    }
+    this.warnEl.textContent = warn ?? "";
+    this.warnEl.classList.toggle("dialog-hint--warn", !adoptable);
+    this.warnEl.style.display = warn ? "block" : "none";
 
+    this.submitBtn.textContent = adoptable ? "Adopt Workspace" : "Create Workspace";
     this.submitBtn.disabled = reasons.length > 0;
   }
 
@@ -140,7 +158,11 @@ export class AddWorkspaceDialog {
     if (!picked) return;
     const name =
       this.mode === "new_branch" ? this.nameInput.value.trim() : picked.name;
-    this.close({ name, mode: this.mode, branch: picked.name });
+    const adoptPath =
+      this.mode === "existing_branch" && picked.external_path
+        ? picked.external_path
+        : undefined;
+    this.close({ name, mode: this.mode, branch: picked.name, adoptPath });
   }
 
   private selectedBranch(select: HTMLSelectElement): BranchInfo | null {

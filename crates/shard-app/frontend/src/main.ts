@@ -5,7 +5,7 @@ import { Sidebar } from "./components/Sidebar";
 import { TerminalPane } from "./components/TerminalPane";
 import { AddShardDialog } from "./components/AddShardDialog";
 import { AddWorkspaceDialog } from "./components/AddWorkspaceDialog";
-import { addRepo, createSession, createWorkspace, listRepos, stopSession, removeSession, removeWorkspace, syncRepo, removeRepo, type WorkspaceStatus } from "./lib/api";
+import { addRepo, adoptWorkspace, createSession, createWorkspace, listRepos, stopSession, removeSession, removeWorkspace, syncRepo, removeRepo, type WorkspaceStatus } from "./lib/api";
 import { contextMenu, type MenuItemDef } from "./lib/ContextMenu";
 import { labelFromCommand } from "./lib/titleFormat";
 import { activityStore } from "./lib/activityStore";
@@ -184,7 +184,16 @@ async function doCreateWorkspace(repo: string) {
   const result = await workspaceDialog.open(repo);
   if (!result) return;
   try {
-    await createWorkspace(repo, result.name, result.mode, result.branch);
+    if (result.adoptPath) {
+      // Branch was checked out in an externally-managed worktree. Tell
+      // the daemon to track it without creating a new worktree. Don't
+      // pass `result.name` — for existing-branch mode it's the raw branch
+      // name (may contain `/`), and the daemon derives a safe workspace
+      // name from the branch when `name` is omitted.
+      await adoptWorkspace(repo, result.adoptPath);
+    } else {
+      await createWorkspace(repo, result.name, result.mode, result.branch);
+    }
     sidebar.refresh();
   } catch (err) {
     alert(`Failed to create workspace: ${err}`);

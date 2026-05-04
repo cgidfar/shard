@@ -18,7 +18,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// v7 adds `InstallHarnessHooks` (type bytes 0xAA–0xAB) for Phase 5.
 /// v8 removes the unused `DetachSession` control frames; type bytes
 /// 0xA6–0xA7 remain reserved.
-pub const PROTOCOL_VERSION: u16 = 8;
+/// v9 adds `AdoptWorkspace` (type bytes 0xAC–0xAD), appends `is_external`
+/// to the `Workspace` wire layout, and adds `external_path` to
+/// `BranchInfo` (SHA-50: track external worktrees).
+pub const PROTOCOL_VERSION: u16 = 9;
 
 /// Maximum accepted daemon control frame size, including the type byte.
 pub const MAX_CONTROL_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -228,6 +231,21 @@ pub enum ControlFrame {
     /// Daemon → Client: resolved session, tagged with its repo alias.
     FoundSession { repo: String, session: Session },
 
+    // --- Workspace Adopt (SHA-50) ---
+    /// Client → Daemon: adopt a pre-existing external git worktree into Shard
+    /// tracking. `path` must be a directory that is already a registered,
+    /// non-prunable worktree of the repo. The daemon writes a row with
+    /// `is_external=1` so subsequent removes only untrack — they never delete
+    /// the directory or git admin entry. Local repos only in v1.
+    AdoptWorkspace {
+        repo: String,
+        path: String,
+        name: Option<String>,
+    },
+
+    /// Daemon → Client: adopt succeeded; returns the persisted row.
+    AdoptWorkspaceAck { workspace: Workspace },
+
     // --- Harness Hooks (Phase 5 of daemon-broker migration) ---
     /// Client → Daemon: install hook integration for `harness` (currently
     /// `"claude-code"` or `"codex"`). Centralizes today's best-effort
@@ -303,6 +321,8 @@ const TYPE_FIND_SESSION_BY_ID: u8 = 0xA8;
 const TYPE_FOUND_SESSION: u8 = 0xA9;
 const TYPE_INSTALL_HARNESS_HOOKS: u8 = 0xAA;
 const TYPE_INSTALL_HARNESS_HOOKS_ACK: u8 = 0xAB;
+const TYPE_ADOPT_WORKSPACE: u8 = 0xAC;
+const TYPE_ADOPT_WORKSPACE_ACK: u8 = 0xAD;
 
 // WorkspaceMode wire tag
 const MODE_NEW_BRANCH: u8 = 0;
@@ -476,6 +496,7 @@ pub async fn write_control_frame<W: AsyncWrite + Unpin>(
                 write_str(&mut payload, &b.name)?;
                 payload.push(if b.is_head { 1 } else { 0 });
                 write_opt_str(&mut payload, b.checked_out_by.as_deref())?;
+                write_opt_str(&mut payload, b.external_path.as_deref())?;
             }
             TYPE_BRANCH_INFO_LIST
         }
@@ -539,6 +560,16 @@ pub async fn write_control_frame<W: AsyncWrite + Unpin>(
             payload.push(if *installed { 1 } else { 0 });
             write_opt_str(&mut payload, skipped_reason.as_deref())?;
             TYPE_INSTALL_HARNESS_HOOKS_ACK
+        }
+        ControlFrame::AdoptWorkspace { repo, path, name } => {
+            write_str(&mut payload, repo)?;
+            write_str(&mut payload, path)?;
+            write_opt_str(&mut payload, name.as_deref())?;
+            TYPE_ADOPT_WORKSPACE
+        }
+        ControlFrame::AdoptWorkspaceAck { workspace } => {
+            write_workspace(&mut payload, workspace)?;
+            TYPE_ADOPT_WORKSPACE_ACK
         }
         ControlFrame::Error { message } => {
             write_str(&mut payload, message)?;
@@ -824,10 +855,13 @@ pub async fn read_control_frame<R: AsyncRead + Unpin>(
                 offset += 1;
                 let (checked_out_by, n) = read_opt_str(&payload[offset..])?;
                 offset += n;
+                let (external_path, n) = read_opt_str(&payload[offset..])?;
+                offset += n;
                 branches.push(BranchInfo {
                     name,
                     is_head,
                     checked_out_by,
+                    external_path,
                 });
             }
             (ControlFrame::BranchInfoList { branches }, offset)
@@ -905,6 +939,20 @@ pub async fn read_control_frame<R: AsyncRead + Unpin>(
                 },
                 1 + n,
             )
+        }
+        TYPE_ADOPT_WORKSPACE => {
+            let mut offset = 0;
+            let (repo, n) = read_str(&payload[offset..])?;
+            offset += n;
+            let (path, n) = read_str(&payload[offset..])?;
+            offset += n;
+            let (name, n) = read_opt_str(&payload[offset..])?;
+            offset += n;
+            (ControlFrame::AdoptWorkspace { repo, path, name }, offset)
+        }
+        TYPE_ADOPT_WORKSPACE_ACK => {
+            let (workspace, n) = read_workspace(payload)?;
+            (ControlFrame::AdoptWorkspaceAck { workspace }, n)
         }
         TYPE_ERROR => {
             let (message, n) = read_str(payload)?;
@@ -1009,7 +1057,7 @@ fn read_workspace_status(buf: &[u8]) -> std::io::Result<(WorkspaceStatus, usize)
 // --- Workspace + BranchInfo + WorkspaceMode wire encoding ---
 //
 // Layout for Workspace:
-//   [name str][branch str][path str][is_base u8][created_at u64]
+//   [name str][branch str][path str][is_base u8][is_external u8][created_at u64]
 //
 // Option<String> is encoded with a 1-byte tag (0 = None, 1 = Some) followed by
 // a length-prefixed string in the Some case.
@@ -1058,6 +1106,7 @@ fn write_workspace(buf: &mut Vec<u8>, ws: &Workspace) -> std::io::Result<()> {
     write_str(buf, &ws.branch)?;
     write_str(buf, &ws.path)?;
     buf.push(if ws.is_base { 1 } else { 0 });
+    buf.push(if ws.is_external { 1 } else { 0 });
     buf.extend_from_slice(&ws.created_at.to_be_bytes());
     Ok(())
 }
@@ -1070,8 +1119,14 @@ fn read_workspace(buf: &[u8]) -> std::io::Result<(Workspace, usize)> {
     offset += n;
     let (path, n) = read_str(&buf[offset..])?;
     offset += n;
-    ensure_len(&buf[offset..], 9, "Workspace is_base + created_at")?;
+    ensure_len(
+        &buf[offset..],
+        10,
+        "Workspace is_base + is_external + created_at",
+    )?;
     let is_base = read_bool_flag(buf[offset], "Workspace is_base")?;
+    offset += 1;
+    let is_external = read_bool_flag(buf[offset], "Workspace is_external")?;
     offset += 1;
     let created_at = u64::from_be_bytes(buf[offset..offset + 8].try_into().unwrap());
     offset += 8;
@@ -1081,6 +1136,7 @@ fn read_workspace(buf: &[u8]) -> std::io::Result<(Workspace, usize)> {
             branch,
             path,
             is_base,
+            is_external,
             created_at,
         },
         offset,
@@ -1777,6 +1833,7 @@ mod tests {
             branch: format!("branch-{name}"),
             path: format!(r"C:\tmp\{name}"),
             is_base,
+            is_external: false,
             created_at: 1_700_000_000,
         }
     }
@@ -1871,11 +1928,19 @@ mod tests {
                     name: "main".to_string(),
                     is_head: true,
                     checked_out_by: None,
+                    external_path: None,
                 },
                 BranchInfo {
                     name: "feature".to_string(),
                     is_head: false,
                     checked_out_by: Some("feature-workspace".to_string()),
+                    external_path: None,
+                },
+                BranchInfo {
+                    name: "external-feat".to_string(),
+                    is_head: false,
+                    checked_out_by: Some("(external: external-feat)".to_string()),
+                    external_path: Some(r"D:\elsewhere\external-feat".to_string()),
                 },
             ],
         };
@@ -2153,6 +2218,41 @@ mod tests {
         let frame = ControlFrame::InstallHarnessHooksAck {
             installed: false,
             skipped_reason: Some("claude code not installed".to_string()),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_adopt_workspace_full() {
+        let frame = ControlFrame::AdoptWorkspace {
+            repo: "demo".to_string(),
+            path: r"D:\elsewhere\feat-x".to_string(),
+            name: Some("feat-x".to_string()),
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_adopt_workspace_default_name() {
+        let frame = ControlFrame::AdoptWorkspace {
+            repo: "demo".to_string(),
+            path: r"D:\elsewhere\feat-x".to_string(),
+            name: None,
+        };
+        assert_eq!(roundtrip(frame.clone()).await, frame);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_adopt_workspace_ack() {
+        let frame = ControlFrame::AdoptWorkspaceAck {
+            workspace: Workspace {
+                name: "feat-x".to_string(),
+                branch: "feat-x".to_string(),
+                path: r"D:\elsewhere\feat-x".to_string(),
+                is_base: false,
+                is_external: true,
+                created_at: 1_700_000_321,
+            },
         };
         assert_eq!(roundtrip(frame.clone()).await, frame);
     }

@@ -118,10 +118,9 @@ impl RepositoryStore {
             git::clone_bare(url, &source_dir)?;
         }
 
-        // Initialize repo.db for this repo
+        // Initialize repo.db for this repo (open_repo_db runs migrations).
         let repo_db_path = self.paths.repo_db(&alias);
-        let repo_conn = db::open_connection(&repo_db_path)?;
-        db::init_repo_db(&repo_conn)?;
+        let _repo_conn = db::open_repo_db(&repo_db_path)?;
 
         // Insert into index
         let id = uuid::Uuid::now_v7().to_string();
@@ -222,7 +221,11 @@ impl RepositoryStore {
             let ws_store = crate::workspaces::WorkspaceStore::new(self.paths.clone());
             let workspaces = ws_store.list(alias)?;
             for ws in workspaces {
-                if !ws.is_base {
+                // Skip externally-adopted worktrees: Shard didn't create the
+                // directory, so it must not delete it on repo teardown. The
+                // DB row is still cleared (the entire repo dir gets removed
+                // below, taking repo.db with it).
+                if !ws.is_base && !ws.is_external {
                     let ws_dir = std::path::PathBuf::from(&ws.path);
                     ensure_managed_local_workspace_path(local_path, &ws_dir)?;
                     if ws_dir.exists() {
