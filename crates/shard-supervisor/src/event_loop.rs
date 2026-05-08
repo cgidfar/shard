@@ -186,14 +186,36 @@ pub async fn run(
                 // Replay log from resume_offset to current position, streamed
                 // from disk in small chunks to avoid loading the entire file
                 // into memory and to keep IPC messages small.
+                //
+                // A long-lived session can produce hundreds of MB of PTY
+                // output. The frontend's `attach_session` always sends
+                // `last_seen_offset = 0`, so without a cap every reconnect
+                // would replay the entire log. That floods the named pipe
+                // and any single mid-replay disconnect (e.g. WebView2 IPC
+                // restart after system sleep) wedges the client. Cap the
+                // window to MAX_REPLAY_BYTES of recent history; this is
+                // safe because the frontend's TerminalOutput handler
+                // ignores `offset` and feeds bytes straight into xterm.js,
+                // and live frames after the snapshot still chain offsets
+                // gap-free from the supervisor's byte_offset counter.
                 let live_offset = current_offset.load(std::sync::atomic::Ordering::Relaxed);
-                if resume_offset < live_offset {
-                    const REPLAY_CHUNK: usize = 4096;
+                const REPLAY_CHUNK: usize = 4096;
+                const MAX_REPLAY_BYTES: u64 = 1024 * 1024;
+                let capped_start = std::cmp::max(
+                    resume_offset,
+                    live_offset.saturating_sub(MAX_REPLAY_BYTES),
+                );
+                if capped_start < live_offset {
                     match std::fs::File::open(&*log_for_replay) {
                         Ok(mut file) => {
-                            let start = resume_offset as u64;
                             let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
                             let end = std::cmp::min(live_offset, file_len);
+                            // Re-cap against file_len in case the on-disk
+                            // log is shorter than the in-memory counter.
+                            let start = std::cmp::max(
+                                capped_start,
+                                end.saturating_sub(MAX_REPLAY_BYTES),
+                            );
                             if start < end {
                                 if let Err(e) = file.seek(std::io::SeekFrom::Start(start)) {
                                     tracing::warn!("replay seek failed: {e}");

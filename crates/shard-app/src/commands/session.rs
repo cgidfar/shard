@@ -392,7 +392,17 @@ pub async fn attach_session(
         loop {
             match protocol::read_frame(&mut reader).await {
                 Ok(Some(Frame::TerminalOutput { data, .. })) => {
-                    if channel.send(Response::new(data)).is_err() {
+                    if let Err(e) = channel.send(Response::new(data)) {
+                        // The frontend channel was dropped — usually because
+                        // the WebView IPC bus rejected backpressure mid-blast
+                        // (large `Resume` replay over a slow consumer). Log
+                        // so this isn't silent next time.
+                        tracing::warn!(
+                            "attach channel send failed for session {session_id}: {e}"
+                        );
+                        if terminal_status.is_none() {
+                            terminal_status = Some(("failed", 255));
+                        }
                         break;
                     }
                 }
