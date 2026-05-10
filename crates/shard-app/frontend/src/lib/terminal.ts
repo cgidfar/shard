@@ -8,6 +8,7 @@ import {
   writeToSession,
   resizeSession,
   detachSession,
+  notifySessionTitle,
   parseOwnedByError,
 } from "./api";
 import { formatOscTitle } from "./titleFormat";
@@ -154,13 +155,19 @@ export function createTerminalSession(
 
   fitAddon.fit();
 
-  // Forward OSC title changes (e.g. shell sets CWD as window title)
-  if (options.onTitleChange) {
-    terminal.onTitleChange((raw) => {
-      const formatted = formatOscTitle(raw);
-      if (formatted) options.onTitleChange!(formatted);
-    });
-  }
+  // Forward OSC title changes (e.g. shell sets CWD as window title). The
+  // local callback updates this window's sidebar/breadcrumb immediately;
+  // the backend notify call mirrors the title to every other window so
+  // sidebars stay in sync regardless of which window has the terminal
+  // mounted.
+  terminal.onTitleChange((raw) => {
+    const formatted = formatOscTitle(raw);
+    if (!formatted) return;
+    options.onTitleChange?.(formatted);
+    void notifySessionTitle(sessionId, formatted).catch((err) =>
+      console.warn(`notify_session_title(${sessionId}) failed:`, err),
+    );
+  });
 
   // Set up data channel from backend (binary transfer via Tauri Response)
   const channel = new Channel<ArrayBuffer>();

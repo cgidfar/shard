@@ -44,6 +44,32 @@ pub struct SessionInputStateEvent {
     pub owner_client_id: Option<u64>,
 }
 
+#[derive(Clone, serde::Serialize)]
+struct SessionTitleChangedEvent {
+    id: String,
+    title: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct SessionTitleEntry {
+    pub id: String,
+    pub title: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct SessionActivityEntry {
+    pub id: String,
+    pub state: &'static str,
+}
+
+fn activity_state_str(s: ActivityState) -> &'static str {
+    match s {
+        ActivityState::Active => "active",
+        ActivityState::Idle => "idle",
+        ActivityState::Blocked => "blocked",
+    }
+}
+
 fn owner_kind_str(k: ClientKind) -> &'static str {
     match k {
         ClientKind::GuiWindow => "gui",
@@ -82,11 +108,14 @@ async fn record_and_emit_input_state(
 async fn handle_supervisor_frame(app: &tauri::AppHandle, session_id: &str, frame: &Frame) -> bool {
     match frame {
         Frame::ActivityUpdate { state } => {
-            let state_str = match state {
-                ActivityState::Active => "active",
-                ActivityState::Idle => "idle",
-                ActivityState::Blocked => "blocked",
-            };
+            let state_str = activity_state_str(*state);
+            // Cache so windows opened later can hydrate without waiting for
+            // the next ActivityUpdate.
+            app.state::<AppState>()
+                .activity_states
+                .lock()
+                .await
+                .insert(session_id.to_string(), *state);
             let _ = app.emit(
                 "session-activity",
                 SessionActivityEvent {
@@ -113,11 +142,10 @@ async fn handle_supervisor_frame(app: &tauri::AppHandle, session_id: &str, frame
                     let _ = store.update_status(&repo, session_id, status, Some(*code as i32));
                 }
             }
-            app.state::<AppState>()
-                .input_owners
-                .lock()
-                .await
-                .remove(session_id);
+            let app_state = app.state::<AppState>();
+            app_state.input_owners.lock().await.remove(session_id);
+            app_state.dynamic_titles.lock().await.remove(session_id);
+            app_state.activity_states.lock().await.remove(session_id);
             let _ = app.emit("sidebar-changed", ());
             true
         }
@@ -137,6 +165,55 @@ pub async fn list_session_input_owners(
             owner_label: owner.as_ref().map(|o| o.label.clone()),
             owner_kind: owner.as_ref().map(|o| owner_kind_str(o.kind)),
             owner_client_id: owner.as_ref().map(|o| o.client_id),
+        })
+        .collect())
+}
+
+/// Record an OSC terminal title observed by one window's xterm.js and
+/// broadcast it to every window so their sidebars stay in sync. The cache
+/// also lets newly opened windows hydrate via `list_session_titles`.
+#[tauri::command]
+pub async fn notify_session_title(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+    title: String,
+) -> Result<(), String> {
+    {
+        let mut titles = state.dynamic_titles.lock().await;
+        match titles.get(&id) {
+            Some(existing) if existing == &title => return Ok(()),
+            _ => titles.insert(id.clone(), title.clone()),
+        };
+    }
+    let _ = app.emit("session-title-changed", SessionTitleChangedEvent { id, title });
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn list_session_titles(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<SessionTitleEntry>, String> {
+    let titles = state.dynamic_titles.lock().await;
+    Ok(titles
+        .iter()
+        .map(|(id, title)| SessionTitleEntry {
+            id: id.clone(),
+            title: title.clone(),
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn list_session_activities(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<SessionActivityEntry>, String> {
+    let activities = state.activity_states.lock().await;
+    Ok(activities
+        .iter()
+        .map(|(id, s)| SessionActivityEntry {
+            id: id.clone(),
+            state: activity_state_str(*s),
         })
         .collect())
 }

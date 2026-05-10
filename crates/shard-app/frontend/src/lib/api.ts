@@ -219,6 +219,30 @@ export function listSessionInputOwners(): Promise<SessionInputState[]> {
   return invoke("list_session_input_owners");
 }
 
+export interface SessionTitleEntry {
+  id: string;
+  title: string;
+}
+
+export interface SessionActivityEntry {
+  id: string;
+  state: "active" | "idle" | "blocked";
+}
+
+/** Tell the backend an OSC terminal title changed. The backend caches it
+ *  and rebroadcasts as `session-title-changed` to every window. */
+export function notifySessionTitle(id: string, title: string): Promise<void> {
+  return invoke("notify_session_title", { id, title });
+}
+
+export function listSessionTitles(): Promise<SessionTitleEntry[]> {
+  return invoke("list_session_titles");
+}
+
+export function listSessionActivities(): Promise<SessionActivityEntry[]> {
+  return invoke("list_session_activities");
+}
+
 export function writeToSession(id: string, data: Uint8Array): Promise<void> {
   return invoke("write_to_session", {
     id,

@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use shard_core::state::RepoState;
-use shard_transport::protocol::OwnerSummary;
+use shard_transport::protocol::{ActivityState, OwnerSummary};
 use tokio::io::WriteHalf;
 use tokio::net::windows::named_pipe::NamedPipeClient;
 use tokio::sync::Mutex;
@@ -71,6 +71,17 @@ pub struct AppState {
     /// lets newly opened windows hydrate their sidebar state without
     /// waiting for the next ownership transition.
     pub input_owners: Mutex<HashMap<String, Option<OwnerSummary>>>,
+    /// Latest OSC terminal title broadcast for each session. Populated by
+    /// `notify_session_title` whenever any window's xterm.js parses an
+    /// OSC title change, so windows that don't have the terminal mounted
+    /// (and newly opened windows) can show the same dynamic label without
+    /// needing to attach. Cleared when the session ends.
+    pub dynamic_titles: Mutex<HashMap<String, String>>,
+    /// Latest supervisor-reported activity state per session. Populated by
+    /// `handle_supervisor_frame` so newly opened windows can hydrate their
+    /// activity indicators without waiting for the next ActivityUpdate.
+    /// Cleared when the session ends.
+    pub activity_states: Mutex<HashMap<String, ActivityState>>,
     /// Last-known `RepoState` per alias, populated by the daemon-subscribe
     /// task in `daemon_ipc::run_state_subscriber`.
     pub repo_states: Mutex<HashMap<String, RepoState>>,
@@ -86,6 +97,8 @@ impl AppState {
             attachments: Mutex::new(HashMap::new()),
             session_windows: Mutex::new(HashMap::new()),
             input_owners: Mutex::new(HashMap::new()),
+            dynamic_titles: Mutex::new(HashMap::new()),
+            activity_states: Mutex::new(HashMap::new()),
             repo_states: Mutex::new(HashMap::new()),
             next_window_id: AtomicU64::new(2), // 1 is reserved; first secondary window is "window-2"
         }

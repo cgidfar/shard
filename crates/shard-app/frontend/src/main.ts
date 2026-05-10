@@ -5,7 +5,7 @@ import { Sidebar } from "./components/Sidebar";
 import { TerminalPane } from "./components/TerminalPane";
 import { AddShardDialog } from "./components/AddShardDialog";
 import { AddWorkspaceDialog } from "./components/AddWorkspaceDialog";
-import { addRepo, adoptWorkspace, createSession, createWorkspace, focusSessionWindow, listRepos, listSessionInputOwners, openNewWindow, stopSession, removeSession, removeWorkspace, syncRepo, removeRepo, type WorkspaceStatus } from "./lib/api";
+import { addRepo, adoptWorkspace, createSession, createWorkspace, focusSessionWindow, listRepos, listSessionActivities, listSessionInputOwners, listSessionTitles, openNewWindow, stopSession, removeSession, removeWorkspace, syncRepo, removeRepo, type WorkspaceStatus } from "./lib/api";
 import { contextMenu, type MenuItemDef } from "./lib/ContextMenu";
 import { labelFromCommand } from "./lib/titleFormat";
 import { activityStore } from "./lib/activityStore";
@@ -173,6 +173,28 @@ function applySidebarOwnership(state: SessionInputStateEvent) {
 async function hydrateSidebarOwnership() {
   const states = await listSessionInputOwners();
   for (const state of states) applySidebarOwnership(state);
+}
+
+/**
+ * Hydrate cross-window state on a freshly opened window. The supervisor
+ * monitors broadcast `session-activity` and `session-title-changed` only
+ * on transitions; without this, a window opened mid-session would show a
+ * stale label and a missing activity dot until the next event.
+ *
+ * `windowState.label` need not match — these caches are process-global
+ * (one Tauri app, many windows), so every window hydrates from the same
+ * backend `AppState`.
+ */
+async function hydrateRuntimeState() {
+  const [titles, activities] = await Promise.all([
+    listSessionTitles(),
+    listSessionActivities(),
+  ]);
+  for (const { id, title } of titles) sidebar.notifyTitleChange(id, title);
+  for (const { id, state } of activities) {
+    const isFocused = id === terminalPane.getActiveId();
+    activityStore.notify(id, state, isFocused);
+  }
 }
 
 function openSession(repo: string, workspace: string, sessionId: string, sessionLabel: string) {
@@ -458,6 +480,7 @@ async function init() {
   terminalPane.showEmpty();
   await sidebar.refresh();
   await hydrateSidebarOwnership();
+  await hydrateRuntimeState();
 }
 
 init();
@@ -489,6 +512,21 @@ listen<{ repo: string; workspace: string; status: WorkspaceStatus | null }>(
 listen<{ id: string; state: "active" | "idle" | "blocked" }>("session-activity", ({ payload }) => {
   const isFocused = payload.id === terminalPane.getActiveId();
   activityStore.notify(payload.id, payload.state, isFocused);
+});
+
+// Cross-window OSC title relay. The window with the terminal mounted
+// parses titles from xterm.js and posts them to the backend, which
+// rebroadcasts to every window so sidebars stay in sync. The originating
+// window also receives this event but its sidebar was already patched
+// inline by the local TerminalPane callback — `notifyTitleChange` is
+// idempotent, so the duplicate paint is harmless.
+listen<{ id: string; title: string }>("session-title-changed", ({ payload }) => {
+  sidebar.notifyTitleChange(payload.id, payload.title);
+  if (payload.id === terminalPane.getActiveId() && currentBreadcrumb) {
+    const resolvedLabel = sidebar.resolveLabel(payload.id);
+    currentBreadcrumb = { ...currentBreadcrumb, session: resolvedLabel };
+    titleBar.setBreadcrumb(currentBreadcrumb);
+  }
 });
 
 // Global ownership listener. The terminal pane's local listener handles
