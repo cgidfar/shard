@@ -8,12 +8,14 @@ use shard_core::repos::RepositoryStore;
 use shard_core::sessions::{Session, SessionStore};
 use shard_core::workspaces::WorkspaceStore;
 use shard_core::{Harness, ShardPaths};
-use shard_transport::protocol::{self, ActivityState, Frame};
+use shard_transport::protocol::{self, ActivityState, ClientKind, Frame, OwnerSummary};
 use shard_transport::transport_windows::NamedPipeTransport;
 use shard_transport::SessionTransport;
 
+use std::sync::Arc;
+
 use crate::daemon_ipc;
-use crate::state::{AppState, ConnectionToken, SessionConnection, SessionWriter};
+use crate::state::{AppState, AttachmentHandle, ConnectionToken, MonitorHandle};
 
 #[derive(Clone, serde::Serialize)]
 pub struct SessionInfo {
@@ -34,16 +36,86 @@ struct TerminalEndedEvent {
     code: u8,
 }
 
-/// Handle ActivityUpdate and Status frames — shared by monitors and attach readers.
-/// Returns `true` if the caller should break its read loop (session ended).
-fn handle_supervisor_frame(app: &tauri::AppHandle, session_id: &str, frame: &Frame) -> bool {
+#[derive(Clone, serde::Serialize)]
+pub struct SessionInputStateEvent {
+    pub id: String,
+    pub owner_label: Option<String>,
+    pub owner_kind: Option<&'static str>,
+    pub owner_client_id: Option<u64>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct SessionTitleChangedEvent {
+    id: String,
+    title: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct SessionTitleEntry {
+    pub id: String,
+    pub title: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct SessionActivityEntry {
+    pub id: String,
+    pub state: &'static str,
+}
+
+fn activity_state_str(s: ActivityState) -> &'static str {
+    match s {
+        ActivityState::Active => "active",
+        ActivityState::Idle => "idle",
+        ActivityState::Blocked => "blocked",
+    }
+}
+
+fn owner_kind_str(k: ClientKind) -> &'static str {
+    match k {
+        ClientKind::GuiWindow => "gui",
+        ClientKind::CliAgent => "cli",
+        ClientKind::MonitorOnly => "monitor",
+    }
+}
+
+fn emit_input_state(app: &tauri::AppHandle, session_id: &str, owner: Option<&OwnerSummary>) {
+    let event = SessionInputStateEvent {
+        id: session_id.to_string(),
+        owner_label: owner.map(|o| o.label.clone()),
+        owner_kind: owner.map(|o| owner_kind_str(o.kind)),
+        owner_client_id: owner.map(|o| o.client_id),
+    };
+    let _ = app.emit("session-input-state", event);
+}
+
+async fn record_and_emit_input_state(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    owner: Option<&OwnerSummary>,
+) {
+    let state = app.state::<AppState>();
+    state
+        .input_owners
+        .lock()
+        .await
+        .insert(session_id.to_string(), owner.cloned());
+    emit_input_state(app, session_id, owner);
+}
+
+/// Handle ActivityUpdate / Status / InputOwnerChanged frames common to both
+/// monitors and attach readers. Returns `true` if the caller should break
+/// its read loop (session ended).
+async fn handle_supervisor_frame(app: &tauri::AppHandle, session_id: &str, frame: &Frame) -> bool {
     match frame {
         Frame::ActivityUpdate { state } => {
-            let state_str = match state {
-                ActivityState::Active => "active",
-                ActivityState::Idle => "idle",
-                ActivityState::Blocked => "blocked",
-            };
+            let state_str = activity_state_str(*state);
+            // Cache so windows opened later can hydrate without waiting for
+            // the next ActivityUpdate.
+            app.state::<AppState>()
+                .activity_states
+                .lock()
+                .await
+                .insert(session_id.to_string(), *state);
             let _ = app.emit(
                 "session-activity",
                 SessionActivityEvent {
@@ -51,6 +123,10 @@ fn handle_supervisor_frame(app: &tauri::AppHandle, session_id: &str, frame: &Fra
                     state: state_str,
                 },
             );
+            false
+        }
+        Frame::InputOwnerChanged { owner } => {
+            record_and_emit_input_state(app, session_id, owner.as_ref()).await;
             false
         }
         Frame::Status { code } => {
@@ -66,6 +142,10 @@ fn handle_supervisor_frame(app: &tauri::AppHandle, session_id: &str, frame: &Fra
                     let _ = store.update_status(&repo, session_id, status, Some(*code as i32));
                 }
             }
+            let app_state = app.state::<AppState>();
+            app_state.input_owners.lock().await.remove(session_id);
+            app_state.dynamic_titles.lock().await.remove(session_id);
+            app_state.activity_states.lock().await.remove(session_id);
             let _ = app.emit("sidebar-changed", ());
             true
         }
@@ -73,9 +153,74 @@ fn handle_supervisor_frame(app: &tauri::AppHandle, session_id: &str, frame: &Fra
     }
 }
 
-/// Start a lightweight monitor connection for a running session.
-/// The monitor discards terminal output but relays ActivityUpdate and Status
-/// frames as Tauri events. Returns the spawned task handle.
+#[tauri::command]
+pub async fn list_session_input_owners(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<SessionInputStateEvent>, String> {
+    let owners = state.input_owners.lock().await;
+    Ok(owners
+        .iter()
+        .map(|(id, owner)| SessionInputStateEvent {
+            id: id.clone(),
+            owner_label: owner.as_ref().map(|o| o.label.clone()),
+            owner_kind: owner.as_ref().map(|o| owner_kind_str(o.kind)),
+            owner_client_id: owner.as_ref().map(|o| o.client_id),
+        })
+        .collect())
+}
+
+/// Record an OSC terminal title observed by one window's xterm.js and
+/// broadcast it to every window so their sidebars stay in sync. The cache
+/// also lets newly opened windows hydrate via `list_session_titles`.
+#[tauri::command]
+pub async fn notify_session_title(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+    title: String,
+) -> Result<(), String> {
+    {
+        let mut titles = state.dynamic_titles.lock().await;
+        match titles.get(&id) {
+            Some(existing) if existing == &title => return Ok(()),
+            _ => titles.insert(id.clone(), title.clone()),
+        };
+    }
+    let _ = app.emit("session-title-changed", SessionTitleChangedEvent { id, title });
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn list_session_titles(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<SessionTitleEntry>, String> {
+    let titles = state.dynamic_titles.lock().await;
+    Ok(titles
+        .iter()
+        .map(|(id, title)| SessionTitleEntry {
+            id: id.clone(),
+            title: title.clone(),
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn list_session_activities(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<SessionActivityEntry>, String> {
+    let activities = state.activity_states.lock().await;
+    Ok(activities
+        .iter()
+        .map(|(id, s)| SessionActivityEntry {
+            id: id.clone(),
+            state: activity_state_str(*s),
+        })
+        .collect())
+}
+
+/// Start the process-global monitor connection for a session. Sends
+/// `Hello { kind: MonitorOnly }` + `Resume { u64::MAX }`, then relays
+/// activity / status / input-owner frames as Tauri events.
 pub fn start_monitor(
     app: tauri::AppHandle,
     session_id: String,
@@ -94,8 +239,26 @@ pub fn start_monitor(
         };
 
         let (mut reader, mut writer) = tokio::io::split(client);
+        let token = ConnectionToken::new();
 
-        // Send Resume with u64::MAX sentinel — skip replay, live-only
+        // Hello first (mandatory under SHA-21 protocol).
+        if protocol::write_frame(
+            &mut writer,
+            &Frame::Hello {
+                client_id: token.as_u64(),
+                kind: ClientKind::MonitorOnly,
+                label: "tauri:monitor".to_string(),
+            },
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
+
+        // u64::MAX still means "skip replay" — preserved for symmetry with
+        // the streaming-attach path, even though MonitorOnly already short-
+        // circuits replay supervisor-side.
         let _ = protocol::write_frame(
             &mut writer,
             &Frame::Resume {
@@ -107,8 +270,9 @@ pub fn start_monitor(
         loop {
             match protocol::read_frame(&mut reader).await {
                 Ok(Some(ref frame @ Frame::ActivityUpdate { .. }))
-                | Ok(Some(ref frame @ Frame::Status { .. })) => {
-                    if handle_supervisor_frame(&app, &session_id, frame) {
+                | Ok(Some(ref frame @ Frame::Status { .. }))
+                | Ok(Some(ref frame @ Frame::InputOwnerChanged { .. })) => {
+                    if handle_supervisor_frame(&app, &session_id, frame).await {
                         break;
                     }
                 }
@@ -181,16 +345,6 @@ pub fn create_session(
 
     let command = command.unwrap_or_else(default_command);
 
-    // Route through daemon. Harness-hook installation is a separate
-    // RPC so the read-modify-write on `~/.claude/settings.json` is
-    // serialized across CLI and GUI spawns (Phase 5).
-    //
-    // We always request the Claude Code installer regardless of the
-    // session's selected harness — the RPC's `harness` arg is the
-    // install target, not the session's harness. This preserves the
-    // pre-Phase-5 opportunistic-install behavior where Codex sessions
-    // still get Claude hooks bootstrapped. Changing that is a UX
-    // decision, not a plumbing change.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -272,21 +426,20 @@ pub fn create_session(
         }
     })?;
 
-    // Drop runtime before blocking_lock to avoid deadlock
     drop(rt);
 
-    // Read back the full session record from DB
     let session_store = SessionStore::new(ShardPaths::new().map_err(|e| e.to_string())?);
     let result = session_store
         .get(&repo, &session_id)
         .map_err(|e| e.to_string())?;
 
-    // Start a monitor for the new session so sidebar gets activity updates
+    // Start the process-global monitor for the new session so every window
+    // sees activity / status / ownership updates without being attached.
     let task = start_monitor(app.clone(), session_id.clone(), transport_addr);
     {
         let state: tauri::State<'_, AppState> = app.state();
-        let mut conns = state.connections.blocking_lock();
-        conns.insert(session_id.clone(), SessionConnection::Monitored { task });
+        let mut monitors = state.monitors.blocking_lock();
+        monitors.insert(session_id.clone(), MonitorHandle { task });
     }
 
     let _ = app.emit("sidebar-changed", ());
@@ -300,24 +453,36 @@ pub async fn stop_session(
     force: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    // Route through the daemon's `StopSession` RPC so the daemon can drain
-    // the supervisor, clear its live-registry entry, and write the DB
-    // status in one workflow. The previous direct-pipe path hit SHA-43
-    // (supervisor silently discards stop frames sent as the first frame)
-    // and left the daemon's in-memory registry populated, which then
-    // caused `RemoveSession` to reject with "still live — stop it first".
     let (_repo, session) = daemon_ipc::find_session_by_id(&id).await?;
 
     if session.status != "running" && session.status != "starting" {
         return Ok(());
     }
 
-    // Abort any existing monitor/attach task before sending the stop so
-    // the daemon's drain doesn't race the Tauri reader on the same pipe.
+    // Abort everything tracking this session in this process before the
+    // daemon's drain runs — every attachment across every window, plus the
+    // monitor.
     {
-        let mut conns = state.connections.lock().await;
-        if let Some(conn) = conns.remove(&id) {
-            conn.abort();
+        let mut attachments = state.attachments.lock().await;
+        let keys_to_remove: Vec<(String, String)> = attachments
+            .keys()
+            .filter(|(_w, sid)| sid == &id)
+            .cloned()
+            .collect();
+        for key in keys_to_remove {
+            if let Some(handle) = attachments.remove(&key) {
+                handle.task.abort();
+            }
+        }
+    }
+    {
+        let mut session_windows = state.session_windows.lock().await;
+        session_windows.remove(&id);
+    }
+    {
+        let mut monitors = state.monitors.lock().await;
+        if let Some(handle) = monitors.remove(&id) {
+            handle.task.abort();
         }
     }
 
@@ -334,13 +499,69 @@ pub async fn remove_session(app: tauri::AppHandle, id: String) -> Result<(), Str
     Ok(())
 }
 
+async fn await_claim_confirmation<R: tokio::io::AsyncRead + Unpin>(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    reader: &mut R,
+    channel: &Channel<Response>,
+    client_id: u64,
+) -> Result<(), String> {
+    let wait = async {
+        loop {
+            match protocol::read_frame(reader).await {
+                Ok(Some(Frame::TerminalOutput { data, .. })) => {
+                    channel
+                        .send(Response::new(data))
+                        .map_err(|e| format!("attach channel send failed: {e}"))?;
+                }
+                Ok(Some(ref frame @ Frame::ActivityUpdate { .. })) => {
+                    handle_supervisor_frame(app, session_id, frame).await;
+                }
+                Ok(Some(ref frame @ Frame::InputOwnerChanged { ref owner })) => {
+                    handle_supervisor_frame(app, session_id, frame).await;
+                    if matches!(owner, Some(o) if o.client_id == client_id) {
+                        return Ok(());
+                    }
+                }
+                Ok(Some(Frame::ClaimRejected { owner })) => {
+                    record_and_emit_input_state(app, session_id, owner.as_ref()).await;
+                    return match owner {
+                        Some(o) if o.kind == ClientKind::GuiWindow => {
+                            Err(format!("owned-by:{}", o.label))
+                        }
+                        Some(o) => Err(format!(
+                            "input owned by {} client '{}'",
+                            owner_kind_str(o.kind),
+                            o.label
+                        )),
+                        None => Err("input claim rejected".to_string()),
+                    };
+                }
+                Ok(Some(ref frame @ Frame::Status { .. })) => {
+                    handle_supervisor_frame(app, session_id, frame).await;
+                    return Err("session ended while attaching".to_string());
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => return Err("session pipe closed while attaching".to_string()),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    };
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+        .await
+        .map_err(|_| "timed out waiting for input ownership".to_string())?
+}
+
 #[tauri::command]
 pub async fn attach_session(
     app: tauri::AppHandle,
+    window: tauri::Window,
     id: String,
     channel: Channel<Response>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    let window_label = window.label().to_string();
     let (_repo, session) = daemon_ipc::find_session_by_id(&id).await?;
 
     if session.status != "running" {
@@ -350,28 +571,43 @@ pub async fn attach_session(
         ));
     }
 
-    // Abort existing monitor if present — we're taking over the connection
+    // Re-attach within the same window: tear down the old reader. The
+    // process-global monitor is left alone — it does not conflict with
+    // window attachments and aborting it here would race the start-monitor
+    // path on stop_session.
     {
-        let mut conns = state.connections.lock().await;
-        if let Some(conn) = conns.remove(&id) {
-            conn.abort();
+        let mut attachments = state.attachments.lock().await;
+        if let Some(prev) = attachments.remove(&(window_label.clone(), id.clone())) {
+            prev.task.abort();
         }
     }
 
     let client = match NamedPipeTransport::connect(&session.transport_addr).await {
         Ok(client) => client,
-        Err(e) => {
-            restore_monitor_if_absent(&app, &state, id.clone(), session.transport_addr.clone())
-                .await;
-            return Err(e.to_string());
-        }
+        Err(e) => return Err(e.to_string()),
     };
 
     let (mut reader, writer) = tokio::io::split(client);
     let token = ConnectionToken::new();
+    let client_id = token.as_u64();
 
-    // Send Resume frame
+    // Hello → Resume → ClaimInput. The supervisor is the single authority
+    // for cross-window ownership, so we wait for either an owner broadcast
+    // that names this connection or a ClaimRejected response before
+    // returning success to the frontend.
     let mut writer = writer;
+    if let Err(e) = protocol::write_frame(
+        &mut writer,
+        &Frame::Hello {
+            client_id,
+            kind: ClientKind::GuiWindow,
+            label: window_label.clone(),
+        },
+    )
+    .await
+    {
+        return Err(e.to_string());
+    }
     if let Err(e) = protocol::write_frame(
         &mut writer,
         &Frame::Resume {
@@ -380,26 +616,25 @@ pub async fn attach_session(
     )
     .await
     {
-        restore_monitor_if_absent(&app, &state, id.clone(), session.transport_addr.clone()).await;
         return Err(e.to_string());
     }
+    if let Err(e) = protocol::write_frame(&mut writer, &Frame::ClaimInput).await {
+        return Err(e.to_string());
+    }
+    await_claim_confirmation(&app, &id, &mut reader, &channel, client_id).await?;
 
-    // Spawn reader task that forwards terminal output AND relays activity/status events
+    let shared_writer: crate::state::SharedSessionWriter =
+        Arc::new(tokio::sync::Mutex::new(writer));
     let session_id = id.clone();
     let app_clone = app.clone();
+    let window_label_for_task = window_label.clone();
     let task = tauri::async_runtime::spawn(async move {
         let mut terminal_status: Option<(&'static str, u8)> = None;
         loop {
             match protocol::read_frame(&mut reader).await {
                 Ok(Some(Frame::TerminalOutput { data, .. })) => {
                     if let Err(e) = channel.send(Response::new(data)) {
-                        // The frontend channel was dropped — usually because
-                        // the WebView IPC bus rejected backpressure mid-blast
-                        // (large `Resume` replay over a slow consumer). Log
-                        // so this isn't silent next time.
-                        tracing::warn!(
-                            "attach channel send failed for session {session_id}: {e}"
-                        );
+                        tracing::warn!("attach channel send failed for session {session_id}: {e}");
                         if terminal_status.is_none() {
                             terminal_status = Some(("failed", 255));
                         }
@@ -407,7 +642,10 @@ pub async fn attach_session(
                     }
                 }
                 Ok(Some(ref frame @ Frame::ActivityUpdate { .. })) => {
-                    handle_supervisor_frame(&app_clone, &session_id, frame);
+                    handle_supervisor_frame(&app_clone, &session_id, frame).await;
+                }
+                Ok(Some(ref frame @ Frame::InputOwnerChanged { .. })) => {
+                    handle_supervisor_frame(&app_clone, &session_id, frame).await;
                 }
                 Ok(Some(ref frame @ Frame::Status { .. })) => {
                     if let Frame::Status { code } = frame {
@@ -418,8 +656,7 @@ pub async fn attach_session(
                         };
                         terminal_status = Some((status, *code));
                     }
-                    handle_supervisor_frame(&app_clone, &session_id, frame);
-                    // Drain any trailing TerminalOutput (defensive)
+                    handle_supervisor_frame(&app_clone, &session_id, frame).await;
                     let deadline =
                         tokio::time::Instant::now() + std::time::Duration::from_millis(500);
                     while let Ok(Ok(Some(Frame::TerminalOutput { data, .. }))) =
@@ -454,94 +691,100 @@ pub async fn attach_session(
                 },
             );
         }
+        // Self-cleanup. Use the token to guard against an interleaved
+        // re-attach having already replaced this entry.
         let state = app_clone.state::<AppState>();
-        let mut conns = state.connections.lock().await;
-        let should_remove = matches!(
-            conns.get(&session_id),
-            Some(SessionConnection::Attached {
-                token: current, ..
-            }) if *current == token
-        );
-        if should_remove {
-            conns.remove(&session_id);
+        {
+            let mut attachments = state.attachments.lock().await;
+            let key = (window_label_for_task.clone(), session_id.clone());
+            let should_remove = matches!(
+                attachments.get(&key),
+                Some(handle) if handle.token == token
+            );
+            if should_remove {
+                attachments.remove(&key);
+            }
         }
-        tracing::debug!("attach reader ended for session {session_id}");
+        {
+            let mut session_windows = state.session_windows.lock().await;
+            if matches!(session_windows.get(&session_id), Some(w) if w == &window_label_for_task) {
+                session_windows.remove(&session_id);
+            }
+        }
+        tracing::debug!("attach reader ended for {window_label_for_task}/{session_id}");
     });
 
-    // Store writer + reader task as Attached connection
     {
-        let mut conns = state.connections.lock().await;
-        match conns.entry(id) {
+        let mut attachments = state.attachments.lock().await;
+        match attachments.entry((window_label.clone(), id.clone())) {
             Entry::Vacant(entry) => {
-                entry.insert(SessionConnection::Attached {
+                entry.insert(AttachmentHandle {
                     token,
-                    writer: SessionWriter { writer },
+                    writer: shared_writer,
                     task,
+                    client_id,
                 });
             }
             Entry::Occupied(_) => {
                 task.abort();
-                return Err("session connection changed while attaching".into());
+                return Err("attachment changed while attaching".into());
             }
         }
+    }
+    {
+        let mut session_windows = state.session_windows.lock().await;
+        session_windows.insert(id, window_label);
     }
 
     Ok(())
 }
 
-async fn restore_monitor_if_absent(
-    app: &tauri::AppHandle,
-    state: &tauri::State<'_, AppState>,
-    id: String,
-    transport_addr: String,
-) {
-    let task = start_monitor(app.clone(), id.clone(), transport_addr);
-    let mut conns = state.connections.lock().await;
-    match conns.entry(id) {
-        Entry::Vacant(entry) => {
-            entry.insert(SessionConnection::Monitored { task });
-        }
-        Entry::Occupied(_) => task.abort(),
-    }
-}
-
 #[tauri::command]
 pub async fn write_to_session(
+    window: tauri::Window,
     id: String,
     data: Vec<u8>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let mut conns = state.connections.lock().await;
-    let conn = conns.get_mut(&id).ok_or("session not attached")?;
-
-    let writer = match conn {
-        SessionConnection::Attached { ref mut writer, .. } => &mut writer.writer,
-        SessionConnection::Monitored { .. } => return Err("session not attached".into()),
+    let window_label = window.label().to_string();
+    // Clone the Arc out from under the attachments lock so the lock is
+    // released before we await the pipe write — otherwise a slow / blocked
+    // pipe would freeze every other session command.
+    let writer = {
+        let attachments = state.attachments.lock().await;
+        attachments
+            .get(&(window_label, id))
+            .ok_or("session not attached in this window")?
+            .writer
+            .clone()
     };
-
+    let mut w = writer.lock().await;
     let frame = Frame::TerminalInput { data };
-    protocol::write_frame(writer, &frame)
+    protocol::write_frame(&mut *w, &frame)
         .await
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn resize_session(
+    window: tauri::Window,
     id: String,
     rows: u16,
     cols: u16,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let mut conns = state.connections.lock().await;
-    let conn = conns.get_mut(&id).ok_or("session not attached")?;
-
-    let writer = match conn {
-        SessionConnection::Attached { ref mut writer, .. } => &mut writer.writer,
-        SessionConnection::Monitored { .. } => return Err("session not attached".into()),
+    let window_label = window.label().to_string();
+    let writer = {
+        let attachments = state.attachments.lock().await;
+        attachments
+            .get(&(window_label, id))
+            .ok_or("session not attached in this window")?
+            .writer
+            .clone()
     };
-
+    let mut w = writer.lock().await;
     let frame = Frame::Resize { rows, cols };
-    protocol::write_frame(writer, &frame)
+    protocol::write_frame(&mut *w, &frame)
         .await
         .map_err(|e| e.to_string())
 }
@@ -561,35 +804,56 @@ pub async fn rename_session(
 #[tauri::command]
 pub async fn detach_session(
     app: tauri::AppHandle,
+    window: tauri::Window,
     id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    // Remove and abort existing connection
+    let window_label = window.label().to_string();
     {
-        let mut conns = state.connections.lock().await;
-        if let Some(conn) = conns.remove(&id) {
-            conn.abort();
+        let mut attachments = state.attachments.lock().await;
+        if let Some(handle) = attachments.remove(&(window_label.clone(), id.clone())) {
+            handle.task.abort();
         }
     }
-    // Lock released — safe to do IPC without blocking write_to_session/resize_session
+    {
+        let mut session_windows = state.session_windows.lock().await;
+        if matches!(session_windows.get(&id), Some(w) if w == &window_label) {
+            session_windows.remove(&id);
+        }
+    }
 
-    // Resolve through the daemon. The detach probe and the monitor-restart
-    // lookup are the same operation: a single FindSessionById tells us both
-    // whether the id is still valid and gives us the transport addr we'd
-    // need to re-monitor. Drop the redundant DetachSession probe — it
-    // returned the same answer find_session_by_id already gives us.
+    // If the session is still running and no monitor exists, restart one
+    // so the sidebar keeps getting activity / status updates.
     if let Ok((_repo, session)) = daemon_ipc::find_session_by_id(&id).await {
         if session.status == "running" {
-            let task = start_monitor(app, id.clone(), session.transport_addr);
-            let mut conns = state.connections.lock().await;
-            match conns.entry(id) {
-                Entry::Vacant(entry) => {
-                    entry.insert(SessionConnection::Monitored { task });
-                }
-                Entry::Occupied(_) => task.abort(),
+            let mut monitors = state.monitors.lock().await;
+            if !monitors.contains_key(&id) {
+                let task = start_monitor(app, id.clone(), session.transport_addr);
+                monitors.insert(id, MonitorHandle { task });
             }
         }
     }
 
     Ok(())
+}
+
+/// Release every attachment held by `window_label` (used by the per-window
+/// `CloseRequested` handler). Synchronous lock on `attachments` so the
+/// caller can run from a Tauri runtime callback that cannot await.
+pub fn release_attachments_for_window(state: &AppState, window_label: &str) {
+    {
+        let mut attachments = state.attachments.blocking_lock();
+        attachments.retain(|(w, _), handle| {
+            if w == window_label {
+                handle.task.abort();
+                false
+            } else {
+                true
+            }
+        });
+    }
+    state
+        .session_windows
+        .blocking_lock()
+        .retain(|_, owner| owner != window_label);
 }

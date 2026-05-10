@@ -43,6 +43,12 @@ export interface SidebarCallbacks {
   onRemoveWorkspace: (repo: string, workspace: string, sessionIds: string[]) => void;
   onAddShard: () => void;
   onLabelChanged?: (sessionId: string, label: string) => void;
+  /**
+   * Fires when the user clicks a session row that is currently attached
+   * in another window. The host should focus that owner and activate the
+   * session there rather than competing for input.
+   */
+  onSessionFocusElsewhere?: (sessionId: string, ownerWindowLabel: string) => void;
 }
 
 /** Paint a workspace row's primary label from its live `WorkspaceStatus`.
@@ -120,6 +126,10 @@ export class Sidebar {
   private pendingRefresh = false;
   private treeEl!: HTMLElement;
   private collapseAllBtn!: HTMLButtonElement;
+  /** Sessions currently held by another window. Value is the owner's
+   *  window label, used to redirect focus on click. Populated by the host
+   *  in response to `session-input-state` events. */
+  private ownedElsewhere: Map<string, string> = new Map();
 
   constructor(el: HTMLElement, callbacks: SidebarCallbacks) {
     this.el = el;
@@ -249,6 +259,22 @@ export class Sidebar {
     this.render();
   }
 
+  /**
+   * Mark / unmark a session as held by another window. Pass `null` to
+   * clear. Idempotent re-renders are cheap; called from the host's
+   * `session-input-state` listener.
+   */
+  setOwnedElsewhere(sessionId: string, ownerWindowLabel: string | null) {
+    const current = this.ownedElsewhere.get(sessionId) ?? null;
+    if (current === ownerWindowLabel) return;
+    if (ownerWindowLabel === null) {
+      this.ownedElsewhere.delete(sessionId);
+    } else {
+      this.ownedElsewhere.set(sessionId, ownerWindowLabel);
+    }
+    this.render();
+  }
+
   /** Patch a single workspace's live status without re-rendering the
    *  whole sidebar. Called by the daemon state subscriber on every
    *  `workspace-status-changed` event. Updates the in-memory tree so
@@ -286,6 +312,22 @@ export class Sidebar {
     const si = this.findSessionInfo(sessionId);
     if (!si) return "session";
     return this.resolveLabelForSession(si);
+  }
+
+  getSessionLocation(sessionId: string): {
+    repo: string;
+    workspace: string;
+    label: string;
+    status: string;
+  } | null {
+    const si = this.findSessionInfo(sessionId);
+    if (!si) return null;
+    return {
+      repo: si.repo,
+      workspace: si.session.workspace_name,
+      label: this.resolveLabelForSession(si),
+      status: si.session.status,
+    };
   }
 
   /** Notify that a terminal's OSC title has changed. */
@@ -584,10 +626,15 @@ export class Sidebar {
           const isActive = si.session.id === this.activeSessionId;
           const isConfirming = si.session.id === this.confirmingStopId;
           const isRenaming = si.session.id === this.renamingSessionId;
+          const ownedElsewhereLabel = this.ownedElsewhere.get(si.session.id) ?? null;
+          const isOwnedElsewhere = ownedElsewhereLabel !== null;
           const resolvedLabel = this.resolveLabelForSession(si);
 
           const sessionRow = document.createElement("div");
-          sessionRow.className = `tree-item tree-item-session${isActive ? " active" : ""}${isDead ? " dead" : ""}`;
+          sessionRow.className = `tree-item tree-item-session${isActive ? " active" : ""}${isDead ? " dead" : ""}${isOwnedElsewhere ? " owned-elsewhere" : ""}`;
+          if (isOwnedElsewhere) {
+            sessionRow.title = `Open in ${ownedElsewhereLabel} — click to focus`;
+          }
           sessionRow.dataset.repo = si.repo;
           sessionRow.dataset.workspace = workspace.name;
           sessionRow.dataset.sessionId = si.session.id;
@@ -686,6 +733,13 @@ export class Sidebar {
             sessionRow.style.cursor = "pointer";
             sessionRow.addEventListener("click", (e) => {
               if ((e.target as HTMLElement).closest(".tree-action")) return;
+              if (isOwnedElsewhere && ownedElsewhereLabel) {
+                this.callbacks.onSessionFocusElsewhere?.(
+                  si.session.id,
+                  ownedElsewhereLabel,
+                );
+                return;
+              }
               this.callbacks.onSessionClick(si.repo, workspace.name, si.session.id, resolvedLabel);
             });
 

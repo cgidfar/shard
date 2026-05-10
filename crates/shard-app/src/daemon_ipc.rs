@@ -372,6 +372,13 @@ async fn connect_and_subscribe(app: &AppHandle) -> std::io::Result<()> {
                 );
                 let _ = app.emit("sidebar-changed", ());
             }
+            ControlFrame::OpenWindowRequested => {
+                let app_state = app.state::<AppState>();
+                let label = app_state.allocate_window_label();
+                if let Err(e) = crate::commands::window::build_new_window(app, &label) {
+                    warn!("state subscriber: failed to open requested window: {e}");
+                }
+            }
             ControlFrame::Error { message } => {
                 warn!("state subscriber: daemon error: {message}");
                 return Ok(());

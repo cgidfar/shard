@@ -5,10 +5,12 @@ import { Sidebar } from "./components/Sidebar";
 import { TerminalPane } from "./components/TerminalPane";
 import { AddShardDialog } from "./components/AddShardDialog";
 import { AddWorkspaceDialog } from "./components/AddWorkspaceDialog";
-import { addRepo, adoptWorkspace, createSession, createWorkspace, listRepos, stopSession, removeSession, removeWorkspace, syncRepo, removeRepo, type WorkspaceStatus } from "./lib/api";
+import { addRepo, adoptWorkspace, createSession, createWorkspace, focusSessionWindow, listRepos, listSessionActivities, listSessionInputOwners, listSessionTitles, openNewWindow, stopSession, removeSession, removeWorkspace, syncRepo, removeRepo, type WorkspaceStatus } from "./lib/api";
 import { contextMenu, type MenuItemDef } from "./lib/ContextMenu";
 import { labelFromCommand } from "./lib/titleFormat";
 import { activityStore } from "./lib/activityStore";
+import { windowState } from "./lib/windowState";
+import type { SessionInputStateEvent } from "./lib/terminal";
 
 const titlebarEl = document.getElementById("titlebar")!;
 const sidebarEl = document.getElementById("sidebar")!;
@@ -16,14 +18,12 @@ const sidebarResizerEl = document.getElementById("sidebar-resizer")!;
 const terminalContainer = document.getElementById("terminal-container")!;
 
 // ── Sidebar resize ──
-const SIDEBAR_WIDTH_KEY = "shard.sidebarWidth";
+// Per-window storage so two open windows don't fight over the same key.
+// Resolved lazily in `init()` once `windowState` has its label; until then
+// the saved width is just the unscoped legacy default if anything.
+let sidebarWidthKey = "shard.sidebarWidth";
 const SIDEBAR_MIN_WIDTH = 180;
 const SIDEBAR_MAX_WIDTH = 500;
-
-const savedWidth = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));
-if (Number.isFinite(savedWidth) && savedWidth >= SIDEBAR_MIN_WIDTH && savedWidth <= SIDEBAR_MAX_WIDTH) {
-  sidebarEl.style.width = `${savedWidth}px`;
-}
 
 sidebarResizerEl.addEventListener("mousedown", (e) => {
   e.preventDefault();
@@ -49,7 +49,7 @@ sidebarResizerEl.addEventListener("mousedown", (e) => {
     sidebarResizerEl.classList.remove("resizing");
     document.body.style.cursor = "";
     document.body.style.userSelect = "";
-    localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarEl.getBoundingClientRect().width));
+    localStorage.setItem(sidebarWidthKey, String(sidebarEl.getBoundingClientRect().width));
   };
 
   window.addEventListener("mousemove", onMove);
@@ -75,6 +75,14 @@ async function openAddShardDialog() {
 
 const terminalPane = new TerminalPane(terminalContainer, {
   onAddShard: openAddShardDialog,
+  onOwnershipConflict(sessionId: string, ownerLabel: string) {
+    focusSessionWindow(ownerLabel, sessionId).catch((err) =>
+      console.warn(`focus_session_window(${ownerLabel}, ${sessionId}) failed:`, err),
+    );
+  },
+  onInputStateChange(state: SessionInputStateEvent) {
+    applySidebarOwnership(state);
+  },
 });
 
 // Wire OSC title changes from terminal to sidebar + breadcrumb
@@ -91,6 +99,11 @@ terminalPane.onTitleChange = (sessionId, title) => {
 const titleBar = new TitleBar(titlebarEl, {
   onToggleSidebar() {
     sidebarEl.classList.toggle("collapsed");
+  },
+  onNewWindow() {
+    openNewWindow().catch((err) =>
+      console.warn("open_new_window failed:", err),
+    );
   },
 });
 
@@ -125,7 +138,64 @@ const sidebar = new Sidebar(sidebarEl, {
     doRemoveWorkspace(repo, workspace, sessionIds);
   },
   onAddShard: openAddShardDialog,
+  onSessionFocusElsewhere(sessionId: string, ownerLabel: string) {
+    focusSessionWindow(ownerLabel, sessionId).catch((err) =>
+      console.warn(`focus_session_window(${ownerLabel}, ${sessionId}) failed:`, err),
+    );
+  },
 });
+
+/**
+ * Reflect the current input owner into the sidebar's "owned elsewhere"
+ * overlay. The supervisor broadcasts `InputOwnerChanged` to every
+ * connected client (every window's monitor + any window's attach reader),
+ * so each window receives the same `session-input-state` events and
+ * computes its own UI state independently.
+ */
+function applySidebarOwnership(state: SessionInputStateEvent) {
+  if (!windowState.ready) return;
+  // GUI owner with a label that isn't us → mark elsewhere.
+  if (
+    state.owner_kind === "gui" &&
+    state.owner_label &&
+    state.owner_label !== windowState.label
+  ) {
+    sidebar.setOwnedElsewhere(state.id, state.owner_label);
+    return;
+  }
+  // Owner is a CLI agent or no owner — clear (CLI takeover greys out the
+  // local terminal via `.input-disabled`, but we don't show an
+  // "elsewhere" sidebar overlay for it; the affordance is "click to
+  // focus another window," which doesn't apply to CLI processes).
+  sidebar.setOwnedElsewhere(state.id, null);
+}
+
+async function hydrateSidebarOwnership() {
+  const states = await listSessionInputOwners();
+  for (const state of states) applySidebarOwnership(state);
+}
+
+/**
+ * Hydrate cross-window state on a freshly opened window. The supervisor
+ * monitors broadcast `session-activity` and `session-title-changed` only
+ * on transitions; without this, a window opened mid-session would show a
+ * stale label and a missing activity dot until the next event.
+ *
+ * `windowState.label` need not match — these caches are process-global
+ * (one Tauri app, many windows), so every window hydrates from the same
+ * backend `AppState`.
+ */
+async function hydrateRuntimeState() {
+  const [titles, activities] = await Promise.all([
+    listSessionTitles(),
+    listSessionActivities(),
+  ]);
+  for (const { id, title } of titles) sidebar.notifyTitleChange(id, title);
+  for (const { id, state } of activities) {
+    const isFocused = id === terminalPane.getActiveId();
+    activityStore.notify(id, state, isFocused);
+  }
+}
 
 function openSession(repo: string, workspace: string, sessionId: string, sessionLabel: string) {
   terminalPane.open(sessionId);
@@ -137,6 +207,22 @@ function openSession(repo: string, workspace: string, sessionId: string, session
     status: "running",
   };
   titleBar.setBreadcrumb(currentBreadcrumb);
+}
+
+function focusLocalSession(sessionId: string) {
+  if (!terminalPane.show(sessionId)) return;
+
+  const location = sidebar.getSessionLocation(sessionId);
+  if (location) {
+    sidebar.setActiveSession(sessionId);
+    currentBreadcrumb = {
+      repo: location.repo,
+      workspace: location.workspace,
+      session: location.label,
+      status: location.status,
+    };
+    titleBar.setBreadcrumb(currentBreadcrumb);
+  }
 }
 
 function closeSession(sessionId: string) {
@@ -376,9 +462,25 @@ contextMenu.register("#terminal-container", (): MenuItemDef[] => {
 
 // Initial load
 async function init() {
+  // Resolve our window label first — every backend call routes through
+  // this. Once the label is known, swap in the per-window sidebar-width
+  // key and apply the saved value (if any).
+  await windowState.init();
+  sidebarWidthKey = `shard.sidebarWidth.${windowState.label}`;
+  const savedWidth = Number(localStorage.getItem(sidebarWidthKey));
+  if (
+    Number.isFinite(savedWidth) &&
+    savedWidth >= SIDEBAR_MIN_WIDTH &&
+    savedWidth <= SIDEBAR_MAX_WIDTH
+  ) {
+    sidebarEl.style.width = `${savedWidth}px`;
+  }
+
   await updateEmptyState();
   terminalPane.showEmpty();
   await sidebar.refresh();
+  await hydrateSidebarOwnership();
+  await hydrateRuntimeState();
 }
 
 init();
@@ -410,4 +512,43 @@ listen<{ repo: string; workspace: string; status: WorkspaceStatus | null }>(
 listen<{ id: string; state: "active" | "idle" | "blocked" }>("session-activity", ({ payload }) => {
   const isFocused = payload.id === terminalPane.getActiveId();
   activityStore.notify(payload.id, payload.state, isFocused);
+});
+
+// Cross-window OSC title relay. The window with the terminal mounted
+// parses titles from xterm.js and posts them to the backend, which
+// rebroadcasts to every window so sidebars stay in sync. The originating
+// window also receives this event but its sidebar was already patched
+// inline by the local TerminalPane callback — `notifyTitleChange` is
+// idempotent, so the duplicate paint is harmless.
+listen<{ id: string; title: string }>("session-title-changed", ({ payload }) => {
+  sidebar.notifyTitleChange(payload.id, payload.title);
+  if (payload.id === terminalPane.getActiveId() && currentBreadcrumb) {
+    const resolvedLabel = sidebar.resolveLabel(payload.id);
+    currentBreadcrumb = { ...currentBreadcrumb, session: resolvedLabel };
+    titleBar.setBreadcrumb(currentBreadcrumb);
+  }
+});
+
+// Global ownership listener. The terminal pane's local listener handles
+// ownership for sessions this window has open; this one updates sidebar
+// state for sessions this window is only monitoring (e.g. when window-2
+// attaches a session that window-1 has visible in its sidebar but isn't
+// terminal-mounted, window-1 still needs to grey it out).
+listen<SessionInputStateEvent>("session-input-state", ({ payload }) => {
+  applySidebarOwnership(payload);
+});
+
+listen<{ id: string }>("focus-session", ({ payload }) => {
+  focusLocalSession(payload.id);
+});
+
+// Ctrl+N opens a new window. Document-level so it fires regardless of
+// which child element has focus (xterm.js would otherwise swallow it).
+document.addEventListener("keydown", (e) => {
+  if (e.ctrlKey && !e.shiftKey && !e.altKey && (e.key === "n" || e.key === "N")) {
+    e.preventDefault();
+    openNewWindow().catch((err) =>
+      console.warn("Ctrl+N open_new_window failed:", err),
+    );
+  }
 });

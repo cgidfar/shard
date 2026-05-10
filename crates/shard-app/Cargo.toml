@@ -10,7 +10,7 @@ tauri-build = { version = "2", features = [] }
 shard-core = { path = "../shard-core" }
 shard-transport = { path = "../shard-transport" }
 shard-supervisor = { path = "../shard-supervisor" }
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }

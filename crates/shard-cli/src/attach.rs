@@ -1,6 +1,6 @@
 use tokio::io::AsyncWriteExt;
 
-use shard_transport::protocol::{self, Frame};
+use shard_transport::protocol::{self, ClientKind, Frame};
 use shard_transport::transport_windows::NamedPipeTransport;
 use shard_transport::SessionTransport;
 
@@ -33,7 +33,20 @@ async fn run_attach(
 ) -> shard_core::Result<()> {
     let (mut reader, mut writer) = tokio::io::split(client);
 
-    // Send resume frame with offset 0 (fresh attach)
+    // Hello → Resume → ClaimInput. SHA-21 made `Hello` mandatory for all
+    // streaming clients. The CLI claims input on attach so it can drive
+    // the agent immediately; CLI claims may temporarily displace GUI owners.
+    protocol::write_frame(
+        &mut writer,
+        &Frame::Hello {
+            client_id: crate::cli_client_id(),
+            kind: ClientKind::CliAgent,
+            label: "shardctl/attach".to_string(),
+        },
+    )
+    .await
+    .map_err(shard_core::ShardError::Io)?;
+
     protocol::write_frame(
         &mut writer,
         &Frame::Resume {
@@ -42,6 +55,10 @@ async fn run_attach(
     )
     .await
     .map_err(shard_core::ShardError::Io)?;
+
+    protocol::write_frame(&mut writer, &Frame::ClaimInput)
+        .await
+        .map_err(shard_core::ShardError::Io)?;
 
     // === Stdin → pipe ===
     let stdin_task = tokio::spawn(async move {

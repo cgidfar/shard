@@ -3,6 +3,7 @@ import { createStatusIndicator } from "../lib/statusIndicator";
 
 export interface TitleBarCallbacks {
   onToggleSidebar: () => void;
+  onNewWindow: () => void;
 }
 
 export interface Breadcrumb {
@@ -81,9 +82,16 @@ export class TitleBar {
     toggleBtn.innerHTML = ICON_TOGGLE_SIDEBAR;
     toggleBtn.addEventListener("click", () => this.callbacks.onToggleSidebar());
 
-    const brand = document.createElement("span");
+    // The brand area doubles as the new-window button. Whole-area click
+    // (rather than a discrete "+") matches what the SHA-21 spec asked for
+    // — a small drag region remains via `data-tauri-drag-region` on the
+    // surrounding `titlebar-left` container.
+    const brand = document.createElement("button");
     brand.className = "titlebar-brand";
-    brand.textContent = "Shard";
+    brand.type = "button";
+    brand.title = "New window (Ctrl+N)";
+    brand.textContent = "Shard +";
+    brand.addEventListener("click", () => this.callbacks.onNewWindow());
 
     const navGroup = document.createElement("div");
     navGroup.className = "titlebar-nav";

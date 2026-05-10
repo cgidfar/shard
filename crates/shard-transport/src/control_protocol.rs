@@ -21,7 +21,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// v9 adds `AdoptWorkspace` (type bytes 0xAC–0xAD), appends `is_external`
 /// to the `Workspace` wire layout, and adds `external_path` to
 /// `BranchInfo` (SHA-50: track external worktrees).
-pub const PROTOCOL_VERSION: u16 = 9;
+/// v10 adds `OpenWindowRequested` (type byte 0xAE) so the daemon tray can
+/// request app windows without the app owning its own tray icon.
+pub const PROTOCOL_VERSION: u16 = 10;
 
 /// Maximum accepted daemon control frame size, including the type byte.
 pub const MAX_CONTROL_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -135,6 +137,11 @@ pub enum ControlFrame {
     /// landed. Subscribers should drop any cached state for this
     /// `(repo, name)` and refresh their sidebar / tree.
     WorkspaceRemoved { repo: String, name: String },
+
+    /// Daemon → Subscribers: the daemon tray's "New Window" item was
+    /// selected. App subscribers should create a new window in the existing
+    /// app process.
+    OpenWindowRequested,
 
     // --- Workspace Create + Reads (Phase 2 of daemon-broker migration) ---
     /// Client → Daemon: create a new workspace under `repo`. Always
@@ -323,6 +330,7 @@ const TYPE_INSTALL_HARNESS_HOOKS: u8 = 0xAA;
 const TYPE_INSTALL_HARNESS_HOOKS_ACK: u8 = 0xAB;
 const TYPE_ADOPT_WORKSPACE: u8 = 0xAC;
 const TYPE_ADOPT_WORKSPACE_ACK: u8 = 0xAD;
+const TYPE_OPEN_WINDOW_REQUESTED: u8 = 0xAE;
 
 // WorkspaceMode wire tag
 const MODE_NEW_BRANCH: u8 = 0;
@@ -452,6 +460,7 @@ pub async fn write_control_frame<W: AsyncWrite + Unpin>(
             write_str(&mut payload, name)?;
             TYPE_WORKSPACE_REMOVED
         }
+        ControlFrame::OpenWindowRequested => TYPE_OPEN_WINDOW_REQUESTED,
         ControlFrame::CreateWorkspace {
             repo,
             name,
@@ -787,6 +796,7 @@ pub async fn read_control_frame<R: AsyncRead + Unpin>(
             let (name, m) = read_str(&payload[n..])?;
             (ControlFrame::WorkspaceRemoved { repo, name }, n + m)
         }
+        TYPE_OPEN_WINDOW_REQUESTED => (ControlFrame::OpenWindowRequested, 0),
         TYPE_CREATE_WORKSPACE => {
             let mut offset = 0;
             let (repo, n) = read_str(&payload[offset..])?;
@@ -1366,7 +1376,12 @@ fn write_count_u32(buf: &mut Vec<u8>, label: &str, count: usize) -> std::io::Res
     Ok(())
 }
 
-fn write_count_u16(buf: &mut Vec<u8>, label: &str, count: usize, max: usize) -> std::io::Result<()> {
+fn write_count_u16(
+    buf: &mut Vec<u8>,
+    label: &str,
+    count: usize,
+    max: usize,
+) -> std::io::Result<()> {
     if count > max {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1781,6 +1796,14 @@ mod tests {
             name: "feature-a".to_string(),
         };
         assert_eq!(roundtrip(f.clone()).await, f);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_open_window_requested() {
+        assert_eq!(
+            roundtrip(ControlFrame::OpenWindowRequested).await,
+            ControlFrame::OpenWindowRequested
+        );
     }
 
     #[tokio::test]

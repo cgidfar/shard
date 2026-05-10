@@ -104,6 +104,13 @@ export interface SessionInfo {
   session: Session;
 }
 
+export interface SessionInputState {
+  id: string;
+  owner_label: string | null;
+  owner_kind: "gui" | "cli" | "monitor" | null;
+  owner_client_id: number | null;
+}
+
 // --- Repo ---
 
 export function listRepos(): Promise<Repository[]> {
@@ -202,11 +209,45 @@ export function attachSession(
   id: string,
   channel: Channel<ArrayBuffer>
 ): Promise<void> {
-  return invoke("attach_session", { id, channel });
+  return invoke("attach_session", {
+    id,
+    channel,
+  });
+}
+
+export function listSessionInputOwners(): Promise<SessionInputState[]> {
+  return invoke("list_session_input_owners");
+}
+
+export interface SessionTitleEntry {
+  id: string;
+  title: string;
+}
+
+export interface SessionActivityEntry {
+  id: string;
+  state: "active" | "idle" | "blocked";
+}
+
+/** Tell the backend an OSC terminal title changed. The backend caches it
+ *  and rebroadcasts as `session-title-changed` to every window. */
+export function notifySessionTitle(id: string, title: string): Promise<void> {
+  return invoke("notify_session_title", { id, title });
+}
+
+export function listSessionTitles(): Promise<SessionTitleEntry[]> {
+  return invoke("list_session_titles");
+}
+
+export function listSessionActivities(): Promise<SessionActivityEntry[]> {
+  return invoke("list_session_activities");
 }
 
 export function writeToSession(id: string, data: Uint8Array): Promise<void> {
-  return invoke("write_to_session", { id, data: Array.from(data) });
+  return invoke("write_to_session", {
+    id,
+    data: Array.from(data),
+  });
 }
 
 export function resizeSession(
@@ -214,7 +255,11 @@ export function resizeSession(
   rows: number,
   cols: number
 ): Promise<void> {
-  return invoke("resize_session", { id, rows, cols });
+  return invoke("resize_session", {
+    id,
+    rows,
+    cols,
+  });
 }
 
 export function renameSession(id: string, label: string | null): Promise<void> {
@@ -222,5 +267,30 @@ export function renameSession(id: string, label: string | null): Promise<void> {
 }
 
 export function detachSession(id: string): Promise<void> {
-  return invoke("detach_session", { id });
+  return invoke("detach_session", {
+    id,
+  });
+}
+
+// --- Window management (SHA-21) ---
+
+export function openNewWindow(): Promise<string> {
+  return invoke("open_new_window");
+}
+
+export function focusWindow(label: string): Promise<void> {
+  return invoke("focus_window", { label });
+}
+
+export function focusSessionWindow(label: string, sessionId: string): Promise<void> {
+  return invoke("focus_session_window", { label, sessionId });
+}
+
+/** Parse the structured `owned-by:{label}` error returned by
+ *  `attach_session` when another window already holds the session. */
+export function parseOwnedByError(err: unknown): string | null {
+  const msg = typeof err === "string" ? err : err instanceof Error ? err.message : null;
+  if (!msg) return null;
+  const m = msg.match(/^owned-by:(.+)$/);
+  return m ? m[1] : null;
 }

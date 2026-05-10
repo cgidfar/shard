@@ -80,6 +80,9 @@ pub enum ChangeKind {
         repo: String,
         name: String,
     },
+    /// Daemon tray requested a new app window. Subscribers that are app
+    /// processes should create one in-process.
+    OpenWindowRequested,
 }
 
 /// Typed commands sent from daemon mutation handlers to the monitor task.
@@ -176,8 +179,8 @@ impl MonitorHandle {
     /// Broadcast a change to subscribers. Used by mutation handlers that
     /// have already committed side effects and want to fan out the
     /// resulting event (e.g. `WorkspaceRemoved`) to connected clients.
-    pub(crate) fn broadcast(&self, change: ChangeKind) {
-        let _ = self.inner.change_tx.send(change);
+    pub(crate) fn broadcast(&self, change: ChangeKind) -> usize {
+        self.inner.change_tx.send(change).unwrap_or(0)
     }
 
     /// Drop the watcher for a specific workspace (so its
