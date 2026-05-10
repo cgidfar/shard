@@ -94,6 +94,18 @@ input {
   font-weight: var(--fw-semibold);
   color: var(--text-primary);
   letter-spacing: 0.01em;
+  background: transparent;
+  border: none;
+  padding: 2px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.titlebar-brand:hover {
+  background: var(--bg-hover);
+}
+.titlebar-brand:active {
+  background: var(--bg-selected);
 }
 
 .titlebar-breadcrumb {
@@ -503,6 +515,23 @@ input {
   opacity: 0.5;
 }
 
+/* Open in another window — clickable but visually de-emphasized so users
+ * don't try to take it over from here. The click handler in Sidebar.ts
+ * redirects to the owning window/session instead. */
+.tree-item-session.owned-elsewhere {
+  opacity: 0.55;
+  font-style: italic;
+}
+.tree-item-session.owned-elsewhere:hover {
+  opacity: 0.75;
+}
+.tree-item-session.owned-elsewhere::after {
+  content: "↗";
+  margin-left: var(--space-2);
+  color: var(--text-muted);
+  font-style: normal;
+}
+
 .tree-item-session .tree-action-close {
   font-size: var(--text-2xs);
 }
@@ -698,6 +727,26 @@ input {
 #terminal-container .xterm {
   height: 100%;
   padding: var(--space-3) var(--space-4);
+}
+
+/* Per-session container that is currently not the input owner. The
+ * keyboard gate is enforced in JS (`terminal.onData` returns early); this
+ * is the visual overlay so the user understands why typing is silent.
+ * `pointer-events: none` keeps the underlying terminal selectable and
+ * scrollable. */
+.input-disabled::after {
+  content: "Input controlled by another window or agent";
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding-bottom: var(--space-6);
+  background: color-mix(in srgb, var(--bg-primary) 65%, transparent);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  pointer-events: none;
+  z-index: 5;
 }
 
 /* ── Empty State ── */

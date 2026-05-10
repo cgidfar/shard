@@ -39,7 +39,7 @@ use crate::opts::DaemonCommands;
 
 // Tray icon imports (Windows-only)
 #[cfg(windows)]
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 #[cfg(windows)]
 use tray_icon::{Icon, TrayIconBuilder};
 #[cfg(windows)]
@@ -68,6 +68,53 @@ const SESSION_MUTATION_STOP_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg(windows)]
 const SUPERVISOR_EXIT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[cfg(windows)]
+struct DaemonInstanceGuard(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for DaemonInstanceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn acquire_daemon_instance_guard(paths: &ShardPaths) -> shard_core::Result<Option<DaemonInstanceGuard>> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+
+    let data_dir = paths.data_dir().to_string_lossy();
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in data_dir.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let mutex_name = format!("Local\\ShardDaemon-{hash:016x}");
+    let name: Vec<u16> = std::ffi::OsStr::new(&mutex_name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if handle == 0 {
+        return Err(shard_core::ShardError::Other(
+            format!("failed to create daemon instance mutex {mutex_name}"),
+        ));
+    }
+
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+        }
+        return Ok(None);
+    }
+
+    Ok(Some(DaemonInstanceGuard(handle)))
+}
+
 /// Snapshot of the minimum session info the tray quit path needs,
 /// captured under the `DaemonState.sessions` lock and then released so the
 /// lock is not held across the graceful-stop RPCs or the confirmation dialog.
@@ -93,7 +140,8 @@ pub enum ShutdownMode {
 #[cfg(windows)]
 #[derive(Debug)]
 pub(crate) enum TrayEvent {
-    /// Update the session count label in the tray menu.
+    /// Session count changed. The tray no longer renders this in the menu,
+    /// but the event remains useful as a cheap wakeup if that changes again.
     SessionCount(usize),
     /// Signal the event loop to exit (daemon is shutting down).
     Quit,
@@ -103,8 +151,8 @@ pub(crate) enum TrayEvent {
 #[cfg(windows)]
 struct TrayApp {
     tray: Option<tray_icon::TrayIcon>,
-    session_count: usize,
     open_id: tray_icon::menu::MenuId,
+    new_window_id: tray_icon::menu::MenuId,
     quit_id: tray_icon::menu::MenuId,
     shutdown_tx: watch::Sender<ShutdownMode>,
     exe_dir: PathBuf,
@@ -127,9 +175,9 @@ impl TrayApp {
     ) -> Self {
         Self {
             tray: None,
-            session_count: 0,
-            open_id: tray_icon::menu::MenuId::new("open"),
-            quit_id: tray_icon::menu::MenuId::new("quit"),
+            open_id: tray_icon::menu::MenuId::new("tray-show"),
+            new_window_id: tray_icon::menu::MenuId::new("tray-new-window"),
+            quit_id: tray_icon::menu::MenuId::new("tray-quit"),
             shutdown_tx,
             exe_dir,
             state,
@@ -137,22 +185,16 @@ impl TrayApp {
         }
     }
 
-    /// Build or rebuild the tray menu with current session count.
+    /// Build the daemon-owned tray menu. Keep labels aligned with the old
+    /// app tray so the UI stays familiar while ownership moves to the daemon.
     fn build_menu(&self) -> Menu {
-        let open_label = format!("Open {APP_NAME}");
-        let quit_label = format!("Quit {APP_NAME}");
-        let open_item = MenuItem::with_id(self.open_id.clone(), &open_label, true, None);
-        let separator = PredefinedMenuItem::separator();
-        let count_label = if self.session_count == 1 {
-            "1 active session".to_string()
-        } else {
-            format!("{} active sessions", self.session_count)
-        };
-        let count_item = MenuItem::new(count_label, false, None);
-        let quit_item = MenuItem::with_id(self.quit_id.clone(), &quit_label, true, None);
+        let open_item = MenuItem::with_id(self.open_id.clone(), "Show", true, None);
+        let new_window_item =
+            MenuItem::with_id(self.new_window_id.clone(), "New Window", true, None);
+        let quit_item = MenuItem::with_id(self.quit_id.clone(), "Quit", true, None);
 
         let menu = Menu::new();
-        let _ = menu.append_items(&[&open_item, &separator, &count_item, &quit_item]);
+        let _ = menu.append_items(&[&open_item, &new_window_item, &quit_item]);
         menu
     }
 
@@ -213,18 +255,6 @@ impl TrayApp {
         let bytes = &buf[..info.buffer_size()];
         Icon::from_rgba(bytes.to_vec(), info.width, info.height)
             .map_err(|e| format!("icon construction: {e}"))
-    }
-
-    /// Update the menu with a new session count.
-    fn update_session_count(&mut self, count: usize) {
-        if count == self.session_count {
-            return;
-        }
-        self.session_count = count;
-        if let Some(ref tray) = self.tray {
-            let menu = self.build_menu();
-            tray.set_menu(Some(Box::new(menu)));
-        }
     }
 
     /// Open the Shard app: find existing window and focus, or spawn new instance.
@@ -292,6 +322,21 @@ impl TrayApp {
                 error!("Failed to spawn {}: {e}", APP_EXE);
             }
         }
+    }
+
+    /// Ask a running app process to create a fresh window. If no app is
+    /// subscribed yet, fall back to launching/focusing the app.
+    fn request_new_window(&self) {
+        if let Some(monitor) = self.state.monitor.get() {
+            let subscribers =
+                monitor.broadcast(crate::cmd::workspace_monitor::ChangeKind::OpenWindowRequested);
+            if subscribers > 0 {
+                info!("Requested app to open a new window");
+                return;
+            }
+        }
+
+        self.open_shard_app();
     }
 
     /// Take a fresh snapshot of sessions whose supervisor processes are
@@ -552,8 +597,9 @@ impl ApplicationHandler<TrayEvent> for TrayApp {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: TrayEvent) {
         match event {
-            TrayEvent::SessionCount(count) => {
-                self.update_session_count(count);
+            TrayEvent::SessionCount(_count) => {
+                // The daemon tray intentionally keeps the compact app-style
+                // menu now: Show / New Window / Quit.
             }
             TrayEvent::Quit => {
                 info!("Tray received quit signal");
@@ -569,8 +615,11 @@ impl ApplicationHandler<TrayEvent> for TrayApp {
         // Poll for menu events (non-blocking)
         if let Ok(event) = MenuEvent::receiver().try_recv() {
             if event.id == self.open_id {
-                info!("Open {} menu item clicked", APP_NAME);
+                info!("Show menu item clicked");
                 self.open_shard_app();
+            } else if event.id == self.new_window_id {
+                info!("New Window menu item clicked");
+                self.request_new_window();
             } else if event.id == self.quit_id {
                 info!("Quit menu item clicked");
 
@@ -674,26 +723,37 @@ enum StopOutcome {
     ForceKilled,
 }
 
-/// Connect to a session pipe, send the standard Resume+StopGraceful probe,
-/// and drain until a lifecycle `Status` frame or pipe EOF — or the timeout
-/// fires. Returns `DrainOutcome::TimedOut` on timeout; does NOT force-kill.
+/// Connect to a session pipe, send the standard Hello+Resume+StopGraceful
+/// probe, and drain until a lifecycle `Status` frame or pipe EOF — or the
+/// timeout fires. Returns `DrainOutcome::TimedOut` on timeout; does NOT
+/// force-kill.
 ///
-/// The initial `Resume` frame is load-bearing: the supervisor's accept
-/// handler only dispatches stop frames via the *post-first-frame* recv loop
-/// (see `crates/shard-supervisor/src/event_loop.rs:148-289`), so sending
-/// `StopGraceful` as the first frame would be silently discarded. See
-/// SHA-43 for the matching bug in the existing non-tray callers.
+/// `Hello` is mandatory under SHA-21; `Resume` then `StopGraceful` follow
+/// because the supervisor's accept handler only dispatches stop frames via
+/// the *post-handshake* recv loop. Stop frames are intentionally NOT gated
+/// on input ownership (preserves SHA-43's fix), so we don't need to claim.
 #[cfg(windows)]
 async fn stop_and_drain(
     transport_addr: &str,
     graceful_timeout: Duration,
 ) -> shard_core::Result<DrainOutcome> {
     use shard_core::ShardError;
-    use shard_transport::protocol::{read_frame, write_frame, Frame};
+    use shard_transport::protocol::{read_frame, write_frame, ClientKind, Frame};
 
     let mut client = shard_transport::PlatformTransport::connect(transport_addr)
         .await
         .map_err(|e| ShardError::Other(format!("connect: {e}")))?;
+
+    write_frame(
+        &mut client,
+        &Frame::Hello {
+            client_id: crate::cli_client_id(),
+            kind: ClientKind::MonitorOnly,
+            label: "shardctl/daemon-stop".to_string(),
+        },
+    )
+    .await
+    .map_err(|e| ShardError::Other(format!("hello handshake: {e}")))?;
 
     write_frame(
         &mut client,
@@ -1078,6 +1138,11 @@ fn run_daemon() -> shard_core::Result<()> {
         .init();
 
     info!("Shard daemon starting (pid={})", std::process::id());
+
+    let Some(_instance_guard) = acquire_daemon_instance_guard(&paths)? else {
+        info!("Another daemon instance is already running, exiting");
+        return Ok(());
+    };
 
     // Check if daemon is already running by trying to open the control pipe
     if is_daemon_running() {
@@ -1584,6 +1649,13 @@ async fn run_subscribe_loop(
                     }
                     Ok(ChangeKind::WorkspaceRemoved { repo, name }) => {
                         let frame = ControlFrame::WorkspaceRemoved { repo, name };
+                        if let Err(e) = write_control_frame(&mut stream, &frame).await {
+                            info!("subscribe: client disconnected ({e})");
+                            return Ok(());
+                        }
+                    }
+                    Ok(ChangeKind::OpenWindowRequested) => {
+                        let frame = ControlFrame::OpenWindowRequested;
                         if let Err(e) = write_control_frame(&mut stream, &frame).await {
                             info!("subscribe: client disconnected ({e})");
                             return Ok(());
@@ -2516,7 +2588,11 @@ async fn handle_adopt_workspace(
                 message: "adopt is only supported for local repos".into(),
             };
         }
-        Err(e) => return ControlFrame::Error { message: e.to_string() },
+        Err(e) => {
+            return ControlFrame::Error {
+                message: e.to_string(),
+            }
+        }
         Ok(_) => {}
     }
 
@@ -2526,18 +2602,19 @@ async fn handle_adopt_workspace(
     // Resolve the effective name before any side effects so the lifecycle
     // gate covers both explicit and implicit-name callers — same discipline
     // as handle_create_workspace.
-    let resolved_name =
-        match ws_store.resolve_adopt_name(&repo, external_path, name.as_deref()) {
-            Ok(n) => n,
-            Err(e) => {
-                return ControlFrame::Error {
-                    message: format!("resolve adopt name failed: {e}"),
-                };
-            }
-        };
+    let resolved_name = match ws_store.resolve_adopt_name(&repo, external_path, name.as_deref()) {
+        Ok(n) => n,
+        Err(e) => {
+            return ControlFrame::Error {
+                message: format!("resolve adopt name failed: {e}"),
+            };
+        }
+    };
 
     if let Err(e) = state.lifecycle.check_can_mutate(&repo, &resolved_name) {
-        return ControlFrame::Error { message: e.to_string() };
+        return ControlFrame::Error {
+            message: e.to_string(),
+        };
     }
 
     // Pass the already-resolved name into the store so name derivation

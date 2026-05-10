@@ -1,11 +1,13 @@
+use std::collections::HashMap;
 use std::io::{Read, Seek};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, watch};
 
-use shard_transport::protocol::{self, ActivityState, Frame};
+use shard_transport::protocol::{self, ActivityState, ClientKind, Frame, OwnerSummary};
 #[cfg(windows)]
 use shard_transport::transport_windows::create_pipe_instance;
 #[cfg(windows)]
@@ -13,10 +15,38 @@ use tokio::net::windows::named_pipe::NamedPipeServer;
 
 use crate::pty::PtySession;
 
+#[allow(dead_code)] // identity fields read via the per-conn local captures, but kept here for diagnostics + future "list clients" RPC
 struct Client {
+    /// Server-assigned, monotonic per supervisor process. Used as the
+    /// authoritative key for the clients map and for owner-release checks
+    /// (a stale `client_id` can collide with a later connection; `conn_id`
+    /// cannot).
+    conn_id: u64,
+    /// Client-supplied id from `Hello`. Surfaced in `OwnerSummary` so other
+    /// clients can identify the owner.
+    client_id: u64,
+    kind: ClientKind,
+    label: String,
     tx: mpsc::Sender<Vec<u8>>,
     /// Skip TerminalOutput fan-out for monitor-only clients.
     monitor_only: bool,
+}
+
+struct Owner {
+    conn_id: u64,
+    client_id: u64,
+    kind: ClientKind,
+    label: String,
+}
+
+impl Owner {
+    fn summary(&self) -> OwnerSummary {
+        OwnerSummary {
+            client_id: self.client_id,
+            kind: self.kind,
+            label: self.label.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -24,6 +54,98 @@ enum Shutdown {
     None,
     Graceful,
     Force,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ClaimResult {
+    Accepted(OwnerSummary),
+    Rejected(Option<OwnerSummary>),
+    Ignored,
+}
+
+/// Serialize an `InputOwnerChanged` frame and broadcast it to every connected
+/// client. Used both on transitions (claim/release) and as a connect-time
+/// snapshot for late joiners.
+async fn broadcast_input_owner(clients: &Mutex<HashMap<u64, Client>>, owner: Option<OwnerSummary>) {
+    let frame = Frame::InputOwnerChanged { owner };
+    let mut buf = Vec::new();
+    if protocol::write_frame(&mut buf, &frame).await.is_err() {
+        return;
+    }
+    if let Ok(mut clients) = clients.lock() {
+        clients.retain(|_conn_id, client| client.tx.try_send(buf.clone()).is_ok());
+    }
+}
+
+async fn send_claim_rejected(
+    clients: &Mutex<HashMap<u64, Client>>,
+    conn_id: u64,
+    owner: Option<OwnerSummary>,
+) {
+    let frame = Frame::ClaimRejected { owner };
+    let mut buf = Vec::new();
+    if protocol::write_frame(&mut buf, &frame).await.is_err() {
+        return;
+    }
+    if let Ok(mut clients) = clients.lock() {
+        let should_remove = clients
+            .get(&conn_id)
+            .map(|client| client.tx.try_send(buf).is_err())
+            .unwrap_or(false);
+        if should_remove {
+            clients.remove(&conn_id);
+        }
+    }
+}
+
+fn apply_claim_input(
+    owner_slot: &Mutex<Option<Owner>>,
+    conn_id: u64,
+    client_id: u64,
+    kind: ClientKind,
+    label: &str,
+) -> ClaimResult {
+    if matches!(kind, ClientKind::MonitorOnly) {
+        return ClaimResult::Ignored;
+    }
+
+    let Ok(mut owner) = owner_slot.lock() else {
+        return ClaimResult::Rejected(None);
+    };
+
+    if owner.as_ref().map(|o| o.conn_id) == Some(conn_id) {
+        return ClaimResult::Accepted(owner.as_ref().unwrap().summary());
+    }
+
+    if matches!(kind, ClientKind::GuiWindow) {
+        if let Some(current) = owner.as_ref() {
+            let same_window = current.kind == ClientKind::GuiWindow && current.label == label;
+            if !same_window {
+                return ClaimResult::Rejected(Some(current.summary()));
+            }
+        }
+    }
+
+    *owner = Some(Owner {
+        conn_id,
+        client_id,
+        kind,
+        label: label.to_string(),
+    });
+
+    ClaimResult::Accepted(owner.as_ref().unwrap().summary())
+}
+
+fn release_owner_if_conn_matches(owner_slot: &Mutex<Option<Owner>>, conn_id: u64) -> bool {
+    let Ok(mut owner) = owner_slot.lock() else {
+        return false;
+    };
+    if owner.as_ref().map(|o| o.conn_id) == Some(conn_id) {
+        *owner = None;
+        true
+    } else {
+        false
+    }
 }
 
 /// Run the session supervisor event loop.
@@ -40,9 +162,11 @@ pub async fn run(
     initial_server: NamedPipeServer,
 ) -> std::io::Result<i32> {
     let child_pid = pty_session.child_pid();
-    let byte_offset = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let clients: Arc<Mutex<Vec<Client>>> = Arc::new(Mutex::new(Vec::new()));
+    let byte_offset = Arc::new(AtomicU64::new(0));
+    let clients: Arc<Mutex<HashMap<u64, Client>>> = Arc::new(Mutex::new(HashMap::new()));
     let pty_writer = Arc::new(Mutex::new(pty_session.writer));
+    let next_conn_id = Arc::new(AtomicU64::new(1));
+    let input_owner: Arc<Mutex<Option<Owner>>> = Arc::new(Mutex::new(None));
 
     let (resize_tx, mut resize_rx) = mpsc::channel::<(u16, u16)>(16);
     let (shutdown_tx, shutdown_rx) = watch::channel(Shutdown::None);
@@ -79,8 +203,7 @@ pub async fn run(
                         let _ = std::io::Write::write_all(&mut *log, &data);
                     }
 
-                    let offset = byte_offset_clone
-                        .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                    let offset = byte_offset_clone.fetch_add(n as u64, Ordering::Relaxed);
 
                     let frame = Frame::TerminalOutput {
                         offset,
@@ -93,8 +216,10 @@ pub async fn run(
                     });
 
                     if let Ok(mut clients) = clients_clone.lock() {
-                        clients.retain(|client| {
-                            if client.monitor_only { return true; }
+                        clients.retain(|_conn_id, client| {
+                            if client.monitor_only {
+                                return true;
+                            }
                             client.tx.try_send(frame_buf.clone()).is_ok()
                         });
                     }
@@ -112,6 +237,8 @@ pub async fn run(
     let pty_writer_clone = pty_writer.clone();
     let byte_offset_for_accept = byte_offset.clone();
     let activity_state_for_accept = activity_state.clone();
+    let next_conn_id_for_accept = next_conn_id.clone();
+    let input_owner_for_accept = input_owner.clone();
     let addr = transport_addr.to_string();
 
     let accept_task = tokio::spawn(async move {
@@ -141,6 +268,8 @@ pub async fn run(
             let current_offset = byte_offset_for_accept.clone();
             let clients_for_register = clients_clone2.clone();
             let activity = activity_state_for_accept.clone();
+            let next_conn_id = next_conn_id_for_accept.clone();
+            let owner_slot = input_owner_for_accept.clone();
 
             tokio::spawn(async move {
                 let (mut reader, mut writer_half) = tokio::io::split(connected);
@@ -152,15 +281,20 @@ pub async fn run(
                 };
 
                 // --- Fire-and-forget path: harness hook pushing state ---
+                //
+                // Hooks (e.g. shard-cli's `notify` subcommand) open a fresh
+                // pipe and send a single ActivityUpdate. They do not send
+                // Hello — preserve this special case so harness scripts keep
+                // working without a protocol upgrade.
                 if let Frame::ActivityUpdate { state } = first_frame {
-                    activity.store(state as u8, std::sync::atomic::Ordering::Relaxed);
+                    activity.store(state as u8, Ordering::Relaxed);
                     let mut buf = Vec::new();
                     if protocol::write_frame(&mut buf, &Frame::ActivityUpdate { state })
                         .await
                         .is_ok()
                     {
                         if let Ok(clients) = clients_for_register.lock() {
-                            for client in clients.iter() {
+                            for client in clients.values() {
                                 let _ = client.tx.try_send(buf.clone());
                             }
                         }
@@ -168,106 +302,153 @@ pub async fn run(
                     return;
                 }
 
-                // --- Streaming client path: Resume → register → replay → stream ---
-                let resume_offset = match first_frame {
-                    Frame::Resume { last_seen_offset } => last_seen_offset,
-                    _ => 0,
+                // --- Streaming client path: Hello → Resume → register → replay → stream ---
+                let (client_id, kind, label) = match first_frame {
+                    Frame::Hello {
+                        client_id,
+                        kind,
+                        label,
+                    } => (client_id, kind, label),
+                    other => {
+                        tracing::warn!(
+                            "expected Hello as first frame, got {:?}; closing connection",
+                            std::mem::discriminant(&other)
+                        );
+                        return;
+                    }
                 };
+
+                let resume_offset = match protocol::read_frame(&mut reader).await {
+                    Ok(Some(Frame::Resume { last_seen_offset })) => last_seen_offset,
+                    other => {
+                        tracing::warn!(
+                            "expected Resume after Hello, got {:?}; closing connection",
+                            other.as_ref().map(std::mem::discriminant)
+                        );
+                        return;
+                    }
+                };
+
+                let conn_id = next_conn_id.fetch_add(1, Ordering::Relaxed);
+                let is_monitor = matches!(kind, ClientKind::MonitorOnly);
 
                 // Register for live updates BEFORE replay so no bytes are
                 // lost between the offset snapshot and registration. Live
                 // fan-out buffers in the mpsc channel while replay writes
                 // directly to the pipe, preserving ordering.
-                let is_monitor = resume_offset == u64::MAX;
                 if let Ok(mut clients) = clients_for_register.lock() {
-                    clients.push(Client { tx, monitor_only: is_monitor });
+                    clients.insert(
+                        conn_id,
+                        Client {
+                            conn_id,
+                            client_id,
+                            kind,
+                            label: label.clone(),
+                            tx,
+                            monitor_only: is_monitor,
+                        },
+                    );
                 }
 
-                // Replay log from resume_offset to current position, streamed
-                // from disk in small chunks to avoid loading the entire file
-                // into memory and to keep IPC messages small.
+                // Replay log from resume_offset to current position. Skipped
+                // entirely for monitor-only clients (they only care about
+                // ActivityUpdate / Status / InputOwnerChanged).
                 //
-                // A long-lived session can produce hundreds of MB of PTY
-                // output. The frontend's `attach_session` always sends
+                // The frontend's `attach_session` always sends
                 // `last_seen_offset = 0`, so without a cap every reconnect
-                // would replay the entire log. That floods the named pipe
-                // and any single mid-replay disconnect (e.g. WebView2 IPC
-                // restart after system sleep) wedges the client. Cap the
-                // window to MAX_REPLAY_BYTES of recent history; this is
-                // safe because the frontend's TerminalOutput handler
-                // ignores `offset` and feeds bytes straight into xterm.js,
-                // and live frames after the snapshot still chain offsets
-                // gap-free from the supervisor's byte_offset counter.
-                let live_offset = current_offset.load(std::sync::atomic::Ordering::Relaxed);
-                const REPLAY_CHUNK: usize = 4096;
-                const MAX_REPLAY_BYTES: u64 = 1024 * 1024;
-                let capped_start = std::cmp::max(
-                    resume_offset,
-                    live_offset.saturating_sub(MAX_REPLAY_BYTES),
-                );
-                if capped_start < live_offset {
-                    match std::fs::File::open(&*log_for_replay) {
-                        Ok(mut file) => {
-                            let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-                            let end = std::cmp::min(live_offset, file_len);
-                            // Re-cap against file_len in case the on-disk
-                            // log is shorter than the in-memory counter.
-                            let start = std::cmp::max(
-                                capped_start,
-                                end.saturating_sub(MAX_REPLAY_BYTES),
-                            );
-                            if start < end {
-                                if let Err(e) = file.seek(std::io::SeekFrom::Start(start)) {
-                                    tracing::warn!("replay seek failed: {e}");
-                                } else {
-                                    let mut remaining = (end - start) as usize;
-                                    let mut offset = start;
-                                    let mut chunk_buf = vec![0u8; REPLAY_CHUNK];
-                                    while remaining > 0 {
-                                        let to_read = std::cmp::min(remaining, REPLAY_CHUNK);
-                                        match file.read(&mut chunk_buf[..to_read]) {
-                                            Ok(0) => break,
-                                            Ok(n) => {
-                                                let frame = Frame::TerminalOutput {
-                                                    offset,
-                                                    data: chunk_buf[..n].to_vec(),
-                                                };
-                                                let mut buf = Vec::new();
-                                                if let Err(e) = protocol::write_frame(&mut buf, &frame).await {
-                                                    tracing::warn!("replay frame serialize failed: {e}");
+                // would replay the entire log. Cap the window to
+                // MAX_REPLAY_BYTES of recent history.
+                if !is_monitor {
+                    let live_offset = current_offset.load(Ordering::Relaxed);
+                    const REPLAY_CHUNK: usize = 4096;
+                    const MAX_REPLAY_BYTES: u64 = 1024 * 1024;
+                    let capped_start =
+                        std::cmp::max(resume_offset, live_offset.saturating_sub(MAX_REPLAY_BYTES));
+                    if capped_start < live_offset {
+                        match std::fs::File::open(&*log_for_replay) {
+                            Ok(mut file) => {
+                                let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+                                let end = std::cmp::min(live_offset, file_len);
+                                let start = std::cmp::max(
+                                    capped_start,
+                                    end.saturating_sub(MAX_REPLAY_BYTES),
+                                );
+                                if start < end {
+                                    if let Err(e) = file.seek(std::io::SeekFrom::Start(start)) {
+                                        tracing::warn!("replay seek failed: {e}");
+                                    } else {
+                                        let mut remaining = (end - start) as usize;
+                                        let mut offset = start;
+                                        let mut chunk_buf = vec![0u8; REPLAY_CHUNK];
+                                        while remaining > 0 {
+                                            let to_read = std::cmp::min(remaining, REPLAY_CHUNK);
+                                            match file.read(&mut chunk_buf[..to_read]) {
+                                                Ok(0) => break,
+                                                Ok(n) => {
+                                                    let frame = Frame::TerminalOutput {
+                                                        offset,
+                                                        data: chunk_buf[..n].to_vec(),
+                                                    };
+                                                    let mut buf = Vec::new();
+                                                    if let Err(e) =
+                                                        protocol::write_frame(&mut buf, &frame)
+                                                            .await
+                                                    {
+                                                        tracing::warn!(
+                                                            "replay frame serialize failed: {e}"
+                                                        );
+                                                        break;
+                                                    }
+                                                    if let Err(e) =
+                                                        writer_half.write_all(&buf).await
+                                                    {
+                                                        tracing::warn!(
+                                                            "replay pipe write failed: {e}"
+                                                        );
+                                                        break;
+                                                    }
+                                                    offset += n as u64;
+                                                    remaining -= n;
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!("replay log read failed: {e}");
                                                     break;
                                                 }
-                                                if let Err(e) = writer_half.write_all(&buf).await {
-                                                    tracing::warn!("replay pipe write failed: {e}");
-                                                    break;
-                                                }
-                                                offset += n as u64;
-                                                remaining -= n;
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!("replay log read failed: {e}");
-                                                break;
                                             }
                                         }
                                     }
                                 }
                             }
-                        }
-                        Err(e) => {
-                            tracing::warn!("failed to open log for replay: {e}");
+                            Err(e) => {
+                                tracing::warn!("failed to open log for replay: {e}");
+                            }
                         }
                     }
                 }
 
-                // Send activity state snapshot so late-connecting monitors
+                // Send activity state snapshot so late-connecting clients
                 // get the current state even if the hook fired before they joined.
-                let state_val = activity.load(std::sync::atomic::Ordering::Relaxed);
+                let state_val = activity.load(Ordering::Relaxed);
                 if let Ok(snap_state) = ActivityState::try_from(state_val) {
                     let snap = Frame::ActivityUpdate { state: snap_state };
                     let mut buf = Vec::new();
                     if protocol::write_frame(&mut buf, &snap).await.is_ok() {
                         let _ = writer_half.write_all(&buf).await;
                     }
+                }
+
+                // Send input-owner snapshot so the new client immediately
+                // knows whether someone else owns input. Direct write rather
+                // than fan-out: only this client needs the snapshot.
+                let owner_snap = Frame::InputOwnerChanged {
+                    owner: owner_slot
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.as_ref().map(Owner::summary)),
+                };
+                let mut buf = Vec::new();
+                if protocol::write_frame(&mut buf, &owner_snap).await.is_ok() {
+                    let _ = writer_half.write_all(&buf).await;
                 }
 
                 // Forward live PTY output to client
@@ -280,24 +461,67 @@ pub async fn run(
                 });
 
                 // Read frames from client and dispatch
+                let owner_for_recv = owner_slot.clone();
+                let clients_for_recv = clients_for_register.clone();
                 let recv_task = tokio::spawn(async move {
+                    // Gate predicate for `TerminalInput` and `Resize`. Stop
+                    // frames are intentionally NOT gated — see SHA-43.
+                    // `conn_id` is server-assigned and unique even under
+                    // `client_id` reuse; comparing on it avoids cross-
+                    // connection confusion.
+                    let i_own_input = || {
+                        matches!(
+                            owner_for_recv.lock().ok().and_then(|g| g.as_ref().map(|o| o.conn_id)),
+                            Some(id) if id == conn_id
+                        )
+                    };
                     loop {
                         match protocol::read_frame(&mut reader).await {
                             Ok(Some(Frame::TerminalInput { data })) => {
-                                if let Ok(mut w) = writer.lock() {
-                                    let _ = std::io::Write::write_all(&mut *w, &data);
+                                if i_own_input() {
+                                    if let Ok(mut w) = writer.lock() {
+                                        let _ = std::io::Write::write_all(&mut *w, &data);
+                                    }
                                 }
                             }
                             Ok(Some(Frame::Resize { rows, cols })) => {
-                                let _ = resize.send((rows, cols)).await;
+                                if i_own_input() {
+                                    let _ = resize.send((rows, cols)).await;
+                                }
                             }
+                            Ok(Some(Frame::ClaimInput)) => {
+                                match apply_claim_input(
+                                    &owner_for_recv,
+                                    conn_id,
+                                    client_id,
+                                    kind,
+                                    &label,
+                                ) {
+                                    ClaimResult::Accepted(owner) => {
+                                        broadcast_input_owner(&clients_for_recv, Some(owner)).await;
+                                    }
+                                    ClaimResult::Rejected(owner) => {
+                                        send_claim_rejected(&clients_for_recv, conn_id, owner)
+                                            .await;
+                                    }
+                                    ClaimResult::Ignored => {
+                                        tracing::debug!(
+                                            "monitor-only client {conn_id} sent ClaimInput; ignoring"
+                                        );
+                                    }
+                                }
+                            }
+                            // Stop frames are intentionally NOT gated on
+                            // ownership. Any client (CLI, monitor, daemon
+                            // drain path) must be able to terminate the
+                            // session — the inverse caused SHA-43.
                             Ok(Some(Frame::StopGraceful)) => {
-                                tracing::info!("received stop-graceful");
+                                tracing::info!("received stop-graceful from conn {conn_id}");
                                 let _ = shutdown.send(Shutdown::Graceful);
                                 break;
                             }
                             Ok(Some(Frame::StopForce)) => {
-                                tracing::info!("received stop-force");
+                                tracing::info!("received stop-force from conn {conn_id}");
                                 let _ = shutdown.send(Shutdown::Force);
                                 break;
                             }
@@ -311,7 +535,42 @@ pub async fn run(
                     }
                 });
 
-                let _ = tokio::join!(send_task, recv_task);
+                // When either task ends (EOF on read, or write error after
+                // pipe close), abort the other so cleanup can run promptly.
+                // The original `join!` pattern would deadlock here on idle
+                // sessions: a Tauri-side detach closes the pipe, recv_task
+                // sees EOF and ends, but send_task is blocked on
+                // `rx.recv().await` and only wakes when the supervisor next
+                // tries to send something — which on a quiescent PTY never
+                // happens, leaving ownership stuck.
+                let mut send_task = send_task;
+                let mut recv_task = recv_task;
+                tokio::select! {
+                    _ = &mut send_task => {
+                        recv_task.abort();
+                        let _ = recv_task.await;
+                    }
+                    _ = &mut recv_task => {
+                        send_task.abort();
+                        let _ = send_task.await;
+                    }
+                }
+
+                // Cleanup: remove from clients map and release ownership if
+                // we held it. Use conn_id (not client_id) for the release
+                // check — defends against client_id collision/reuse.
+                //
+                // The check-and-clear must happen under a single lock hold:
+                // a separate read-then-write would let a new client claim
+                // ownership between the two, and our cleanup would then
+                // wrongly clear *their* fresh ownership.
+                if let Ok(mut clients) = clients_for_register.lock() {
+                    clients.remove(&conn_id);
+                }
+                let was_owner = release_owner_if_conn_matches(&owner_slot, conn_id);
+                if was_owner {
+                    broadcast_input_owner(&clients_for_register, None).await;
+                }
             });
         }
     });
@@ -422,20 +681,22 @@ pub async fn run(
     // 1. Drain PTY reader — child already exited, so ConPTY pipe will EOF
     //    once buffered data (including alt-screen restore) is consumed.
     //    Keep resize_task alive so the PtyMaster isn't dropped prematurely.
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        pty_read_task,
-    )
-    .await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), pty_read_task).await;
 
     // 2. NOW send Status frame — all TerminalOutput has been flushed
     let status_frame = Frame::Status {
-        code: if exit_code == 0 { 0 } else if exit_code == -1 { 1 } else { 2 },
+        code: if exit_code == 0 {
+            0
+        } else if exit_code == -1 {
+            1
+        } else {
+            2
+        },
     };
     let mut status_buf = Vec::new();
     let _ = protocol::write_frame(&mut status_buf, &status_frame).await;
     if let Ok(clients) = clients.lock() {
-        for client in clients.iter() {
+        for client in clients.values() {
             let _ = client.tx.try_send(status_buf.clone());
         }
     }
@@ -446,4 +707,129 @@ pub async fn run(
     resize_task.abort();
 
     Ok(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn owner(conn_id: u64, client_id: u64, kind: ClientKind, label: &str) -> Owner {
+        Owner {
+            conn_id,
+            client_id,
+            kind,
+            label: label.to_string(),
+        }
+    }
+
+    fn summary(client_id: u64, kind: ClientKind, label: &str) -> OwnerSummary {
+        OwnerSummary {
+            client_id,
+            kind,
+            label: label.to_string(),
+        }
+    }
+
+    fn client(tx: mpsc::Sender<Vec<u8>>, monitor_only: bool) -> Client {
+        Client {
+            conn_id: 1,
+            client_id: 1,
+            kind: if monitor_only {
+                ClientKind::MonitorOnly
+            } else {
+                ClientKind::GuiWindow
+            },
+            label: "window-1".to_string(),
+            tx,
+            monitor_only,
+        }
+    }
+
+    #[test]
+    fn gui_claim_rejects_different_gui_owner() {
+        let owner_slot = Mutex::new(Some(owner(1, 10, ClientKind::GuiWindow, "window-1")));
+
+        let result = apply_claim_input(&owner_slot, 2, 20, ClientKind::GuiWindow, "window-2");
+
+        assert_eq!(
+            result,
+            ClaimResult::Rejected(Some(summary(10, ClientKind::GuiWindow, "window-1")))
+        );
+        assert_eq!(
+            owner_slot.lock().unwrap().as_ref().map(Owner::summary),
+            Some(summary(10, ClientKind::GuiWindow, "window-1"))
+        );
+    }
+
+    #[test]
+    fn gui_claim_accepts_same_window_reconnect() {
+        let owner_slot = Mutex::new(Some(owner(1, 10, ClientKind::GuiWindow, "window-1")));
+
+        let result = apply_claim_input(&owner_slot, 2, 20, ClientKind::GuiWindow, "window-1");
+
+        assert_eq!(
+            result,
+            ClaimResult::Accepted(summary(20, ClientKind::GuiWindow, "window-1"))
+        );
+        assert_eq!(
+            owner_slot.lock().unwrap().as_ref().map(Owner::summary),
+            Some(summary(20, ClientKind::GuiWindow, "window-1"))
+        );
+    }
+
+    #[test]
+    fn cli_claim_can_displace_gui_owner() {
+        let owner_slot = Mutex::new(Some(owner(1, 10, ClientKind::GuiWindow, "window-1")));
+
+        let result = apply_claim_input(&owner_slot, 2, 20, ClientKind::CliAgent, "shardctl");
+
+        assert_eq!(
+            result,
+            ClaimResult::Accepted(summary(20, ClientKind::CliAgent, "shardctl"))
+        );
+        assert_eq!(
+            owner_slot.lock().unwrap().as_ref().map(Owner::summary),
+            Some(summary(20, ClientKind::CliAgent, "shardctl"))
+        );
+    }
+
+    #[test]
+    fn gui_claim_rejects_cli_owner() {
+        let owner_slot = Mutex::new(Some(owner(1, 10, ClientKind::CliAgent, "shardctl")));
+
+        let result = apply_claim_input(&owner_slot, 2, 20, ClientKind::GuiWindow, "window-1");
+
+        assert_eq!(
+            result,
+            ClaimResult::Rejected(Some(summary(10, ClientKind::CliAgent, "shardctl")))
+        );
+    }
+
+    #[test]
+    fn owner_release_uses_server_connection_id() {
+        let owner_slot = Mutex::new(Some(owner(1, 10, ClientKind::GuiWindow, "window-1")));
+
+        assert!(!release_owner_if_conn_matches(&owner_slot, 2));
+        assert!(owner_slot.lock().unwrap().is_some());
+
+        assert!(release_owner_if_conn_matches(&owner_slot, 1));
+        assert!(owner_slot.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn input_owner_broadcast_evicts_backlogged_clients() {
+        let clients = Mutex::new(HashMap::new());
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1);
+        tx.try_send(vec![0xAA]).unwrap();
+        clients.lock().unwrap().insert(1, client(tx, false));
+
+        broadcast_input_owner(
+            &clients,
+            Some(summary(10, ClientKind::GuiWindow, "window-1")),
+        )
+        .await;
+
+        assert!(clients.lock().unwrap().is_empty());
+        assert_eq!(rx.recv().await, Some(vec![0xAA]));
+    }
 }

@@ -3,8 +3,15 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Channel } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { attachSession, writeToSession, resizeSession, detachSession } from "./api";
+import {
+  attachSession,
+  writeToSession,
+  resizeSession,
+  detachSession,
+  parseOwnedByError,
+} from "./api";
 import { formatOscTitle } from "./titleFormat";
+import { windowState } from "./windowState";
 
 export interface TerminalSession {
   terminal: Terminal;
@@ -12,8 +19,31 @@ export interface TerminalSession {
   dispose: () => void;
 }
 
+export interface SessionInputStateEvent {
+  id: string;
+  owner_label: string | null;
+  owner_kind: "gui" | "cli" | "monitor" | null;
+  owner_client_id: number | null;
+}
+
 export interface TerminalSessionOptions {
   onTitleChange?: (title: string) => void;
+  /**
+   * Fired after `attachSession` succeeds and this terminal owns input.
+   */
+  onAttached?: () => void;
+  /**
+   * Fired when `attachSession` rejects with `owned-by:{label}`. The caller
+   * is expected to bring that window to the front instead of competing for
+   * input.
+   */
+  onOwnershipConflict?: (ownerWindowLabel: string) => void;
+  /**
+   * Fired on every `session-input-state` Tauri event for this session.
+   * Used by the host (TerminalPane → main) to update sidebar overlays
+   * across windows.
+   */
+  onInputStateChange?: (state: SessionInputStateEvent) => void;
 }
 
 export function createTerminalSession(
@@ -57,12 +87,14 @@ export function createTerminalSession(
   const fitAddon = new FitAddon();
   terminal.loadAddon(fitAddon);
 
-  // Let browser handle clipboard shortcuts instead of xterm consuming them
+  // Let browser handle clipboard shortcuts and the SHA-21 new-window
+  // accelerator instead of xterm consuming them.
   terminal.attachCustomKeyEventHandler((e: KeyboardEvent) => {
     if (e.type !== "keydown") return true;
     if (e.ctrlKey && !e.shiftKey && !e.altKey) {
       if (e.key === "c" && terminal.hasSelection()) return false;
       if (e.key === "v") return false;
+      if (e.key === "n" || e.key === "N") return false;
     }
     if (e.ctrlKey && e.shiftKey && !e.altKey) {
       if (e.key === "C" || e.key === "V") return false;
@@ -139,16 +171,37 @@ export function createTerminalSession(
   let disconnected = false;
   let disposed = false;
   let attached = false;
+  // Visually disabled until the supervisor confirms our `ClaimInput` via
+  // an `InputOwnerChanged` whose GUI owner label matches this window.
+  // The dim-and-disable state also returns when a CLI agent claims input
+  // mid-session, or when the current owner releases input.
+  let inputBlocked = true;
   const encoder = new TextEncoder();
+
+  function applyInputBlocked() {
+    container.classList.toggle("input-disabled", inputBlocked);
+  }
+  applyInputBlocked();
 
   // Attach to session (sends Resume, starts receiving output). Input and
   // resize calls wait on this so they cannot race the backend connection
   // registration.
   const attachReady = attachSession(sessionId, channel)
     .then(() => {
-      if (!disposed) attached = true;
+      if (!disposed) {
+        attached = true;
+        options.onAttached?.();
+      }
     })
     .catch((err) => {
+      const ownerLabel = parseOwnedByError(err);
+      if (ownerLabel) {
+        // Another window already has this session. Don't surface the
+        // error — the caller redirects focus to that window.
+        disconnected = true;
+        options.onOwnershipConflict?.(ownerLabel);
+        return;
+      }
       disconnected = true;
       terminal.write(`\r\n\x1b[31mFailed to attach: ${err}\x1b[0m\r\n`);
     });
@@ -175,9 +228,38 @@ export function createTerminalSession(
     else unlistenEnded = unlisten;
   });
 
-  // Forward user input to backend
+  let unlistenInputState: (() => void) | null = null;
+  listen<SessionInputStateEvent>("session-input-state", ({ payload }) => {
+    if (payload.id !== sessionId) return;
+    options.onInputStateChange?.(payload);
+    const wasBlocked = inputBlocked;
+    const ownedByMe =
+      payload.owner_kind === "gui" && payload.owner_label === windowState.label;
+    inputBlocked = !ownedByMe;
+    if (wasBlocked !== inputBlocked) {
+      applyInputBlocked();
+      if (!inputBlocked) {
+        // We just (re)gained ownership. CLI takeover may have resized
+        // the PTY out from under us — push our current dimensions so
+        // xterm.js and ConPTY agree before the user types anything.
+        const dims = fitAddon.proposeDimensions();
+        if (dims) {
+          void resizeSession(sessionId, dims.rows, dims.cols).catch(() => {});
+        }
+      }
+    }
+  }).then((unlisten) => {
+    if (disposed) unlisten();
+    else unlistenInputState = unlisten;
+  });
+
+  // Forward user input to backend. `inputBlocked` is the second gate: even
+  // after attach succeeds, input is dropped locally until the supervisor
+  // confirms ownership. The supervisor would silently drop non-owner
+  // bytes anyway, but blocking client-side avoids "ghost typing" during
+  // event lag.
   terminal.onData((data: string) => {
-    if (disconnected || disposed) return;
+    if (disconnected || disposed || inputBlocked) return;
     void (async () => {
       if (!(await waitForAttach())) return;
       writeToSession(sessionId, encoder.encode(data)).catch(markDisconnected);
@@ -226,6 +308,7 @@ export function createTerminalSession(
     if (resizeTimer) clearTimeout(resizeTimer);
     resizeObserver.disconnect();
     if (unlistenEnded) unlistenEnded();
+    if (unlistenInputState) unlistenInputState();
     detachSession(sessionId).catch(() => {});
     terminal.dispose();
   }

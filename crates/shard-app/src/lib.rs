@@ -3,7 +3,7 @@ mod daemon_ipc;
 mod state;
 
 use state::AppState;
-use tauri::Manager;
+use tauri::{Manager, WindowEvent};
 
 /// Ensure the daemon is running before the app starts.
 /// Spawns it if not already alive. Non-fatal on failure (app still works,
@@ -61,10 +61,10 @@ fn start_monitors_for_running_sessions(app: &tauri::AppHandle) {
 
     // Spawn monitors and batch-insert under a single short lock
     let state: tauri::State<'_, AppState> = app.state();
-    let mut conns = state.connections.blocking_lock();
+    let mut monitors = state.monitors.blocking_lock();
     for (id, addr, label) in running {
         let task = commands::session::start_monitor(app.clone(), id.clone(), addr);
-        conns.insert(id.clone(), state::SessionConnection::Monitored { task });
+        monitors.insert(id.clone(), state::MonitorHandle { task });
         tracing::info!("Started monitor for session {} [{label}]", &id[..8]);
     }
 }
@@ -98,6 +98,33 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                let app = window.app_handle();
+                let state: tauri::State<AppState> = app.state();
+
+                // Window count *includes* this one — it has not been
+                // destroyed yet. So `== 1` means "this is the last visible
+                // window." Hide it instead of closing so sessions stay
+                // durable; the daemon's tray icon remains the sole visible
+                // process control surface.
+                let visible_count = app
+                    .webview_windows()
+                    .values()
+                    .filter(|w| w.is_visible().unwrap_or(true))
+                    .count();
+                if visible_count <= 1 {
+                    api.prevent_close();
+                    let _ = window.hide();
+                    return;
+                }
+
+                // Non-last close: release this window's attachments so the
+                // reader tasks tear down their pipes (which signals the
+                // supervisor to release input ownership if we held it).
+                commands::session::release_attachments_for_window(&state, window.label());
+            }
+        })
         .setup(|app| {
             start_monitors_for_running_sessions(app.handle());
 
@@ -122,6 +149,7 @@ pub fn run() {
             commands::workspace::remove_workspace,
             commands::workspace::list_repo_branches,
             commands::session::list_sessions,
+            commands::session::list_session_input_owners,
             commands::session::create_session,
             commands::session::stop_session,
             commands::session::remove_session,
@@ -130,6 +158,10 @@ pub fn run() {
             commands::session::write_to_session,
             commands::session::resize_session,
             commands::session::detach_session,
+            commands::window::get_window_label,
+            commands::window::open_new_window,
+            commands::window::focus_window,
+            commands::window::focus_session_window,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
