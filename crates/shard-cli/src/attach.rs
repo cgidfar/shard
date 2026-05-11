@@ -1,8 +1,7 @@
 use tokio::io::AsyncWriteExt;
 
 use shard_transport::protocol::{self, ClientKind, Frame};
-use shard_transport::transport_windows::NamedPipeTransport;
-use shard_transport::SessionTransport;
+use shard_transport::{PlatformClient, PlatformTransport, SessionTransport};
 
 /// Attach to a session via its transport address.
 ///
@@ -12,7 +11,7 @@ use shard_transport::SessionTransport;
 ///
 /// Detach with Ctrl-] (0x1d).
 pub async fn attach_to_session(transport_addr: &str) -> shard_core::Result<()> {
-    let client = NamedPipeTransport::connect(transport_addr)
+    let client = PlatformTransport::connect(transport_addr)
         .await
         .map_err(|e| shard_core::ShardError::Other(format!("connect failed: {e}")))?;
 
@@ -28,9 +27,7 @@ pub async fn attach_to_session(transport_addr: &str) -> shard_core::Result<()> {
     result
 }
 
-async fn run_attach(
-    client: tokio::net::windows::named_pipe::NamedPipeClient,
-) -> shard_core::Result<()> {
+async fn run_attach(client: PlatformClient) -> shard_core::Result<()> {
     let (mut reader, mut writer) = tokio::io::split(client);
 
     // Hello → Resume → ClaimInput. SHA-21 made `Hello` mandatory for all

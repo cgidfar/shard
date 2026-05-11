@@ -62,3 +62,13 @@ pub fn create_pipe_instance(address: &str, first: bool) -> std::io::Result<Named
 pub fn session_pipe_name(session_id: &str) -> String {
     format!(r"\\.\pipe\shard-session-{session_id}")
 }
+
+/// Open a single client connection to a control pipe, no retry.
+///
+/// Lives here (not in `daemon_client`) so the only place the named-pipe
+/// `ClientOptions` API is named is the Windows-specific transport file.
+/// The control-pipe retry helpers in `daemon_client` call this in a loop
+/// and stay platform-neutral at the type level via `PlatformClient`.
+pub fn open_control_pipe(name: &str) -> std::io::Result<NamedPipeClient> {
+    ClientOptions::new().open(name)
+}

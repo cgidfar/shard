@@ -4,14 +4,14 @@ use std::sync::Arc;
 
 use shard_core::state::RepoState;
 use shard_transport::protocol::{ActivityState, OwnerSummary};
+use shard_transport::PlatformClient;
 use tokio::io::WriteHalf;
-use tokio::net::windows::named_pipe::NamedPipeClient;
 use tokio::sync::Mutex;
 
 /// Shared write-half of an attached session pipe. Wrapped in `Arc<Mutex>`
 /// so per-window IPC commands (`write_to_session`, `resize_session`) can
 /// serialize writes.
-pub type SharedSessionWriter = Arc<Mutex<WriteHalf<NamedPipeClient>>>;
+pub type SharedSessionWriter = Arc<Mutex<WriteHalf<PlatformClient>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnectionToken(u64);

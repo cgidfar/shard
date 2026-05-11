@@ -5,7 +5,8 @@ use shard_core::sessions::SessionStore;
 use shard_core::workspaces::WorkspaceStore;
 use shard_core::ShardPaths;
 use shard_supervisor::process::{PlatformProcessControl, ProcessControl};
-use shard_transport::daemon_client::NamedPipeDaemonConnection;
+use shard_transport::daemon_client::PlatformDaemonConnection;
+use shard_transport::{PlatformTransport, SessionTransport};
 
 use crate::opts::{parse_target, SessionCommands};
 
@@ -138,7 +139,7 @@ fn create(
 }
 
 /// Connect to the daemon, spawning it if not running.
-async fn connect_or_spawn_daemon() -> shard_core::Result<NamedPipeDaemonConnection> {
+async fn connect_or_spawn_daemon() -> shard_core::Result<PlatformDaemonConnection> {
     use shard_transport::daemon_client;
 
     daemon_client::connect_or_spawn(
@@ -318,11 +319,7 @@ async fn stop_via_daemon_async(
 
 async fn connect_to_daemon_for_stop(
     control_pipe_name: Option<&str>,
-) -> shard_core::Result<
-    shard_transport::daemon_client::DaemonConnection<
-        tokio::net::windows::named_pipe::NamedPipeClient,
-    >,
-> {
+) -> shard_core::Result<PlatformDaemonConnection> {
     use shard_transport::daemon_client;
 
     let mut conn = match control_pipe_name {
@@ -466,13 +463,11 @@ fn serve(
     // Create the tokio runtime first — needed for named pipe creation
     let rt = tokio::runtime::Runtime::new()?;
 
-    // Create the named pipe BEFORE writing the ready file.
+    // Create the transport server BEFORE writing the ready file.
     // This ensures clients can connect as soon as they see the ready signal.
     // Must be inside the runtime context because tokio registers with the reactor.
     let initial_server = rt
-        .block_on(async {
-            shard_transport::transport_windows::create_pipe_instance(&transport_addr, true)
-        })
+        .block_on(async { PlatformTransport::bind(&transport_addr).await })
         .map_err(|e| shard_core::ShardError::Other(format!("failed to create pipe: {e}")))?;
 
     // Update status to running

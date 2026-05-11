@@ -9,8 +9,7 @@ use shard_core::sessions::{Session, SessionStore};
 use shard_core::workspaces::WorkspaceStore;
 use shard_core::{Harness, ShardPaths};
 use shard_transport::protocol::{self, ActivityState, ClientKind, Frame, OwnerSummary};
-use shard_transport::transport_windows::NamedPipeTransport;
-use shard_transport::SessionTransport;
+use shard_transport::{PlatformTransport, SessionTransport};
 
 use std::sync::Arc;
 
@@ -227,7 +226,7 @@ pub fn start_monitor(
     transport_addr: String,
 ) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
-        let client = match NamedPipeTransport::connect(&transport_addr).await {
+        let client = match PlatformTransport::connect(&transport_addr).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::debug!(
@@ -582,7 +581,7 @@ pub async fn attach_session(
         }
     }
 
-    let client = match NamedPipeTransport::connect(&session.transport_addr).await {
+    let client = match PlatformTransport::connect(&session.transport_addr).await {
         Ok(client) => client,
         Err(e) => return Err(e.to_string()),
     };

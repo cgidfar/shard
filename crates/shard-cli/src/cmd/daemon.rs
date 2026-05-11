@@ -1390,8 +1390,11 @@ async fn run_control_loop(state: Arc<DaemonState>, mut shutdown_rx: watch::Recei
         }
     }
 
-    // Create the first control pipe instance
-    let server = match create_pipe_instance(&state.control_pipe_name, true) {
+    // Create the first control pipe instance via the platform transport.
+    // Subsequent instances in the accept loop still use `create_pipe_instance`
+    // — that "create another instance per accept" pattern is Windows-only and
+    // gets unified in Phase 7 alongside the Unix transport.
+    let server = match shard_transport::PlatformTransport::bind(&state.control_pipe_name).await {
         Ok(s) => s,
         Err(e) => {
             error!("Failed to create control pipe: {e}");
@@ -1446,7 +1449,7 @@ async fn run_control_loop(state: Arc<DaemonState>, mut shutdown_rx: watch::Recei
 /// Accept control pipe connections and spawn per-client handlers.
 async fn accept_loop(
     state: Arc<DaemonState>,
-    initial_server: tokio::net::windows::named_pipe::NamedPipeServer,
+    initial_server: shard_transport::PlatformServer,
     mut shutdown_rx: watch::Receiver<ShutdownMode>,
 ) {
     let mut server = initial_server;
@@ -1490,7 +1493,7 @@ async fn accept_loop(
 /// Handle a single control pipe client connection.
 async fn handle_client(
     state: Arc<DaemonState>,
-    mut stream: tokio::net::windows::named_pipe::NamedPipeServer,
+    mut stream: shard_transport::PlatformServer,
 ) -> std::io::Result<()> {
     // Expect Hello first
     let frame = read_control_frame(&mut stream).await?;
@@ -1598,7 +1601,7 @@ async fn handle_client(
 /// versioned, so this is always safe.
 async fn run_subscribe_loop(
     monitor: crate::cmd::workspace_monitor::MonitorHandle,
-    mut stream: tokio::net::windows::named_pipe::NamedPipeServer,
+    mut stream: shard_transport::PlatformServer,
     mut shutdown_rx: watch::Receiver<ShutdownMode>,
 ) -> std::io::Result<()> {
     use crate::cmd::workspace_monitor::ChangeKind;

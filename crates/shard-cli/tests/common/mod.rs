@@ -19,9 +19,9 @@ use std::sync::Arc;
 use shard_cli::cmd::daemon::{self, DaemonConfig, DaemonState, ShutdownMode};
 use shard_core::paths::ShardPaths;
 use shard_core::workspaces::{default_git_ops, WorkspaceGitOps};
-use shard_transport::daemon_client::{connect_to_with_retry, DaemonConnection};
+use shard_transport::daemon_client::PlatformDaemonConnection;
+use shard_transport::daemon_client::connect_to_with_retry;
 use tempfile::TempDir;
-use tokio::net::windows::named_pipe::NamedPipeClient;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -150,7 +150,7 @@ impl TestHarness {
     }
 
     /// Open and handshake a fresh connection to the daemon.
-    pub async fn connect(&self) -> DaemonConnection<NamedPipeClient> {
+    pub async fn connect(&self) -> PlatformDaemonConnection {
         let mut conn = connect_to_with_retry(&self.control_pipe_name, Duration::from_secs(2))
             .await
             .expect("connect to test daemon");

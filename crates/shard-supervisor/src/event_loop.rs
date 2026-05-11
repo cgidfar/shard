@@ -8,10 +8,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, watch};
 
 use shard_transport::protocol::{self, ActivityState, ClientKind, Frame, OwnerSummary};
+use shard_transport::PlatformServer;
 #[cfg(windows)]
 use shard_transport::transport_windows::create_pipe_instance;
-#[cfg(windows)]
-use tokio::net::windows::named_pipe::NamedPipeServer;
 
 use crate::pty::PtySession;
 
@@ -159,7 +158,7 @@ pub async fn run(
     transport_addr: &str,
     mut pty_session: PtySession,
     log_path: &Path,
-    initial_server: NamedPipeServer,
+    initial_server: PlatformServer,
 ) -> std::io::Result<i32> {
     let child_pid = pty_session.child_pid();
     let byte_offset = Arc::new(AtomicU64::new(0));

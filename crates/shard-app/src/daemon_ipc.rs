@@ -27,7 +27,7 @@ use crate::state::AppState;
 //
 pub async fn connect_or_spawn(
     timeout: Duration,
-) -> std::io::Result<daemon_client::NamedPipeDaemonConnection> {
+) -> std::io::Result<daemon_client::PlatformDaemonConnection> {
     daemon_client::connect_or_spawn(spawn_shardctl_daemon, timeout).await
 }
 
